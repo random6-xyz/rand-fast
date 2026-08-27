@@ -1,0 +1,15 @@
+[package]
+name = "fast-ebpf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aya-ebpf.workspace = true
+fast-common.workspace = true
+
+[[bin]]
+name = "fast-ebpf"
+path = "src/main.rs"
+test = false
+bench = false

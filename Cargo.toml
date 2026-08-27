@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "fast",
+    "fast-common",
+    "fast-ebpf",
+    "tools/sched-workload",
+]
+default-members = [
+    "fast",
+    "fast-common",
+    "tools/sched-workload",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1.0"
+aya = "0.14.0"
+aya-build = "0.2.0"
+aya-ebpf = "0.2.1"
+bytemuck = { version = "1.23", default-features = false, features = ["derive"] }
+clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.4"
+fast-common = { path = "fast-common" }
+humantime = "2.3"
+libc = "0.2"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
