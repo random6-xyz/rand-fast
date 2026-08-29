@@ -13,6 +13,8 @@ pub struct Cli {
 pub enum Command {
     /// Measure scheduler latency for a process and its threads.
     Sched(SchedArgs),
+    /// Measure CPU usage and on-CPU hot stacks.
+    Cpu(CpuArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -43,6 +45,17 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
         return Err("duration must be greater than zero".to_string());
     }
     Ok(duration)
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CpuArgs {
+    /// Process ID (TGID) to observe.
+    #[arg(long, value_name = "PID", value_parser = parse_pid)]
+    pub pid: u32,
+
+    /// Collection duration, for example 10s or 500ms.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    pub duration: Duration,
 }
 
 #[cfg(test)]

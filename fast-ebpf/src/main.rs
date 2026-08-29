@@ -5,13 +5,14 @@
 use core::panic::PanicInfo;
 
 use aya_ebpf::{
-    bindings::{BPF_ANY, BPF_NOEXIST},
-    helpers::{bpf_get_smp_processor_id, bpf_ktime_get_ns},
+    bindings::{BPF_ANY, BPF_F_REUSE_STACKID, BPF_NOEXIST},
+    helpers::{bpf_get_stackid, bpf_get_smp_processor_id, bpf_ktime_get_ns},
     macros::{map, tracepoint},
-    maps::{HashMap, LruHashMap, PerfEventArray},
+    maps::{HashMap, LruHashMap, PerfEventArray, StackTrace},
     programs::TracePointContext,
+    EbpfContext,
 };
-use fast_common::{MAX_TARGET_TIDS, PendingWakeup, SchedulerLatencyEvent};
+use fast_common::{CpuSampleEvent, MAX_STACKS, MAX_TARGET_TIDS, PendingWakeup, SchedulerLatencyEvent};
 
 // The offsets are the stable payload offsets of the Linux scheduler tracepoints:
 // trace_entry is 8 bytes, followed by the fields declared in include/trace/events/sched.h.
@@ -30,6 +31,12 @@ static PENDING_WAKEUPS: LruHashMap<u32, PendingWakeup> =
 
 #[map]
 static EVENTS: PerfEventArray<SchedulerLatencyEvent> = PerfEventArray::new(0);
+
+#[map]
+static CPU_EVENTS: PerfEventArray<CpuSampleEvent> = PerfEventArray::new(0);
+
+#[map]
+static STACK_TRACES: StackTrace = StackTrace::with_max_entries(MAX_STACKS, 0);
 
 #[tracepoint(name = "sched_wakeup", category = "sched")]
 pub fn sched_wakeup(ctx: TracePointContext) -> u32 {
@@ -86,16 +93,42 @@ fn try_sched_switch(ctx: TracePointContext) -> Result<u32, u32> {
         return Ok(0);
     }
 
+    let run_cpu = unsafe { bpf_get_smp_processor_id() };
     let event = SchedulerLatencyEvent {
         latency_ns: run_ns - pending.wake_ns,
         wake_ns: pending.wake_ns,
         run_ns,
         tid,
         wake_cpu: pending.wake_cpu,
-        run_cpu: unsafe { bpf_get_smp_processor_id() },
+        run_cpu,
         reserved: 0,
     };
     EVENTS.output(&ctx, event, BPF_ANY);
+
+    // Best-effort on-CPU sampling for hot-stack reporting.
+    let kstack = unsafe {
+        bpf_get_stackid(
+            ctx.as_ptr() as *mut core::ffi::c_void,
+            &STACK_TRACES as *const _ as *mut core::ffi::c_void,
+            0,
+        )
+    };
+    let ustack = unsafe {
+        bpf_get_stackid(
+            ctx.as_ptr() as *mut core::ffi::c_void,
+            &STACK_TRACES as *const _ as *mut core::ffi::c_void,
+            256 | BPF_F_REUSE_STACKID as u64,
+        )
+    };
+    let cpu_sample = CpuSampleEvent {
+        tid,
+        cpu: run_cpu,
+        kernel_stack_id: kstack as i64,
+        user_stack_id: ustack as i64,
+        _pad: 0,
+        _pad2: 0,
+    };
+    CPU_EVENTS.output(&ctx, cpu_sample, BPF_ANY);
 
     Ok(0)
 }

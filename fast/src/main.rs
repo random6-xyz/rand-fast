@@ -1,5 +1,6 @@
 mod cli;
 mod collector;
+mod cpu;
 mod output;
 mod process;
 mod stats;
@@ -23,5 +24,6 @@ fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Sched(args) => collector::run(args),
+        Command::Cpu(args) => cpu::run(args),
     }
 }
