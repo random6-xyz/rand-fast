@@ -15,6 +15,16 @@ pub enum Command {
     Sched(SchedArgs),
     /// Measure CPU usage and on-CPU hot stacks.
     Cpu(CpuArgs),
+    /// Measure disk I/O latency.
+    Io(IoArgs),
+    /// Measure network latency and retransmissions.
+    Net(NetArgs),
+    /// Measure off-CPU wait time.
+    OffCpu(OffCpuArgs),
+    /// Measure memory pressure.
+    Memory(MemoryArgs),
+    /// Diagnose likely causes.
+    Diagnose(DiagnoseArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -55,6 +65,65 @@ pub struct CpuArgs {
 
     /// Collection duration, for example 10s or 500ms.
     #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    pub duration: Duration,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct IoArgs {
+    /// Process ID (TGID) to observe.
+    #[arg(long, value_name = "PID", value_parser = parse_pid)]
+    pub pid: u32,
+
+    /// Collection duration, for example 10s or 500ms.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    pub duration: Duration,
+
+    /// Slow I/O threshold (default 10ms).
+    #[arg(long, default_value = "10ms", value_parser = parse_duration)]
+    pub threshold: Duration,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct NetArgs {
+    /// Process ID (TGID) to observe.
+    #[arg(long, value_name = "PID", value_parser = parse_pid)]
+    pub pid: u32,
+
+    /// Collection duration, for example 10s or 500ms.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    pub duration: Duration,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct OffCpuArgs {
+    /// Process ID (TGID) to observe.
+    #[arg(long, value_name = "PID", value_parser = parse_pid)]
+    pub pid: u32,
+
+    /// Collection duration, for example 10s or 500ms.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    pub duration: Duration,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct MemoryArgs {
+    /// Process ID (TGID) to observe.
+    #[arg(long, value_name = "PID", value_parser = parse_pid)]
+    pub pid: u32,
+
+    /// Collection duration, for example 10s or 500ms.
+    #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
+    pub duration: Duration,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DiagnoseArgs {
+    /// Process ID (TGID) to diagnose.
+    #[arg(long, value_name = "PID", value_parser = parse_pid)]
+    pub pid: u32,
+
+    /// Collection duration, for example 10s or 500ms.
+    #[arg(long, default_value = "10s", value_parser = parse_duration)]
     pub duration: Duration,
 }
 

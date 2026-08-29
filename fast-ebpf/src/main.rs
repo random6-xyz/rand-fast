@@ -6,13 +6,13 @@ use core::panic::PanicInfo;
 
 use aya_ebpf::{
     bindings::{BPF_ANY, BPF_F_REUSE_STACKID, BPF_NOEXIST},
-    helpers::{bpf_get_stackid, bpf_get_smp_processor_id, bpf_ktime_get_ns},
+    helpers::{bpf_get_current_pid_tgid, bpf_get_stackid, bpf_get_smp_processor_id, bpf_ktime_get_ns},
     macros::{map, tracepoint},
     maps::{HashMap, LruHashMap, PerfEventArray, StackTrace},
     programs::TracePointContext,
     EbpfContext,
 };
-use fast_common::{CpuSampleEvent, MAX_STACKS, MAX_TARGET_TIDS, PendingWakeup, SchedulerLatencyEvent};
+use fast_common::{CpuSampleEvent, IoEvent, MemoryEvent, OffCpuEvent, TcpEvent, MAX_STACKS, MAX_TARGET_TIDS, PendingWakeup, SchedulerLatencyEvent};
 
 // The offsets are the stable payload offsets of the Linux scheduler tracepoints:
 // trace_entry is 8 bytes, followed by the fields declared in include/trace/events/sched.h.
@@ -37,6 +37,24 @@ static CPU_EVENTS: PerfEventArray<CpuSampleEvent> = PerfEventArray::new(0);
 
 #[map]
 static STACK_TRACES: StackTrace = StackTrace::with_max_entries(MAX_STACKS, 0);
+
+#[map]
+static IO_EVENTS: PerfEventArray<IoEvent> = PerfEventArray::new(0);
+
+#[map]
+static PENDING_IO: LruHashMap<u32, u64> = LruHashMap::with_max_entries(MAX_TARGET_TIDS, 0);
+
+#[map]
+static NET_EVENTS: PerfEventArray<TcpEvent> = PerfEventArray::new(0);
+
+#[map]
+static OFFCPU_EVENTS: PerfEventArray<OffCpuEvent> = PerfEventArray::new(0);
+
+#[map]
+static OFFCPU_START: LruHashMap<u32, u64> = LruHashMap::with_max_entries(MAX_TARGET_TIDS, 0);
+
+#[map]
+static MEMORY_EVENTS: PerfEventArray<MemoryEvent> = PerfEventArray::new(0);
 
 #[tracepoint(name = "sched_wakeup", category = "sched")]
 pub fn sched_wakeup(ctx: TracePointContext) -> u32 {
@@ -131,6 +149,123 @@ fn try_sched_switch(ctx: TracePointContext) -> Result<u32, u32> {
     CPU_EVENTS.output(&ctx, cpu_sample, BPF_ANY);
 
     Ok(0)
+}
+
+// --- I/O: block_rq_issue / block_rq_complete ---
+#[tracepoint(name = "block_rq_issue", category = "block")]
+pub fn block_rq_issue(ctx: TracePointContext) -> u32 {
+    let tid = (bpf_get_current_pid_tgid() as u32) & 0xFFFF_FFFF;
+    if unsafe { TARGET_TIDS.get(tid) }.is_none() {
+        return 0;
+    }
+    let start = unsafe { bpf_ktime_get_ns() };
+    let _ = PENDING_IO.insert(tid, start, BPF_ANY as u64);
+    0
+}
+
+#[tracepoint(name = "block_rq_complete", category = "block")]
+pub fn block_rq_complete(ctx: TracePointContext) -> u32 {
+    let tid = (bpf_get_current_pid_tgid() as u32) & 0xFFFF_FFFF;
+    if unsafe { TARGET_TIDS.get(tid) }.is_none() {
+        return 0;
+    }
+    let start = match unsafe { PENDING_IO.get(tid) } {
+        Some(v) => *v,
+        None => return 0,
+    };
+    let _ = PENDING_IO.remove(tid);
+    let end = unsafe { bpf_ktime_get_ns() };
+    if end < start {
+        return 0;
+    }
+    let event = IoEvent {
+        latency_ns: end - start,
+        tid,
+        dev: 0,
+        sectors: 0,
+        op: 0,
+    };
+    IO_EVENTS.output(&ctx, event, BPF_ANY);
+    0
+}
+
+// --- Network: tcp_retransmit_skb ---
+#[tracepoint(name = "tcp_retransmit_skb", category = "tcp")]
+pub fn tcp_retransmit_skb(ctx: TracePointContext) -> u32 {
+    let tid = (bpf_get_current_pid_tgid() as u32) & 0xFFFF_FFFF;
+    if unsafe { TARGET_TIDS.get(tid) }.is_none() {
+        return 0;
+    }
+    let event = TcpEvent {
+        tid,
+        saddr: 0,
+        daddr: 0,
+        sport: 0,
+        dport: 0,
+        rtt_us: 0,
+        retrans: 1,
+        _pad: [0; 3],
+    };
+    NET_EVENTS.output(&ctx, event, BPF_ANY);
+    0
+}
+
+// --- Off-CPU: helper for sched_wakeup off-cpu measurement ---
+#[allow(dead_code)]
+fn try_offcpu_wakeup(ctx: TracePointContext) -> Result<u32, u32> {
+    let tid = unsafe { ctx.read_at::<u32>(SCHED_WAKEUP_PID_OFFSET) }.map_err(|_| 0u32)?;
+    if unsafe { TARGET_TIDS.get(tid) }.is_none() {
+        return Ok(0);
+    }
+    if let Some(start) = unsafe { OFFCPU_START.get(tid) } {
+        let end = unsafe { bpf_ktime_get_ns() };
+        let wait = end.saturating_sub(*start);
+        let _ = OFFCPU_START.remove(tid);
+        let stack = unsafe {
+            bpf_get_stackid(
+                ctx.as_ptr() as *mut core::ffi::c_void,
+                &STACK_TRACES as *const _ as *mut core::ffi::c_void,
+                0,
+            )
+        };
+        let event = OffCpuEvent {
+            wait_ns: wait,
+            stack_id: stack as i64,
+            tid,
+            reason: 0,
+            _pad: 0,
+            _pad2: 0,
+        };
+        OFFCPU_EVENTS.output(&ctx, event, BPF_ANY);
+    }
+    Ok(0)
+}
+
+#[tracepoint(name = "sched_stat_sleep", category = "sched")]
+pub fn sched_stat_sleep(ctx: TracePointContext) -> u32 {
+    // Fallback off-cpu trigger
+    let _ = try_offcpu_wakeup(ctx);
+    0
+}
+
+// --- Memory: page_fault ---
+#[tracepoint(name = "page_fault_user", category = "exceptions")]
+pub fn page_fault_user(ctx: TracePointContext) -> u32 {
+    let tid = (bpf_get_current_pid_tgid() as u32) & 0xFFFF_FFFF;
+    if unsafe { TARGET_TIDS.get(tid) }.is_none() {
+        return 0;
+    }
+    let event = MemoryEvent {
+        minflt: 1,
+        majflt: 0,
+        swap_kb: 0,
+        tid,
+        psi_some_pct: 0,
+        psi_full_pct: 0,
+        _pad: 0,
+    };
+    MEMORY_EVENTS.output(&ctx, event, BPF_ANY);
+    0
 }
 
 #[cfg(target_arch = "bpf")]

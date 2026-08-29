@@ -1,6 +1,12 @@
 mod cli;
 mod collector;
 mod cpu;
+mod daemon;
+mod diagnose;
+mod io;
+mod memory;
+mod network;
+mod offcpu;
 mod output;
 mod process;
 mod stats;
@@ -25,5 +31,10 @@ fn run() -> anyhow::Result<()> {
     match cli.command {
         Command::Sched(args) => collector::run(args),
         Command::Cpu(args) => cpu::run(args),
+        Command::Io(args) => io::run(args),
+        Command::Net(args) => network::run(args),
+        Command::OffCpu(args) => offcpu::run(args),
+        Command::Memory(args) => memory::run(args),
+        Command::Diagnose(args) => diagnose::run(args),
     }
 }

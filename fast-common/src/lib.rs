@@ -16,6 +16,10 @@ pub const SLOW_50MS_NS: u64 = 50_000_000;
 pub enum EventType {
     SchedulerLatency = 1,
     CpuSample = 2,
+    Io = 3,
+    Network = 4,
+    OffCpu = 5,
+    Memory = 6,
 }
 
 /// A scheduler latency sample emitted when a target thread starts running.
@@ -61,6 +65,56 @@ pub struct CpuUsageSnapshot {
     pub total_ticks: u64,
 }
 
+/// I/O latency event attributed to a thread and block device.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct IoEvent {
+    pub latency_ns: u64,
+    pub tid: u32,
+    pub dev: u32,
+    pub sectors: u32,
+    pub op: u32,
+}
+
+/// TCP/network event for RTT and retransmission.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct TcpEvent {
+    pub tid: u32,
+    pub saddr: u32,
+    pub daddr: u32,
+    pub rtt_us: u32,
+    pub sport: u16,
+    pub dport: u16,
+    pub retrans: u8,
+    pub _pad: [u8; 3],
+}
+
+/// Off-CPU wait event with stack.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct OffCpuEvent {
+    pub wait_ns: u64,
+    pub stack_id: i64,
+    pub tid: u32,
+    pub reason: u32,
+    pub _pad: u32,
+    pub _pad2: u32,
+}
+
+/// Memory pressure snapshot.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct MemoryEvent {
+    pub minflt: u64,
+    pub majflt: u64,
+    pub swap_kb: u64,
+    pub tid: u32,
+    pub psi_some_pct: u32,
+    pub psi_full_pct: u32,
+    pub _pad: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,5 +130,29 @@ mod tests {
     fn pending_layout_is_stable() {
         assert_eq!(size_of::<PendingWakeup>(), 16);
         assert_eq!(align_of::<PendingWakeup>(), 8);
+    }
+
+    #[test]
+    fn io_event_layout_is_stable() {
+        assert_eq!(size_of::<IoEvent>(), 24);
+        assert_eq!(align_of::<IoEvent>(), 8);
+    }
+
+    #[test]
+    fn tcp_event_layout_is_stable() {
+        assert_eq!(size_of::<TcpEvent>(), 24);
+        assert_eq!(align_of::<TcpEvent>(), 4);
+    }
+
+    #[test]
+    fn offcpu_event_layout_is_stable() {
+        assert_eq!(size_of::<OffCpuEvent>(), 32);
+        assert_eq!(align_of::<OffCpuEvent>(), 8);
+    }
+
+    #[test]
+    fn memory_event_layout_is_stable() {
+        assert_eq!(size_of::<MemoryEvent>(), 40);
+        assert_eq!(align_of::<MemoryEvent>(), 8);
     }
 }
