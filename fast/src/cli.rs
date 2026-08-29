@@ -25,6 +25,8 @@ pub enum Command {
     Memory(MemoryArgs),
     /// Diagnose likely causes.
     Diagnose(DiagnoseArgs),
+    /// Flight recorder daemon.
+    Daemon(DaemonArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -125,6 +127,25 @@ pub struct DiagnoseArgs {
     /// Collection duration, for example 10s or 500ms.
     #[arg(long, default_value = "10s", value_parser = parse_duration)]
     pub duration: Duration,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DaemonArgs {
+    /// Process ID (TGID) to observe.
+    #[arg(long, value_name = "PID", value_parser = parse_pid)]
+    pub pid: u32,
+
+    /// Collection duration (0 for infinite).
+    #[arg(long, default_value = "0s", value_parser = parse_duration)]
+    pub duration: Duration,
+
+    /// Trigger threshold for scheduler p95 (default 10ms).
+    #[arg(long, default_value = "10ms", value_parser = parse_duration)]
+    pub trigger: Duration,
+
+    /// Output directory for incidents.
+    #[arg(long, default_value = "./incidents")]
+    pub output: std::path::PathBuf,
 }
 
 #[cfg(test)]
