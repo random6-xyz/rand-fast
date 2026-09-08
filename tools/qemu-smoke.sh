@@ -3,8 +3,13 @@
 #
 # Records verifier results and idle-vs-load deltas for sched, cpu, io, net,
 # and off-cpu, one case per line, so results can be pasted into the README
-# matrix. Run it as root inside the QEMU guest (7.2.0-rc6 bpf-next bzImage,
-# see README) or on a host where you hold CAP_BPF + CAP_PERFMON.
+# matrix. Run it as root inside the QEMU guest (the kernel used for the
+# matrix, see README) or on a host where you hold CAP_BPF + CAP_PERFMON.
+#
+# Besides the matrix, the v1.0 accuracy checks quantify:
+# - cpu rate scaling: samples scale with --frequency x CPU time,
+# - cpu symbolization: the lock-hog futex wait path appears in top stacks,
+# - io per-request pairing: completions match issues (ratio ~ 1).
 #
 # Expected working directory contents (release binaries):
 #   ./fast  ./sched-workload  ./fast-workload
@@ -126,6 +131,97 @@ run_case cpu "$SCHED_WORKLOAD" hog --duration 30s --workers 8
 run_case io "$FAST_WORKLOAD" io-hog --duration 30s --workers 2 --path "$IO_HOG_PATH"
 run_case net "$FAST_WORKLOAD" net-hog --duration 30s --workers 4
 run_case off-cpu "$FAST_WORKLOAD" lock-hog --duration 30s --workers 16
+
+# --- v1.0 accuracy checks ---
+check_cpu_rate_scaling() {
+    # Samples must scale with frequency x CPU time: 396 Hz yields ~4x the
+    # sample count of 99 Hz against the same busy-spin hog.
+    "$SCHED_WORKLOAD" hog --duration 20s --workers 8 >/dev/null 2>&1 &
+    local hog_pid=$!
+    sleep 0.3
+    local one four ratio_ok=1
+    if ! "$FAST" cpu --pid "$hog_pid" --duration "$DURATION" \
+        >"$OUT_DIR/cpu-rate-1x.txt" 2>&1; then
+        echo "cpu rate scaling: FAIL (99 Hz collection failed)"
+        FAILURES=$((FAILURES + 1))
+        kill "$hog_pid" 2>/dev/null
+        return
+    fi
+    if ! "$FAST" cpu --pid "$hog_pid" --duration "$DURATION" --frequency 396 \
+        >"$OUT_DIR/cpu-rate-4x.txt" 2>&1; then
+        echo "cpu rate scaling: FAIL (396 Hz collection failed)"
+        FAILURES=$((FAILURES + 1))
+        kill "$hog_pid" 2>/dev/null
+        return
+    fi
+    one=$(grep -m1 '^Samples:' "$OUT_DIR/cpu-rate-1x.txt" | awk '{print $2}')
+    four=$(grep -m1 '^Samples:' "$OUT_DIR/cpu-rate-4x.txt" | awk '{print $2}')
+    awk -v a="${one:-0}" -v b="${four:-0}" \
+        'BEGIN { if (a+0 <= 0) { print "cpu rate scaling: FAIL (no samples at 99 Hz)"; exit 1 }
+                 r = (b+0) / (a+0)
+                 printf "cpu rate scaling: %d samples at 99 Hz -> %d samples at 396 Hz (%.2fx)\n", a, b, r
+                 exit (r >= 3 && r <= 5.5) ? 0 : 1 }' || ratio_ok=0
+    if [ "$ratio_ok" -ne 1 ]; then
+        FAILURES=$((FAILURES + 1))
+    fi
+    kill "$hog_pid" 2>/dev/null
+    wait "$hog_pid" 2>/dev/null
+}
+
+check_cpu_symbolization() {
+    # The lock-hog fixture parks in futex syscalls; the futex wait path must
+    # show up symbolized in the hot stacks (kernel frames and user frames).
+    "$FAST_WORKLOAD" lock-hog --duration 20s --workers 16 >/dev/null 2>&1 &
+    local hog_pid=$!
+    sleep 0.3
+    local report="$OUT_DIR/cpu-symbols.txt"
+    if "$FAST" cpu --pid "$hog_pid" --duration "$DURATION" >"$report" 2>&1; then
+        if grep -q '\[k\] .*futex' "$report" \
+            && grep -Eq '^  [0-9]+ +[A-Za-z_]' "$report"; then
+            echo "cpu symbolization: pass (futex kernel frames + symbolized user frames)"
+        else
+            echo "cpu symbolization: FAIL (futex path not visible; see $report)"
+            FAILURES=$((FAILURES + 1))
+        fi
+    else
+        echo "cpu symbolization: FAIL (collection failed; see $report)"
+        FAILURES=$((FAILURES + 1))
+    fi
+    kill "$hog_pid" 2>/dev/null
+    wait "$hog_pid" 2>/dev/null
+}
+
+check_io_pairing() {
+    # Per-request tracking: the completion count must approach the issue
+    # count. The fixture runs 8s and the collection starts 0.2s later and
+    # stops when the fixture exits, so ~0.97 is the ceiling; the pre-v1.0
+    # TID matching paired only a fraction of a percent.
+    "$FAST_WORKLOAD" io-hog --duration 8s --workers 2 --path "$IO_HOG_PATH" \
+        >"$OUT_DIR/io-pair-fixture.log" 2>&1 &
+    local hog_pid=$!
+    sleep 0.2
+    local report="$OUT_DIR/io-pair.txt"
+    if "$FAST" io --pid "$hog_pid" --duration 8s >"$report" 2>&1; then
+        local samples reads
+        samples=$(grep -m1 '^Samples:' "$report" | awk '{print $2}')
+        reads=$(grep -m1 'in [0-9]* reads' "$OUT_DIR/io-pair-fixture.log" | awk '{print $6}')
+        awk -v s="${samples:-0}" -v r="${reads:-0}" \
+            'BEGIN { if (r+0 == 0) { print "io pairing: FAIL (fixture performed no reads)"; exit 1 }
+                     p = (s+0) / (r+0) * 100
+                     printf "io pairing: %s completions for %s reads (%.1f%%)\n", s, r, p
+                     exit (p >= 80) ? 0 : 1 }' \
+            || FAILURES=$((FAILURES + 1))
+    else
+        echo "io pairing: FAIL (collection failed; see $report)"
+        FAILURES=$((FAILURES + 1))
+    fi
+    kill "$hog_pid" 2>/dev/null
+    wait "$hog_pid" 2>/dev/null
+}
+
+check_cpu_rate_scaling
+check_cpu_symbolization
+check_io_pairing
 
 echo "=== key metrics ==="
 print_metrics() {

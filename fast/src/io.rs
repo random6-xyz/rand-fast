@@ -1,12 +1,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    convert::TryInto,
     fs,
+    path::Path,
 };
 
 use anyhow::{Context, Result};
-use aya::{Ebpf, include_bytes_aligned, maps::HashMap as AyaHashMap, maps::MapData};
-use fast_common::IoEvent;
+use aya::{Ebpf, include_bytes_aligned};
+use fast_common::{IoEvent, io_op_name};
 
 use crate::{cli::IoArgs, process, runtime};
 
@@ -14,12 +14,89 @@ use crate::{cli::IoArgs, process, runtime};
 /// keeps event loss low.
 const PERF_PAGE_COUNT: usize = 64;
 
+/// Upper bound on rows in the slow-I/O table (the slowest ones are kept).
+const SLOW_TABLE_ROWS: usize = 16;
+
+/// Aggregate counters for one operation kind.
+#[derive(Debug, Default, Clone, Copy)]
+struct OpStats {
+    count: u64,
+    sectors: u64,
+}
+
+impl OpStats {
+    fn record(&mut self, sectors: u32) {
+        self.count += 1;
+        self.sectors += u64::from(sectors);
+    }
+}
+
+/// Per-device statistics: latency samples, operation split, and sectors moved.
+#[derive(Debug, Default)]
+struct DeviceStats {
+    latencies: Vec<u64>,
+    read: OpStats,
+    write: OpStats,
+    other: OpStats,
+}
+
+impl DeviceStats {
+    fn record(&mut self, event: &IoEvent) {
+        self.latencies.push(event.latency_ns);
+        match event.op {
+            0 => self.read.record(event.sectors),
+            1 => self.write.record(event.sectors),
+            _ => self.other.record(event.sectors),
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.latencies.len()
+    }
+
+    fn sectors(&self) -> u64 {
+        self.read.sectors + self.write.sectors + self.other.sectors
+    }
+}
+
+/// One row of the slow-I/O table; ordered by latency for a bounded min-heap.
+/// Equality is latency-based: two rows with the same latency are
+/// interchangeable in the table.
+#[derive(Debug, Clone, Copy)]
+struct SlowEntry {
+    latency_ns: u64,
+    event: IoEvent,
+}
+
+impl PartialEq for SlowEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.latency_ns == other.latency_ns
+    }
+}
+
+impl Eq for SlowEntry {}
+
+impl Ord for SlowEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.latency_ns.cmp(&other.latency_ns)
+    }
+}
+
+impl PartialOrd for SlowEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[derive(Debug)]
 struct IoStats {
     threshold_ns: u64,
     latencies: Vec<u64>,
-    by_device: BTreeMap<u32, Vec<u64>>,
+    by_device: BTreeMap<u32, DeviceStats>,
+    /// Total number of I/Os above the threshold.
     slow: u64,
+    /// The `SLOW_TABLE_ROWS` slowest I/Os above the threshold.
+    slow_top: std::collections::BinaryHeap<std::cmp::Reverse<SlowEntry>>,
     lost: u64,
 }
 
@@ -30,35 +107,62 @@ impl IoStats {
             latencies: Vec::new(),
             by_device: BTreeMap::new(),
             slow: 0,
+            slow_top: std::collections::BinaryHeap::new(),
             lost: 0,
         }
     }
 
     fn record(&mut self, event: IoEvent) {
         self.latencies.push(event.latency_ns);
-        self.by_device
-            .entry(event.dev)
-            .or_default()
-            .push(event.latency_ns);
+        self.by_device.entry(event.dev).or_default().record(&event);
         if event.latency_ns > self.threshold_ns {
             self.slow += 1;
+            let entry = std::cmp::Reverse(SlowEntry {
+                latency_ns: event.latency_ns,
+                event,
+            });
+            if self.slow_top.len() < SLOW_TABLE_ROWS {
+                self.slow_top.push(entry);
+            } else if let Some(std::cmp::Reverse(smallest)) = self.slow_top.peek()
+                && entry.0 > *smallest
+            {
+                self.slow_top.pop();
+                self.slow_top.push(entry);
+            }
         }
     }
+
     fn record_lost(&mut self, count: u64) {
         self.lost = self.lost.saturating_add(count);
     }
+
     fn summary(&self) -> Option<Summary> {
         summary(&self.latencies)
     }
-    fn device_summaries(&self) -> Vec<(u32, Summary)> {
-        let mut out = Vec::new();
-        for (dev, vals) in &self.by_device {
-            if let Some(s) = summary(vals) {
-                out.push((*dev, s));
-            }
+
+    /// Slow-I/O table rows, slowest first.
+    fn slow_table(&self) -> Vec<SlowEntry> {
+        let mut rows: Vec<_> = self
+            .slow_top
+            .iter()
+            .map(|std::cmp::Reverse(entry)| *entry)
+            .collect();
+        rows.sort_by_key(|entry| std::cmp::Reverse(entry.latency_ns));
+        rows
+    }
+
+    /// Operation split across all devices: (read, write, other).
+    fn op_summary(&self) -> (OpStats, OpStats, OpStats) {
+        let mut total = (OpStats::default(), OpStats::default(), OpStats::default());
+        for device in self.by_device.values() {
+            total.0.count += device.read.count;
+            total.0.sectors += device.read.sectors;
+            total.1.count += device.write.count;
+            total.1.sectors += device.write.sectors;
+            total.2.count += device.other.count;
+            total.2.sectors += device.other.sectors;
         }
-        out.sort_by_key(|(d, _)| *d);
-        out
+        total
     }
 }
 
@@ -115,6 +219,41 @@ fn format_ns(ns: u64) -> String {
     format!("{:.2} s", ns as f64 / 1_000_000_000.0)
 }
 
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    let value = bytes as f64;
+    if value < KIB {
+        return format!("{bytes} B");
+    }
+    if value < KIB * KIB {
+        return format!("{:.1} KiB", value / KIB);
+    }
+    if value < KIB * KIB * KIB {
+        return format!("{:.1} MiB", value / (KIB * KIB));
+    }
+    format!("{:.2} GiB", value / (KIB * KIB * KIB))
+}
+
+/// Resolves a kernel `dev_t` (major << 20 | minor) to its sysfs device name,
+/// for example `vdb1` or `sda`.
+fn block_dev_name(dev: u32) -> Option<String> {
+    let major = dev >> 20;
+    let minor = dev & 0xFFFFF;
+    let path = fs::canonicalize(format!("/sys/dev/block/{major}:{minor}")).ok()?;
+    Path::new(&path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+fn device_label(dev: u32) -> String {
+    let major = dev >> 20;
+    let minor = dev & 0xFFFFF;
+    match block_dev_name(dev) {
+        Some(name) => format!("{name} ({major}:{minor})"),
+        None => format!("{major}:{minor}"),
+    }
+}
+
 fn read_proc_io(pid: u32) -> Result<(u64, u64)> {
     let content = fs::read_to_string(format!("/proc/{pid}/io"))
         .with_context(|| format!("failed to read /proc/{pid}/io"))?;
@@ -128,6 +267,23 @@ fn read_proc_io(pid: u32) -> Result<(u64, u64)> {
         }
     }
     Ok((rchar, wchar))
+}
+
+fn print_op_split(read: OpStats, write: OpStats, other: OpStats) {
+    let mut parts = Vec::new();
+    for (stats, name) in [(read, "read"), (write, "write"), (other, "other")] {
+        if stats.count > 0 {
+            parts.push(format!(
+                "{name} {} ({})",
+                stats.count,
+                format_bytes(stats.sectors * 512)
+            ));
+        }
+    }
+    if parts.is_empty() {
+        return;
+    }
+    println!("ops: {}", parts.join(", "));
 }
 
 pub fn run(args: IoArgs) -> Result<()> {
@@ -147,20 +303,16 @@ pub fn run(args: IoArgs) -> Result<()> {
     runtime::attach_tracepoint(&mut bpf, "block", "block_rq_complete")?;
 
     let mut target_tids = runtime::take_target_map(&mut bpf)?;
-    let pending_map = bpf
-        .take_map("PENDING_IO")
-        .context("eBPF map PENDING_IO is missing")?;
-    let mut pending_io: AyaHashMap<MapData, u32, u64> = pending_map
-        .try_into()
-        .context("PENDING_IO has an unexpected map type or layout")?;
 
     let mut known_tids = BTreeSet::new();
     let mut stats = IoStats::new(threshold.as_nanos() as u64);
     let (rchar_start, wchar_start) = read_proc_io(pid).unwrap_or((0, 0));
-    let summary = runtime::run_collection(
+    let collection = runtime::run_collection(
         &mut bpf,
         &mut target_tids,
-        &mut pending_io,
+        // Pending I/O lives in a request-keyed LRU map inside the eBPF
+        // program; no TID-keyed pending state needs thread-exit cleanup.
+        &mut runtime::NoPendingCleanup,
         &mut known_tids,
         &initial_tids,
         &mut stats,
@@ -178,8 +330,11 @@ pub fn run(args: IoArgs) -> Result<()> {
     let wchar_delta = wchar_end.saturating_sub(wchar_start);
 
     println!("PID: {process_name} ({pid})");
-    println!("Duration: {}", humantime::format_duration(summary.elapsed));
-    if summary.interrupted {
+    println!(
+        "Duration: {}",
+        humantime::format_duration(collection.elapsed)
+    );
+    if collection.interrupted {
         println!("Status: interrupted");
     }
     println!("Samples: {}", stats.latencies.len());
@@ -191,40 +346,75 @@ pub fn run(args: IoArgs) -> Result<()> {
     );
     println!("rchar: {rchar_delta} bytes, wchar: {wchar_delta} bytes");
     println!();
+
     println!("I/O latency");
     match stats.summary() {
         Some(s) => {
+            println!("{:<8}{:>10}", "samples", s.count);
             println!("{:<8}{:>10}", "p50", format_ns(s.p50_ns));
             println!("{:<8}{:>10}", "p95", format_ns(s.p95_ns));
             println!("{:<8}{:>10}", "p99", format_ns(s.p99_ns));
             println!("{:<8}{:>10}", "max", format_ns(s.max_ns));
+            let (read, write, other) = stats.op_summary();
+            print_op_split(read, write, other);
         }
         None => println!("No I/O samples were collected."),
     }
     println!();
+
     println!("Per-device latency");
-    let dev_summaries = stats.device_summaries();
-    if dev_summaries.is_empty() {
+    let devices: Vec<(&u32, &DeviceStats)> = stats.by_device.iter().collect();
+    if devices.is_empty() {
         println!("No per-device samples were collected.");
     } else {
-        for (dev, s) in dev_summaries {
-            let major = dev >> 20;
-            let minor = dev & 0xFFFFF;
+        for (dev, device) in devices {
             println!(
-                "dev {major}:{minor} samples {:<4} p50 {:>10} p95 {:>10} p99 {:>10} max {:>10}",
-                s.count,
-                format_ns(s.p50_ns),
-                format_ns(s.p95_ns),
-                format_ns(s.p99_ns),
-                format_ns(s.max_ns)
+                "dev {:<12} samples {:<6} sectors {}",
+                device_label(*dev),
+                device.count(),
+                device.sectors()
             );
+            let (read, write, other) = (device.read, device.write, device.other);
+            print_op_split(read, write, other);
+            if let Some(s) = summary(&device.latencies) {
+                println!(
+                    "  p50 {:>10} p95 {:>10} p99 {:>10} max {:>10}",
+                    format_ns(s.p50_ns),
+                    format_ns(s.p95_ns),
+                    format_ns(s.p99_ns),
+                    format_ns(s.max_ns)
+                );
+            }
         }
     }
     println!();
+
+    let slow_rows = stats.slow_table();
     println!(
-        "Slow-device threshold: {} (configurable via --threshold)",
-        humantime::format_duration(threshold)
+        "Slow I/O > {} (top {} of {})",
+        humantime::format_duration(threshold),
+        slow_rows.len(),
+        stats.slow
     );
+    if slow_rows.is_empty() {
+        println!("(none)");
+    } else {
+        println!(
+            "{:>10}  {:<12}  {:<5}  {:>8}  {:>9}  {:>7}",
+            "latency", "device", "op", "sectors", "bytes", "tid"
+        );
+        for row in slow_rows {
+            println!(
+                "{:>10}  {:<12}  {:<5}  {:>8}  {:>9}  {:>7}",
+                format_ns(row.latency_ns),
+                device_label(row.event.dev),
+                io_op_name(row.event.op),
+                row.event.sectors,
+                format_bytes(u64::from(row.event.sectors) * 512),
+                row.event.tid
+            );
+        }
+    }
     Ok(())
 }
 
@@ -232,35 +422,27 @@ pub fn run(args: IoArgs) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn io_event(latency_ms: u64, dev: u32, op: u32, sectors: u32) -> IoEvent {
+        IoEvent {
+            latency_ns: latency_ms * 1_000_000,
+            tid: 1,
+            dev,
+            sectors,
+            op,
+        }
+    }
+
     #[test]
     fn counts_slow_and_device() {
         let mut s = IoStats::new(1_000_000);
-        s.record(IoEvent {
-            latency_ns: 5_000_000,
-            tid: 1,
-            dev: 0x0801,
-            sectors: 8,
-            op: 0,
-        });
-        s.record(IoEvent {
-            latency_ns: 5_000_000,
-            tid: 1,
-            dev: 0x0801,
-            sectors: 8,
-            op: 0,
-        });
+        s.record(io_event(5, 0x0801, 0, 8));
+        s.record(io_event(5, 0x0801, 0, 8));
         assert_eq!(s.slow, 2);
         assert_eq!(s.by_device.len(), 1);
         assert_eq!(s.latencies.len(), 2);
 
         let mut strict = IoStats::new(10_000_000);
-        strict.record(IoEvent {
-            latency_ns: 5_000_000,
-            tid: 1,
-            dev: 0x0801,
-            sectors: 8,
-            op: 0,
-        });
+        strict.record(io_event(5, 0x0801, 0, 8));
         assert_eq!(strict.slow, 0);
     }
 
@@ -268,16 +450,71 @@ mod tests {
     fn summary_computed() {
         let mut s = IoStats::new(100_000_000);
         for i in 1..=10u64 {
-            s.record(IoEvent {
-                latency_ns: i * 1_000_000,
-                tid: 1,
-                dev: 0,
-                sectors: 1,
-                op: 0,
-            });
+            s.record(io_event(i, 0, 0, 1));
         }
         let sum = s.summary().unwrap();
         assert!(sum.p50_ns > 0);
         assert_eq!(sum.max_ns, 10_000_000);
+    }
+
+    #[test]
+    fn splits_operations_per_device() {
+        let mut s = IoStats::new(1_000_000_000);
+        s.record(io_event(1, 0x0801, 0, 8));
+        s.record(io_event(1, 0x0801, 0, 8));
+        s.record(io_event(1, 0x0801, 1, 16));
+        s.record(io_event(1, 0x0801, 7, 4));
+        s.record(io_event(1, 0x0802, 1, 32));
+
+        let device = &s.by_device[&0x0801];
+        assert_eq!(device.read.count, 2);
+        assert_eq!(device.read.sectors, 16);
+        assert_eq!(device.write.count, 1);
+        assert_eq!(device.write.sectors, 16);
+        assert_eq!(device.other.count, 1);
+        assert_eq!(device.other.sectors, 4);
+        assert_eq!(device.sectors(), 36);
+
+        let (read, write, other) = s.op_summary();
+        assert_eq!(read.count, 2);
+        assert_eq!(write.count, 2);
+        assert_eq!(write.sectors, 48);
+        assert_eq!(other.count, 1);
+    }
+
+    #[test]
+    fn slow_table_keeps_slowest_rows() {
+        let mut s = IoStats::new(1_000_000);
+        // 20 slow I/Os strictly above the 1 ms threshold: 2..=21 ms.
+        for i in 2..=21u64 {
+            s.record(io_event(i, 0x0801, 0, 8));
+        }
+        assert_eq!(s.slow, 20);
+        let rows = s.slow_table();
+        assert_eq!(rows.len(), SLOW_TABLE_ROWS);
+        // The slowest (21 ms) first, truncated before the fastest (6 ms).
+        assert_eq!(rows[0].latency_ns, 21_000_000);
+        assert_eq!(rows[SLOW_TABLE_ROWS - 1].latency_ns, 6_000_000);
+    }
+
+    #[test]
+    fn formats_bytes() {
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(512 * 1024), "512.0 KiB");
+        assert_eq!(format_bytes(2 * 1024 * 1024), "2.0 MiB");
+    }
+
+    #[test]
+    fn formats_seconds() {
+        assert_eq!(format_ns(1_250_000_000), "1.25 s");
+        assert_eq!(format_ns(2_000_000_000), "2.00 s");
+    }
+
+    #[test]
+    fn op_names() {
+        assert_eq!(io_op_name(0), "read");
+        assert_eq!(io_op_name(1), "write");
+        assert_eq!(io_op_name(7), "other");
     }
 }

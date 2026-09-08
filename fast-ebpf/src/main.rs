@@ -10,14 +10,14 @@ use aya_ebpf::{
     helpers::{
         bpf_get_current_pid_tgid, bpf_get_smp_processor_id, bpf_get_stackid, bpf_ktime_get_ns,
     },
-    macros::{map, tracepoint},
+    macros::{map, perf_event, tracepoint},
     maps::{HashMap, LruHashMap, PerfEventArray, StackTrace},
-    programs::TracePointContext,
+    programs::{PerfEventContext, TracePointContext},
 };
 use fast_common::{
     COLLECT_CPU_SAMPLE, COLLECT_OFFCPU, COLLECT_SCHEDULER_LATENCY, CpuSampleEvent, IoEvent,
-    MAX_STACKS, MAX_TARGET_TIDS, MemoryEvent, OffCpuEvent, PendingWakeup, SchedulerLatencyEvent,
-    TcpEvent,
+    IoRequestKey, MAX_PENDING_IO, MAX_STACKS, MAX_TARGET_TIDS, MemoryEvent, OffCpuEvent, PendingIo,
+    PendingWakeup, SchedulerLatencyEvent, TcpEvent,
 };
 
 // The offsets are the stable payload offsets of the Linux scheduler tracepoints:
@@ -26,6 +26,20 @@ const SCHED_WAKEUP_PID_OFFSET: usize = 24;
 const SCHED_SWITCH_PREV_PID_OFFSET: usize = 24;
 const SCHED_SWITCH_PREV_STATE_OFFSET: usize = 32;
 const SCHED_SWITCH_NEXT_PID_OFFSET: usize = 56;
+
+// Payload offsets of the block request tracepoints, verified against the
+// format files that tools/qemu-guest-init.sh dumps on the target kernel
+// (7.2.3-arch1-3):
+//   issue:    dev=8(4) sector=16(8) nr_sector=24(4) bytes=28(4) ioprio=32(2)
+//             rwbs[10]=34 comm[16]=44 cmd=60
+//   complete: dev=8(4) sector=16(8) nr_sector=24(4) error=28(4) ioprio=32(2)
+//             rwbs[10]=34 cmd=44
+// The operation is the first character of the rwbs string, which is how the
+// kernel renders req_op for the trace (R read, W write, D discard, ...).
+const BLOCK_RQ_DEV_OFFSET: usize = 8;
+const BLOCK_RQ_SECTOR_OFFSET: usize = 16;
+const BLOCK_RQ_NR_SECTOR_OFFSET: usize = 24;
+const BLOCK_RQ_RWBS_OFFSET: usize = 34;
 
 #[cfg(not(target_arch = "bpf"))]
 fn main() {}
@@ -51,11 +65,19 @@ static CPU_EVENTS: PerfEventArray<CpuSampleEvent> = PerfEventArray::new(0);
 #[map]
 static STACK_TRACES: StackTrace = StackTrace::with_max_entries(MAX_STACKS, 0);
 
+/// User-space stacks live in their own map: `bpf_get_stackid` chains entries
+/// with equal ids (the id is a hash index, not a unique key), so sharing one
+/// map between kernel and user captures would make lookups return whichever
+/// stack was captured last for that id.
+#[map]
+static STACK_TRACES_USER: StackTrace = StackTrace::with_max_entries(MAX_STACKS, 0);
+
 #[map]
 static IO_EVENTS: PerfEventArray<IoEvent> = PerfEventArray::new(0);
 
 #[map]
-static PENDING_IO: LruHashMap<u32, u64> = LruHashMap::with_max_entries(MAX_TARGET_TIDS, 0);
+static PENDING_IO: LruHashMap<IoRequestKey, PendingIo> =
+    LruHashMap::with_max_entries(MAX_PENDING_IO, 0);
 
 #[map]
 static NET_EVENTS: PerfEventArray<TcpEvent> = PerfEventArray::new(0);
@@ -88,9 +110,7 @@ fn try_sched_wakeup(ctx: TracePointContext) -> Result<u32, u32> {
 
     // A runnable task should retain the timestamp of its first observed wakeup.
     // BPF_NOEXIST also avoids replacing it if multiple wakeup notifications race.
-    if mode & (COLLECT_SCHEDULER_LATENCY | COLLECT_CPU_SAMPLE) != 0
-        && unsafe { PENDING_WAKEUPS.get(tid) }.is_none()
-    {
+    if mode & COLLECT_SCHEDULER_LATENCY != 0 && unsafe { PENDING_WAKEUPS.get(tid) }.is_none() {
         let pending = PendingWakeup {
             wake_ns: unsafe { bpf_ktime_get_ns() },
             wake_cpu: unsafe { bpf_get_smp_processor_id() },
@@ -158,7 +178,7 @@ fn try_sched_switch(ctx: TracePointContext) -> Result<u32, u32> {
         return Ok(0);
     }
 
-    if mode & (COLLECT_SCHEDULER_LATENCY | COLLECT_CPU_SAMPLE) != 0 {
+    if mode & COLLECT_SCHEDULER_LATENCY != 0 {
         let pending = match unsafe { PENDING_WAKEUPS.get(tid) } {
             Some(pending) => *pending,
             None => return Ok(0),
@@ -171,86 +191,158 @@ fn try_sched_switch(ctx: TracePointContext) -> Result<u32, u32> {
         }
 
         let run_cpu = unsafe { bpf_get_smp_processor_id() };
-        if mode & COLLECT_SCHEDULER_LATENCY != 0 {
-            let event = SchedulerLatencyEvent {
-                latency_ns: run_ns - pending.wake_ns,
-                wake_ns: pending.wake_ns,
-                run_ns,
-                tid,
-                wake_cpu: pending.wake_cpu,
-                run_cpu,
-                reserved: 0,
-            };
-            EVENTS.output(&ctx, event, BPF_ANY);
-        }
-
-        // Best-effort on-CPU sampling for hot-stack reporting.
-        if mode & COLLECT_CPU_SAMPLE != 0 {
-            let kstack = unsafe {
-                bpf_get_stackid(
-                    ctx.as_ptr(),
-                    &STACK_TRACES as *const _ as *mut core::ffi::c_void,
-                    0,
-                )
-            };
-            let ustack = unsafe {
-                bpf_get_stackid(
-                    ctx.as_ptr(),
-                    &STACK_TRACES as *const _ as *mut core::ffi::c_void,
-                    256 | BPF_F_REUSE_STACKID as u64,
-                )
-            };
-            let cpu_sample = CpuSampleEvent {
-                tid,
-                cpu: run_cpu,
-                kernel_stack_id: kstack as i64,
-                user_stack_id: ustack as i64,
-                _pad: 0,
-                _pad2: 0,
-            };
-            CPU_EVENTS.output(&ctx, cpu_sample, BPF_ANY);
-        }
+        let event = SchedulerLatencyEvent {
+            latency_ns: run_ns - pending.wake_ns,
+            wake_ns: pending.wake_ns,
+            run_ns,
+            tid,
+            wake_cpu: pending.wake_cpu,
+            run_cpu,
+            reserved: 0,
+        };
+        EVENTS.output(&ctx, event, BPF_ANY);
     }
 
     Ok(0)
 }
 
-// --- I/O: block_rq_issue / block_rq_complete ---
-#[tracepoint(name = "block_rq_issue", category = "block")]
-pub fn block_rq_issue(_ctx: TracePointContext) -> u32 {
+// --- CPU: on-CPU sampling via perf cpu-clock events ---
+/// Samples the stack of whichever target thread is running when the perf
+/// event fires. `fast cpu` attaches this program per CPU with a fixed
+/// frequency, so the sample count scales with sampling rate times CPU time —
+/// unlike the old switch-in capture, which scaled with wakeup count and
+/// never saw a busy thread that sleeps between wakeups.
+#[perf_event]
+pub fn cpu_sample(ctx: PerfEventContext) -> u32 {
+    match try_cpu_sample(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_cpu_sample(ctx: PerfEventContext) -> Result<u32, u32> {
+    if unsafe { MODE.get(0) }.copied().unwrap_or(0) & COLLECT_CPU_SAMPLE == 0 {
+        return Ok(0);
+    }
+
+    // The event fires in the context of the interrupted task, so the current
+    // TID identifies the thread that was on CPU. The idle task (TID 0) and
+    // all non-target threads are filtered out here.
     let tid = bpf_get_current_pid_tgid() as u32;
     if unsafe { TARGET_TIDS.get(tid) }.is_none() {
-        return 0;
+        return Ok(0);
     }
-    let start = unsafe { bpf_ktime_get_ns() };
-    let _ = PENDING_IO.insert(tid, start, BPF_ANY as u64);
-    0
+
+    let cpu = unsafe { bpf_get_smp_processor_id() };
+    let kstack = unsafe {
+        bpf_get_stackid(
+            ctx.as_ptr(),
+            &STACK_TRACES as *const _ as *mut core::ffi::c_void,
+            0,
+        )
+    };
+    // BPF_F_USER_STACK (256) selects the user-space stack of the interrupted
+    // task; BPF_F_REUSE_STACKID lets different samples share one entry.
+    let ustack = unsafe {
+        bpf_get_stackid(
+            ctx.as_ptr(),
+            &STACK_TRACES_USER as *const _ as *mut core::ffi::c_void,
+            256 | BPF_F_REUSE_STACKID as u64,
+        )
+    };
+    let cpu_sample = CpuSampleEvent {
+        tid,
+        cpu,
+        kernel_stack_id: kstack as i64,
+        user_stack_id: ustack as i64,
+        _pad: 0,
+        _pad2: 0,
+    };
+    CPU_EVENTS.output(&ctx, cpu_sample, BPF_ANY);
+    Ok(0)
+}
+
+// --- I/O: block_rq_issue / block_rq_complete ---
+#[tracepoint(name = "block_rq_issue", category = "block")]
+pub fn block_rq_issue(ctx: TracePointContext) -> u32 {
+    match try_block_rq_issue(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_block_rq_issue(ctx: TracePointContext) -> Result<u32, u32> {
+    let tid = bpf_get_current_pid_tgid() as u32;
+    if unsafe { TARGET_TIDS.get(tid) }.is_none() {
+        return Ok(0);
+    }
+
+    let dev = unsafe { ctx.read_at::<u32>(BLOCK_RQ_DEV_OFFSET) }.map_err(|_| 0u32)?;
+    let sector = unsafe { ctx.read_at::<u64>(BLOCK_RQ_SECTOR_OFFSET) }.map_err(|_| 0u32)?;
+    let rwbs_op = unsafe { ctx.read_at::<u8>(BLOCK_RQ_RWBS_OFFSET) }.map_err(|_| 0u32)?;
+
+    // Key the request by (device, start sector) so the completion can find it
+    // from IRQ/softirq context. BPF_NOEXIST keeps the first outstanding
+    // request on a colliding key instead of letting a second issue overwrite
+    // and misattribute it.
+    let key = IoRequestKey {
+        dev,
+        _pad: 0,
+        sector,
+    };
+    let pending = PendingIo {
+        start_ns: unsafe { bpf_ktime_get_ns() },
+        tid,
+        op: match rwbs_op {
+            b'R' => 0,
+            b'W' => 1,
+            _ => 2,
+        },
+    };
+    let _ = PENDING_IO.insert(key, pending, BPF_NOEXIST as u64);
+    Ok(0)
 }
 
 #[tracepoint(name = "block_rq_complete", category = "block")]
 pub fn block_rq_complete(ctx: TracePointContext) -> u32 {
-    let tid = bpf_get_current_pid_tgid() as u32;
-    if unsafe { TARGET_TIDS.get(tid) }.is_none() {
-        return 0;
+    match try_block_rq_complete(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
     }
-    let start = match unsafe { PENDING_IO.get(tid) } {
-        Some(v) => *v,
-        None => return 0,
+}
+
+fn try_block_rq_complete(ctx: TracePointContext) -> Result<u32, u32> {
+    // The completion usually runs in IRQ/softirq context, so the current TID
+    // says nothing about the issuer: the pending entry, found through the
+    // request key, carries the issuing thread.
+    let dev = unsafe { ctx.read_at::<u32>(BLOCK_RQ_DEV_OFFSET) }.map_err(|_| 0u32)?;
+    let sector = unsafe { ctx.read_at::<u64>(BLOCK_RQ_SECTOR_OFFSET) }.map_err(|_| 0u32)?;
+    let nr_sector = unsafe { ctx.read_at::<u32>(BLOCK_RQ_NR_SECTOR_OFFSET) }.map_err(|_| 0u32)?;
+    let key = IoRequestKey {
+        dev,
+        _pad: 0,
+        sector,
     };
-    let _ = PENDING_IO.remove(tid);
+
+    let pending = match unsafe { PENDING_IO.get(key) } {
+        Some(pending) => *pending,
+        None => return Ok(0),
+    };
+    let _ = PENDING_IO.remove(key);
+
     let end = unsafe { bpf_ktime_get_ns() };
-    if end < start {
-        return 0;
+    if end < pending.start_ns {
+        return Ok(0);
     }
     let event = IoEvent {
-        latency_ns: end - start,
-        tid,
-        dev: 0,
-        sectors: 0,
-        op: 0,
+        latency_ns: end - pending.start_ns,
+        tid: pending.tid,
+        dev,
+        sectors: nr_sector,
+        op: pending.op,
     };
     IO_EVENTS.output(&ctx, event, BPF_ANY);
-    0
+    Ok(0)
 }
 
 // --- Network: tcp_retransmit_skb ---

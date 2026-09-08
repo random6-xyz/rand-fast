@@ -111,6 +111,18 @@ impl<V: AyaPod> PendingCleanup for AyaHashMap<MapData, u32, V> {
     }
 }
 
+/// Pending-state no-op for collectors whose pending maps are not keyed by
+/// TID, so thread-exit cleanup has nothing to remove: on-CPU sampling keeps
+/// no pending state, and per-request I/O entries die through the map's LRU
+/// eviction instead.
+pub struct NoPendingCleanup;
+
+impl PendingCleanup for NoPendingCleanup {
+    fn clear(&mut self, _tid: u32) -> Result<(), MapError> {
+        Ok(())
+    }
+}
+
 /// Takes the shared `TARGET_TIDS` map out of the loaded eBPF object.
 pub fn take_target_map(bpf: &mut Ebpf) -> Result<AyaHashMap<MapData, u32, u8>> {
     let map = bpf

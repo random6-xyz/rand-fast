@@ -2,8 +2,24 @@
 
 use bytemuck::{Pod, Zeroable};
 
+/// Map-facing types need to satisfy aya's `Pod` marker so the userspace crate
+/// can put them into aya maps. Implemented only under the opt-in `aya`
+/// feature because the eBPF build must not link aya.
+#[cfg(feature = "aya")]
+mod aya_pod {
+    unsafe impl aya::Pod for crate::PendingIo {}
+    unsafe impl aya::Pod for crate::IoRequestKey {}
+}
+
 pub const MAX_TARGET_TIDS: u32 = 4096;
-pub const MAX_STACKS: u32 = 256;
+/// Upper bound for in-flight per-request I/O entries. Only target-issued
+/// requests enter the map, so this is generous headroom over any realistic
+/// queue depth.
+pub const MAX_PENDING_IO: u32 = 8192;
+/// Stack trace map capacity. Sized for periodic on-CPU sampling where many
+/// distinct user/kernel stacks accumulate over a run; entries are allocated
+/// lazily (~1 KiB each at the default 127-frame depth).
+pub const MAX_STACKS: u32 = 4096;
 pub const MAX_STACK_DEPTH: u32 = 32;
 
 pub const SLOW_1MS_NS: u64 = 1_000_000;
@@ -49,6 +65,43 @@ pub struct PendingWakeup {
     pub wake_ns: u64,
     pub wake_cpu: u32,
     pub reserved: u32,
+}
+
+/// Pending block I/O request state carried from `block_rq_issue` to
+/// `block_rq_complete`. `op` is the operation code derived from the trace's
+/// rwbs field: 0 read, 1 write, 2 anything else (see [`io_op_name`]).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct PendingIo {
+    pub start_ns: u64,
+    pub tid: u32,
+    pub op: u32,
+}
+
+/// Identity of one in-flight block request: the device and its start sector.
+///
+/// `block_rq_issue` and `block_rq_complete` both carry these fields in their
+/// tracepoint payloads, which makes the pair a portable request key. The
+/// request pointer is not reachable from `BPF_PROG_TYPE_TRACEPOINT` programs
+/// (only raw/BTF tracepoints expose TP_PROTO arguments), so the pair stands
+/// in for it: an in-flight request is uniquely identified by where it starts.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct IoRequestKey {
+    pub dev: u32,
+    pub _pad: u32,
+    pub sector: u64,
+}
+
+/// Human-readable name for the operation code stored in I/O events. The
+/// eBPF side derives it from the rwbs field's first character: 0 read,
+/// 1 write, 2 anything else (discard, zone ops, ...).
+pub fn io_op_name(op: u32) -> &'static str {
+    match op {
+        0 => "read",
+        1 => "write",
+        _ => "other",
+    }
 }
 
 /// On-CPU sampling event for hot-stack reporting.
@@ -137,6 +190,49 @@ mod tests {
     fn pending_layout_is_stable() {
         assert_eq!(size_of::<PendingWakeup>(), 16);
         assert_eq!(align_of::<PendingWakeup>(), 8);
+    }
+
+    #[test]
+    fn pending_io_layout_is_stable() {
+        assert_eq!(size_of::<PendingIo>(), 16);
+        assert_eq!(align_of::<PendingIo>(), 8);
+    }
+
+    #[test]
+    fn io_request_key_layout_is_stable() {
+        assert_eq!(size_of::<IoRequestKey>(), 16);
+        assert_eq!(align_of::<IoRequestKey>(), 8);
+    }
+
+    #[test]
+    fn io_op_names() {
+        assert_eq!(io_op_name(0), "read");
+        assert_eq!(io_op_name(1), "write");
+        assert_eq!(io_op_name(2), "other");
+    }
+
+    #[test]
+    fn cpu_sample_event_layout_is_stable() {
+        assert_eq!(size_of::<CpuSampleEvent>(), 32);
+        assert_eq!(align_of::<CpuSampleEvent>(), 8);
+    }
+
+    #[test]
+    fn cpu_sample_event_round_trips_through_bytes() {
+        let event = CpuSampleEvent {
+            tid: 42,
+            cpu: 3,
+            kernel_stack_id: 7,
+            user_stack_id: -1,
+            _pad: 0,
+            _pad2: 0,
+        };
+        let decoded: CpuSampleEvent = bytemuck::pod_read_unaligned(bytemuck::bytes_of(&event));
+        assert_eq!(bytemuck::bytes_of(&decoded), bytemuck::bytes_of(&event));
+        assert_eq!(decoded.tid, 42);
+        assert_eq!(decoded.cpu, 3);
+        assert_eq!(decoded.kernel_stack_id, 7);
+        assert_eq!(decoded.user_stack_id, -1);
     }
 
     #[test]
