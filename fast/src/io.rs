@@ -1,11 +1,8 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    convert::TryInto,
-    fs,
-};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 
 use anyhow::{Context, Result};
-use aya::{Ebpf, include_bytes_aligned, maps::HashMap as AyaHashMap, maps::MapData};
+use aya::{Ebpf, include_bytes_aligned};
 use fast_common::IoEvent;
 
 use crate::{cli::IoArgs, process, runtime};
@@ -147,13 +144,6 @@ pub fn run(args: IoArgs) -> Result<()> {
     runtime::attach_tracepoint(&mut bpf, "block", "block_rq_complete")?;
 
     let mut target_tids = runtime::take_target_map(&mut bpf)?;
-    let pending_map = bpf
-        .take_map("PENDING_IO")
-        .context("eBPF map PENDING_IO is missing")?;
-    let mut pending_io: AyaHashMap<MapData, u32, fast_common::PendingIo> =
-        pending_map
-            .try_into()
-            .context("PENDING_IO has an unexpected map type or layout")?;
 
     let mut known_tids = BTreeSet::new();
     let mut stats = IoStats::new(threshold.as_nanos() as u64);
@@ -161,7 +151,9 @@ pub fn run(args: IoArgs) -> Result<()> {
     let summary = runtime::run_collection(
         &mut bpf,
         &mut target_tids,
-        &mut pending_io,
+        // Pending I/O lives in a request-keyed LRU map inside the eBPF
+        // program; no TID-keyed pending state needs thread-exit cleanup.
+        &mut runtime::NoPendingCleanup,
         &mut known_tids,
         &initial_tids,
         &mut stats,

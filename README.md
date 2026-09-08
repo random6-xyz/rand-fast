@@ -138,6 +138,10 @@ Measures block I/O latency from `block_rq_issue` / `block_rq_complete`, and
 reads `/proc/<pid>/io` counters for byte deltas. The tracepoint payloads are
 parsed: each event carries the device (`major:minor`), start sector, size in
 sectors, and the operation (read/write) taken from the issue `cmd_flags`.
+Requests are paired per request, not per issuing thread: the pending map is
+keyed by (device, start sector), so completions that run in IRQ/softirq
+context still attribute to the issuing thread and completion rate tracks
+issue rate.
 `--threshold` (default `10ms`) controls the slow-I/O counter.
 
 ```bash

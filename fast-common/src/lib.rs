@@ -8,9 +8,14 @@ use bytemuck::{Pod, Zeroable};
 #[cfg(feature = "aya")]
 mod aya_pod {
     unsafe impl aya::Pod for crate::PendingIo {}
+    unsafe impl aya::Pod for crate::IoRequestKey {}
 }
 
 pub const MAX_TARGET_TIDS: u32 = 4096;
+/// Upper bound for in-flight per-request I/O entries. Only target-issued
+/// requests enter the map, so this is generous headroom over any realistic
+/// queue depth.
+pub const MAX_PENDING_IO: u32 = 8192;
 /// Stack trace map capacity. Sized for periodic on-CPU sampling where many
 /// distinct user/kernel stacks accumulate over a run; entries are allocated
 /// lazily (~1 KiB each at the default 127-frame depth).
@@ -71,6 +76,21 @@ pub struct PendingIo {
     pub start_ns: u64,
     pub tid: u32,
     pub cmd_flags: u32,
+}
+
+/// Identity of one in-flight block request: the device and its start sector.
+///
+/// `block_rq_issue` and `block_rq_complete` both carry these fields in their
+/// tracepoint payloads, which makes the pair a portable request key. The
+/// request pointer is not reachable from `BPF_PROG_TYPE_TRACEPOINT` programs
+/// (only raw/BTF tracepoints expose TP_PROTO arguments), so the pair stands
+/// in for it: an in-flight request is uniquely identified by where it starts.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct IoRequestKey {
+    pub dev: u32,
+    pub _pad: u32,
+    pub sector: u64,
 }
 
 /// Human-readable name for a block request operation code (the high 8 bits
@@ -175,6 +195,12 @@ mod tests {
     fn pending_io_layout_is_stable() {
         assert_eq!(size_of::<PendingIo>(), 16);
         assert_eq!(align_of::<PendingIo>(), 8);
+    }
+
+    #[test]
+    fn io_request_key_layout_is_stable() {
+        assert_eq!(size_of::<IoRequestKey>(), 16);
+        assert_eq!(align_of::<IoRequestKey>(), 8);
     }
 
     #[test]

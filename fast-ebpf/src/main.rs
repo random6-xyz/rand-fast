@@ -16,8 +16,8 @@ use aya_ebpf::{
 };
 use fast_common::{
     COLLECT_CPU_SAMPLE, COLLECT_OFFCPU, COLLECT_SCHEDULER_LATENCY, CpuSampleEvent, IoEvent,
-    MAX_STACKS, MAX_TARGET_TIDS, MemoryEvent, OffCpuEvent, PendingIo, PendingWakeup,
-    SchedulerLatencyEvent, TcpEvent,
+    IoRequestKey, MAX_PENDING_IO, MAX_STACKS, MAX_TARGET_TIDS, MemoryEvent, OffCpuEvent, PendingIo,
+    PendingWakeup, SchedulerLatencyEvent, TcpEvent,
 };
 
 // The offsets are the stable payload offsets of the Linux scheduler tracepoints:
@@ -65,7 +65,8 @@ static STACK_TRACES: StackTrace = StackTrace::with_max_entries(MAX_STACKS, 0);
 static IO_EVENTS: PerfEventArray<IoEvent> = PerfEventArray::new(0);
 
 #[map]
-static PENDING_IO: LruHashMap<u32, PendingIo> = LruHashMap::with_max_entries(MAX_TARGET_TIDS, 0);
+static PENDING_IO: LruHashMap<IoRequestKey, PendingIo> =
+    LruHashMap::with_max_entries(MAX_PENDING_IO, 0);
 
 #[map]
 static NET_EVENTS: PerfEventArray<TcpEvent> = PerfEventArray::new(0);
@@ -265,14 +266,26 @@ fn try_block_rq_issue(ctx: TracePointContext) -> Result<u32, u32> {
         return Ok(0);
     }
 
+    let dev = unsafe { ctx.read_at::<u32>(BLOCK_RQ_DEV_OFFSET) }.map_err(|_| 0u32)?;
+    let sector = unsafe { ctx.read_at::<u64>(BLOCK_RQ_SECTOR_OFFSET) }.map_err(|_| 0u32)?;
     let cmd_flags =
         unsafe { ctx.read_at::<u32>(BLOCK_RQ_ISSUE_CMD_FLAGS_OFFSET) }.map_err(|_| 0u32)?;
+
+    // Key the request by (device, start sector) so the completion can find it
+    // from IRQ/softirq context. BPF_NOEXIST keeps the first outstanding
+    // request on a colliding key instead of letting a second issue overwrite
+    // and misattribute it.
+    let key = IoRequestKey {
+        dev,
+        _pad: 0,
+        sector,
+    };
     let pending = PendingIo {
         start_ns: unsafe { bpf_ktime_get_ns() },
         tid,
         cmd_flags,
     };
-    let _ = PENDING_IO.insert(tid, pending, BPF_ANY as u64);
+    let _ = PENDING_IO.insert(key, pending, BPF_NOEXIST as u64);
     Ok(0)
 }
 
@@ -286,17 +299,22 @@ pub fn block_rq_complete(ctx: TracePointContext) -> u32 {
 
 fn try_block_rq_complete(ctx: TracePointContext) -> Result<u32, u32> {
     // The completion usually runs in IRQ/softirq context, so the current TID
-    // says nothing about the issuer: only a pending entry can attribute the
-    // completion to the issuing thread.
+    // says nothing about the issuer: the pending entry, found through the
+    // request key, carries the issuing thread.
     let dev = unsafe { ctx.read_at::<u32>(BLOCK_RQ_DEV_OFFSET) }.map_err(|_| 0u32)?;
     let sector = unsafe { ctx.read_at::<u64>(BLOCK_RQ_SECTOR_OFFSET) }.map_err(|_| 0u32)?;
     let nr_sector = unsafe { ctx.read_at::<u32>(BLOCK_RQ_NR_SECTOR_OFFSET) }.map_err(|_| 0u32)?;
+    let key = IoRequestKey {
+        dev,
+        _pad: 0,
+        sector,
+    };
 
-    let pending = match unsafe { PENDING_IO.get(&(bpf_get_current_pid_tgid() as u32)) } {
+    let pending = match unsafe { PENDING_IO.get(key) } {
         Some(pending) => *pending,
         None => return Ok(0),
     };
-    let _ = PENDING_IO.remove(&(bpf_get_current_pid_tgid() as u32));
+    let _ = PENDING_IO.remove(key);
 
     let end = unsafe { bpf_ktime_get_ns() };
     if end < pending.start_ns {
