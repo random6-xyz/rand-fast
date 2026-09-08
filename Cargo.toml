@@ -5,11 +5,13 @@ members = [
     "fast-common",
     "fast-ebpf",
     "tools/sched-workload",
+    "tools/fast-workload",
 ]
 default-members = [
     "fast",
     "fast-common",
     "tools/sched-workload",
+    "tools/fast-workload",
 ]
 
 [workspace.package]
