@@ -6,3 +6,10 @@ license.workspace = true
 
 [dependencies]
 bytemuck.workspace = true
+aya = { workspace = true, optional = true, default-features = false }
+
+[features]
+# Exposes `unsafe impl aya::Pod` for the map-facing event types so the
+# userspace crate can store them in aya maps. Kept opt-in because the eBPF
+# build must not link aya.
+aya = ["dep:aya"]

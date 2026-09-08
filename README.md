@@ -135,8 +135,10 @@ rate scaling.
 ### `fast io`
 
 Measures block I/O latency from `block_rq_issue` / `block_rq_complete`, and
-reads `/proc/<pid>/io` counters for byte deltas. `--threshold` (default
-`10ms`) controls the slow-I/O counter.
+reads `/proc/<pid>/io` counters for byte deltas. The tracepoint payloads are
+parsed: each event carries the device (`major:minor`), start sector, size in
+sectors, and the operation (read/write) taken from the issue `cmd_flags`.
+`--threshold` (default `10ms`) controls the slow-I/O counter.
 
 ```bash
 sudo ./target/release/fast io --pid 1234 --duration 10s --threshold 10ms

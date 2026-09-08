@@ -21,7 +21,7 @@ license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1.0"
-aya = "0.14.0"
+aya = { version = "0.14.0", default-features = false }
 aya-build = "0.2.0"
 aya-ebpf = "0.2.1"
 bytemuck = { version = "1.23", default-features = false, features = ["derive"] }

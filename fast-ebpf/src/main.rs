@@ -16,8 +16,8 @@ use aya_ebpf::{
 };
 use fast_common::{
     COLLECT_CPU_SAMPLE, COLLECT_OFFCPU, COLLECT_SCHEDULER_LATENCY, CpuSampleEvent, IoEvent,
-    MAX_STACKS, MAX_TARGET_TIDS, MemoryEvent, OffCpuEvent, PendingWakeup, SchedulerLatencyEvent,
-    TcpEvent,
+    MAX_STACKS, MAX_TARGET_TIDS, MemoryEvent, OffCpuEvent, PendingIo, PendingWakeup,
+    SchedulerLatencyEvent, TcpEvent,
 };
 
 // The offsets are the stable payload offsets of the Linux scheduler tracepoints:
@@ -26,6 +26,16 @@ const SCHED_WAKEUP_PID_OFFSET: usize = 24;
 const SCHED_SWITCH_PREV_PID_OFFSET: usize = 24;
 const SCHED_SWITCH_PREV_STATE_OFFSET: usize = 32;
 const SCHED_SWITCH_NEXT_PID_OFFSET: usize = 56;
+
+// Payload offsets of the block request tracepoints: trace_entry is 8 bytes,
+// then dev (dev_t, 4 bytes), a 4-byte alignment hole, sector (u64), and
+// nr_sector (u32). block_rq_issue carries cmd_flags at 28; block_rq_complete
+// carries the completion error there instead. Verified against the tracepoint
+// format files on the 6.x/7.x kernels used in the QEMU smoke matrix.
+const BLOCK_RQ_DEV_OFFSET: usize = 8;
+const BLOCK_RQ_SECTOR_OFFSET: usize = 16;
+const BLOCK_RQ_NR_SECTOR_OFFSET: usize = 24;
+const BLOCK_RQ_ISSUE_CMD_FLAGS_OFFSET: usize = 28;
 
 #[cfg(not(target_arch = "bpf"))]
 fn main() {}
@@ -55,7 +65,7 @@ static STACK_TRACES: StackTrace = StackTrace::with_max_entries(MAX_STACKS, 0);
 static IO_EVENTS: PerfEventArray<IoEvent> = PerfEventArray::new(0);
 
 #[map]
-static PENDING_IO: LruHashMap<u32, u64> = LruHashMap::with_max_entries(MAX_TARGET_TIDS, 0);
+static PENDING_IO: LruHashMap<u32, PendingIo> = LruHashMap::with_max_entries(MAX_TARGET_TIDS, 0);
 
 #[map]
 static NET_EVENTS: PerfEventArray<TcpEvent> = PerfEventArray::new(0);
@@ -242,40 +252,65 @@ fn try_cpu_sample(ctx: PerfEventContext) -> Result<u32, u32> {
 
 // --- I/O: block_rq_issue / block_rq_complete ---
 #[tracepoint(name = "block_rq_issue", category = "block")]
-pub fn block_rq_issue(_ctx: TracePointContext) -> u32 {
+pub fn block_rq_issue(ctx: TracePointContext) -> u32 {
+    match try_block_rq_issue(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_block_rq_issue(ctx: TracePointContext) -> Result<u32, u32> {
     let tid = bpf_get_current_pid_tgid() as u32;
     if unsafe { TARGET_TIDS.get(tid) }.is_none() {
-        return 0;
+        return Ok(0);
     }
-    let start = unsafe { bpf_ktime_get_ns() };
-    let _ = PENDING_IO.insert(tid, start, BPF_ANY as u64);
-    0
+
+    let cmd_flags =
+        unsafe { ctx.read_at::<u32>(BLOCK_RQ_ISSUE_CMD_FLAGS_OFFSET) }.map_err(|_| 0u32)?;
+    let pending = PendingIo {
+        start_ns: unsafe { bpf_ktime_get_ns() },
+        tid,
+        cmd_flags,
+    };
+    let _ = PENDING_IO.insert(tid, pending, BPF_ANY as u64);
+    Ok(0)
 }
 
 #[tracepoint(name = "block_rq_complete", category = "block")]
 pub fn block_rq_complete(ctx: TracePointContext) -> u32 {
-    let tid = bpf_get_current_pid_tgid() as u32;
-    if unsafe { TARGET_TIDS.get(tid) }.is_none() {
-        return 0;
+    match try_block_rq_complete(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
     }
-    let start = match unsafe { PENDING_IO.get(tid) } {
-        Some(v) => *v,
-        None => return 0,
+}
+
+fn try_block_rq_complete(ctx: TracePointContext) -> Result<u32, u32> {
+    // The completion usually runs in IRQ/softirq context, so the current TID
+    // says nothing about the issuer: only a pending entry can attribute the
+    // completion to the issuing thread.
+    let dev = unsafe { ctx.read_at::<u32>(BLOCK_RQ_DEV_OFFSET) }.map_err(|_| 0u32)?;
+    let sector = unsafe { ctx.read_at::<u64>(BLOCK_RQ_SECTOR_OFFSET) }.map_err(|_| 0u32)?;
+    let nr_sector = unsafe { ctx.read_at::<u32>(BLOCK_RQ_NR_SECTOR_OFFSET) }.map_err(|_| 0u32)?;
+
+    let pending = match unsafe { PENDING_IO.get(&(bpf_get_current_pid_tgid() as u32)) } {
+        Some(pending) => *pending,
+        None => return Ok(0),
     };
-    let _ = PENDING_IO.remove(tid);
+    let _ = PENDING_IO.remove(&(bpf_get_current_pid_tgid() as u32));
+
     let end = unsafe { bpf_ktime_get_ns() };
-    if end < start {
-        return 0;
+    if end < pending.start_ns {
+        return Ok(0);
     }
     let event = IoEvent {
-        latency_ns: end - start,
-        tid,
-        dev: 0,
-        sectors: 0,
-        op: 0,
+        latency_ns: end - pending.start_ns,
+        tid: pending.tid,
+        dev,
+        sectors: nr_sector,
+        op: pending.cmd_flags >> 24,
     };
     IO_EVENTS.output(&ctx, event, BPF_ANY);
-    0
+    Ok(0)
 }
 
 // --- Network: tcp_retransmit_skb ---

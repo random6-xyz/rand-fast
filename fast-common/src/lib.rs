@@ -2,6 +2,14 @@
 
 use bytemuck::{Pod, Zeroable};
 
+/// Map-facing types need to satisfy aya's `Pod` marker so the userspace crate
+/// can put them into aya maps. Implemented only under the opt-in `aya`
+/// feature because the eBPF build must not link aya.
+#[cfg(feature = "aya")]
+mod aya_pod {
+    unsafe impl aya::Pod for crate::PendingIo {}
+}
+
 pub const MAX_TARGET_TIDS: u32 = 4096;
 /// Stack trace map capacity. Sized for periodic on-CPU sampling where many
 /// distinct user/kernel stacks accumulate over a run; entries are allocated
@@ -52,6 +60,27 @@ pub struct PendingWakeup {
     pub wake_ns: u64,
     pub wake_cpu: u32,
     pub reserved: u32,
+}
+
+/// Pending block I/O request state carried from `block_rq_issue` to
+/// `block_rq_complete`. `cmd_flags` is the raw request flag word; the
+/// operation occupies its high 8 bits (see [`io_op_name`]).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct PendingIo {
+    pub start_ns: u64,
+    pub tid: u32,
+    pub cmd_flags: u32,
+}
+
+/// Human-readable name for a block request operation code (the high 8 bits
+/// of the tracepoint's `cmd_flags`), matching the kernel's `req_op` values.
+pub fn io_op_name(op: u32) -> &'static str {
+    match op {
+        0 => "read",
+        1 => "write",
+        _ => "other",
+    }
 }
 
 /// On-CPU sampling event for hot-stack reporting.
@@ -140,6 +169,19 @@ mod tests {
     fn pending_layout_is_stable() {
         assert_eq!(size_of::<PendingWakeup>(), 16);
         assert_eq!(align_of::<PendingWakeup>(), 8);
+    }
+
+    #[test]
+    fn pending_io_layout_is_stable() {
+        assert_eq!(size_of::<PendingIo>(), 16);
+        assert_eq!(align_of::<PendingIo>(), 8);
+    }
+
+    #[test]
+    fn io_op_names() {
+        assert_eq!(io_op_name(0), "read");
+        assert_eq!(io_op_name(1), "write");
+        assert_eq!(io_op_name(2), "other");
     }
 
     #[test]

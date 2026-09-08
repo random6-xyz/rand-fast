@@ -150,9 +150,10 @@ pub fn run(args: IoArgs) -> Result<()> {
     let pending_map = bpf
         .take_map("PENDING_IO")
         .context("eBPF map PENDING_IO is missing")?;
-    let mut pending_io: AyaHashMap<MapData, u32, u64> = pending_map
-        .try_into()
-        .context("PENDING_IO has an unexpected map type or layout")?;
+    let mut pending_io: AyaHashMap<MapData, u32, fast_common::PendingIo> =
+        pending_map
+            .try_into()
+            .context("PENDING_IO has an unexpected map type or layout")?;
 
     let mut known_tids = BTreeSet::new();
     let mut stats = IoStats::new(threshold.as_nanos() as u64);

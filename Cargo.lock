@@ -375,6 +375,7 @@ dependencies = [
 name = "fast-common"
 version = "0.1.0"
 dependencies = [
+ "aya",
  "bytemuck",
 ]
 
