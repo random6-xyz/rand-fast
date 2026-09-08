@@ -1,17 +1,20 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # QEMU smoke matrix for all eBPF-backed fast subcommands.
 #
 # Records verifier results and idle-vs-load deltas for sched, cpu, io, net,
-# and offcpu, one case per line, so results can be pasted into the README
+# and off-cpu, one case per line, so results can be pasted into the README
 # matrix. Run it as root inside the QEMU guest (7.2.0-rc6 bpf-next bzImage,
 # see README) or on a host where you hold CAP_BPF + CAP_PERFMON.
 #
 # Expected working directory contents (release binaries):
 #   ./fast  ./sched-workload  ./fast-workload
+#   (override with FAST, SCHED_WORKLOAD, FAST_WORKLOAD)
 #
 # Environment overrides:
-#   DURATION   per-run collection length (default 5s)
-#   OUT_DIR    where raw reports are written (default /tmp/fast-smoke)
+#   DURATION    per-run collection length (default 5s)
+#   OUT_DIR     where raw reports are written (default /tmp/fast-smoke)
+#   IO_HOG_PATH file the io-hog reads; put it on a real block device (not
+#               tmpfs) so block_rq_* tracepoints fire (default /tmp/fast-workload-io)
 set -u
 
 FAST=${FAST:-./fast}
@@ -19,10 +22,11 @@ SCHED_WORKLOAD=${SCHED_WORKLOAD:-./sched-workload}
 FAST_WORKLOAD=${FAST_WORKLOAD:-./fast-workload}
 DURATION=${DURATION:-5s}
 OUT_DIR=${OUT_DIR:-/tmp/fast-smoke}
+IO_HOG_PATH=${IO_HOG_PATH:-/tmp/fast-workload-io}
 
 mkdir -p "$OUT_DIR"
 for binary in "$FAST" "$SCHED_WORKLOAD" "$FAST_WORKLOAD"; do
-    if [[ ! -x "$binary" ]]; then
+    if [ ! -x "$binary" ]; then
         echo "missing executable: $binary" >&2
         exit 1
     fi
@@ -31,11 +35,6 @@ done
 echo "kernel: $(uname -r)"
 echo "duration: $DURATION"
 echo
-
-start_target() {
-    "$SCHED_WORKLOAD" target --duration 30s --period 1ms >/dev/null 2>&1 &
-    echo $!
-}
 
 run_case() {
     # run_case <command> <fixture-cmd...>
@@ -57,7 +56,7 @@ run_case() {
     fi
 
     # Load case: run the fixture for the target and collect again.
-    "$@" >/dev/null 2>&1 &
+    "$@" >"$OUT_DIR/$command_name-fixture.log" 2>&1 &
     local load_pid=$!
     sleep 0.5
     "$FAST" "$command_name" --pid "$load_pid" --duration "$DURATION" \
@@ -76,10 +75,17 @@ run_sched_case() {
     local report_idle="$OUT_DIR/sched.txt"
     local report_load="$OUT_DIR/sched-load.txt"
 
-    local target_pid
-    target_pid=$(start_target)
+    "$SCHED_WORKLOAD" target --duration 30s --period 1ms >/dev/null 2>&1 &
+    local target_pid=$!
     sleep 0.3
-    "$FAST" sched --pid "$target_pid" --duration "$DURATION" >"$report_idle" 2>&1 || true
+    if "$FAST" sched --pid "$target_pid" --duration "$DURATION" >"$report_idle" 2>&1; then
+        echo "sched verifier: pass (program loaded and attached)"
+    else
+        echo "sched verifier: FAIL"
+        cat "$report_idle"
+        kill "$target_pid" 2>/dev/null
+        return
+    fi
 
     "$SCHED_WORKLOAD" hog --duration 30s --workers 8 >/dev/null 2>&1 &
     local hog_pid=$!
@@ -87,7 +93,6 @@ run_sched_case() {
     kill "$hog_pid" "$target_pid" 2>/dev/null
     wait 2>/dev/null
 
-    echo "sched verifier: pass"
     echo "  idle report: $report_idle"
     echo "  load report: $report_load"
     echo
@@ -95,18 +100,26 @@ run_sched_case() {
 
 run_sched_case
 run_case cpu "$SCHED_WORKLOAD" hog --duration 30s --workers 8
-run_case io "$FAST_WORKLOAD" io-hog --duration 30s --workers 2
+run_case io "$FAST_WORKLOAD" io-hog --duration 30s --workers 2 --path "$IO_HOG_PATH"
 run_case net "$FAST_WORKLOAD" net-hog --duration 30s --workers 4
-run_case offcpu "$FAST_WORKLOAD" lock-hog --duration 30s --workers 8
+run_case off-cpu "$FAST_WORKLOAD" lock-hog --duration 30s --workers 16
 
 echo "=== key metrics ==="
-for case_name in sched cpu io net offcpu; do
+print_metrics() {
+    # print_metrics <case-name> <grep pattern>
+    local name="$1" pattern="$2" report
     for variant in "" "-load"; do
-        report="$OUT_DIR/$case_name$variant.txt"
-        [[ -f "$report" ]] || continue
-        key=$(grep -m1 -E "p95|Samples:|Retransmissions:" "$report" || echo "(no samples)")
-        printf '%-14s %s\n' "$case_name$variant" "$key"
+        report="$OUT_DIR/$name$variant.txt"
+        [ -f "$report" ] || continue
+        echo "--- $name$variant ---"
+        grep -E "$pattern" "$report" || echo "(no match)"
     done
-done
+}
+
+print_metrics sched 'p95|> 1ms'
+print_metrics cpu 'Samples:|CPU usage:'
+print_metrics io 'Samples:|rchar:'
+print_metrics net 'Retransmissions:'
+print_metrics off-cpu 'Samples:'
 echo
 echo "Raw reports saved under $OUT_DIR"

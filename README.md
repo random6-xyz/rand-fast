@@ -42,7 +42,7 @@ the process exits.
 | `cpu`       | CPU usage and on-CPU hot stacks            | measured, stacks not symbolized |
 | `io`        | block I/O latency                          | measured, device metadata stubbed |
 | `net`       | TCP retransmissions                        | stub (RTT/endpoint fields zeroed) |
-| `offcpu`    | off-CPU wait time                          | measured, stacks not symbolized |
+| `off-cpu`   | off-CPU wait time                          | measured, stacks not symbolized |
 | `memory`    | PSI, page faults, swap                     | measured from `/proc` |
 | `diagnose`  | ranked likely causes                       | heuristic `/proc` signals only |
 | `daemon`    | flight recorder                            | stub (synthetic ring data) |
@@ -114,9 +114,11 @@ CPU saturation likely contributes to scheduler latency (CPU 96.1% with 5211 samp
 ```
 
 Verification: `fast cpu` against `./target/release/sched-workload target
---duration 30s` shows near-zero usage and few samples; against
-`./target/release/sched-workload hog --duration 30s --workers 8` the usage
-and sample counts jump.
+--duration 30s` shows thousands of samples (each wakeup emits one) and
+near-zero usage; against `./target/release/sched-workload hog --duration
+30s --workers 8` the usage jumps to ~100% per core and the correlation line
+reports pressure. The pure spin-loop hog emits no wakeup samples by design
+(it never sleeps), so the load signal is the usage percentage.
 
 ### `fast io`
 
@@ -184,37 +186,40 @@ Loopback rarely retransmits, so the counter usually stays 0; to produce real
 retransmissions, add artificial loss (requires root): `tc qdisc add dev lo
 root netem loss 1%` and clean up with `tc qdisc del dev lo root`.
 
-### `fast offcpu`
+### `fast off-cpu`
 
-Measures off-CPU wait from `sched_stat_sleep`, with kernel stack ids for hot
-wait stacks.
+Measures off-CPU wait by pairing `sched_switch` (a target thread switches
+out in a sleepable state) with `sched_wakeup` (it becomes runnable again),
+with kernel stack ids for hot wait stacks.
 
 ```bash
-sudo ./target/release/fast offcpu --pid 1234 --duration 10s
+sudo ./target/release/fast off-cpu --pid 1234 --duration 10s
 ```
 
-Sample output (lock-hog, 8 contending threads):
+Sample output (lock-hog, 16 contending threads on 8 CPUs):
 
 ```text
 PID: fast-workload (18700)
 Duration: 5s
-Samples: 15230
+Samples: 484380
 Lost: 0
 
 Off-CPU wait
-p50         12 µs
-p95        480 µs
-p99        1.1 ms
-max        9.6 ms
+p50          5 µs
+p95         55 µs
+p99        219 µs
+max        1.5 ms
 
 Hot wait stacks
-stack 7      samples 15198
+stack 140    samples 258910
 ```
 
-Verification: `fast offcpu` against `./target/release/sched-workload target
---duration 30s` collects short waits; against
-`./target/release/fast-workload lock-hog --duration 30s --workers 8` wait
-times and sample counts rise sharply from futex contention.
+Verification: `fast off-cpu` against `./target/release/sched-workload target
+--duration 30s` collects ~1000 timer-sleep waits per second (p50 ≈ the sleep
+period); against `./target/release/fast-workload lock-hog --duration 30s
+--workers 16` the sample count explodes into hundreds of thousands of short
+futex waits. Use more workers than CPUs so waiters actually park instead of
+spinning.
 
 ### `fast memory`
 
@@ -271,7 +276,7 @@ Ranked causes (deterministic):
 Evidence preserved per signal; confidence is tested and deterministic.
 For competing bottlenecks, synthetic fixtures (hog, dd, iperf, futex, stress --vm) validate ranking.
 
-Note: full diagnose would run 'fast sched/cpu/io/net/offcpu/memory' collectors in parallel for 10s
+Note: full diagnose would run 'fast sched/cpu/io/net/off-cpu/memory' collectors in parallel for 10s
 ```
 
 Verification: start `./target/release/sched-workload hog --duration 30s
@@ -326,9 +331,10 @@ Honest state of each area, as of this version:
   `dev 0:0`.
 - `net`: only `tcp_retransmit_skb` is tracked; RTT and address/port fields
   are zeroed, so no endpoint or RTT table exists yet.
-- `offcpu`: waits come from `sched_stat_sleep` duration; pairing with the
-  wake path is approximate, wait reasons are not classified, and stack ids
-  are not symbolized.
+- `off-cpu`: waits pair switch-out with the next wakeup, so the final
+  wake-to-run dispatch is counted as scheduler latency instead; stack ids
+  capture the waking context, not the sleeping frame, wait reasons are not
+  classified, and stack ids are not symbolized.
 - `memory`: pure `/proc` polling (PSI, stat, meminfo). The `MEMORY_EVENTS`
   eBPF map is emitted but not consumed by userspace.
 - `diagnose`: heuristic ranking from `/proc` only; no eBPF collection, and
@@ -348,20 +354,35 @@ tools/qemu-smoke.sh                 # writes raw reports to /tmp/fast-smoke
 ```
 
 The script also runs on a host where you hold the required capabilities.
+`tools/qemu-guest-init.sh` boots a minimal initramfs-only guest (busybox,
+the release binaries, a loopback link, and an optional ext4 scratch disk for
+the io-hog fixture) and runs the matrix automatically:
 
-Recorded results (bpf-next kernel, QEMU guest):
+```bash
+truncate -s 256M /tmp/fast-io.img && mkfs.ext4 -q -F /tmp/fast-io.img
+gcc -static -O2 -o /tmp/mount2 tools/qemu-guest-mount.c
+# build the initramfs around tools/qemu-guest-init.sh, then:
+qemu-system-x86_64 -enable-kvm -m 2048 -smp 8 \
+    -kernel vmlinuz -initrd initramfs.img.gz \
+    -append "console=ttyS0 rdinit=/init loglevel=3 panic=-1" \
+    -nographic -no-reboot -monitor none \
+    -drive file=/tmp/fast-io.img,format=raw,if=virtio
+```
 
-| Command  | Verifier | Idle                          | Load                          |
-| -------- | -------- | ----------------------------- | ----------------------------- |
-| `sched`  | pass     | p50 7µs p95 9µs p99 11µs max 69µs, slow>1ms 0 (2026-08-29, 7.2.0-rc6, 16 hog workers) | p50 3µs p95 2.3ms p99 4.0ms max 5.2ms, slow>1ms 297 |
-| `cpu`    | pending  | pending                       | pending                       |
-| `io`     | pending  | pending                       | pending                       |
-| `net`    | pending  | pending                       | pending                       |
-| `offcpu` | pending  | pending                       | pending                       |
+Recorded results (QEMU KVM guest, 8 vCPUs, kernel 7.2.3-arch1-3 with BTF,
+2026-09-08; the `sched` row keeps the earlier 7.2.0-rc6 record):
 
-The `cpu`, `io`, `net`, and `offcpu` rows are filled by running
-`tools/qemu-smoke.sh` in the guest environment and pasting the printed
-metrics into the table.
+| Command   | Verifier | Idle                                   | Load                                            |
+| --------- | -------- | -------------------------------------- | ----------------------------------------------- |
+| `sched`   | pass     | p50 7µs p95 19µs p99 35µs max 298µs, slow>1ms 0 | p50 3µs p95 15µs p99 1.0ms max 1.8ms, slow>1ms 43 |
+| `sched` (7.2.0-rc6, 2026-08-29) | pass | p50 7µs p95 9µs p99 11µs max 69µs, slow>1ms 0 | p50 3µs p95 2.3ms p99 4.0ms max 5.2ms, slow>1ms 297 |
+| `cpu`     | pass     | 4585 samples, usage 0.1%               | usage 99.4%; 0 samples (a spin hog never sleeps, samples ride wakeups) |
+| `io`      | pass     | 0 samples                              | 59 samples, p95 128µs, rchar 954 MB             |
+| `net`     | pass     | retransmissions 0                      | retransmissions 0 (loopback does not retransmit) |
+| `off-cpu` | pass     | 4576 samples, wait p50 1.1ms (timer sleep) | 484380 samples, wait p50 5µs p99 219µs (futex) |
+
+All five eBPF-backed programs load and attach in the guest, and the load
+runs show the expected signal deltas.
 
 ## Tests
 
