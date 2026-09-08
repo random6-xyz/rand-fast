@@ -148,7 +148,7 @@ issue rate.
 sudo ./target/release/fast io --pid 1234 --duration 10s --threshold 10ms
 ```
 
-Sample output (io-hog, sequential O_DIRECT reads):
+Sample output (io-hog, sequential O_DIRECT reads on a real block device):
 
 ```text
 PID: fast-workload (18500)
@@ -159,24 +159,36 @@ Slow > 10ms: 2
 rchar: 6321840128 bytes, wchar: 0 bytes
 
 I/O latency
+samples         412
 p50        1.2 ms
 p95        3.1 ms
 p99        5.8 ms
 max       21.4 ms
+ops: read 412 (1.6 GiB)
 
 Per-device latency
-dev 0:0  samples 412  p50        1.2 ms p95        3.1 ms p99        5.8 ms max       21.4 ms
+dev vdb (252:16)  samples 412  sectors 3355443
+ops: read 412 (1.6 GiB)
+  p50        1.2 ms p95        3.1 ms p99        5.8 ms max       21.4 ms
 
-Slow-device threshold: 10ms (configurable via --threshold)
+Slow I/O > 10ms (top 2 of 2)
+   latency  device       op      sectors      bytes      tid
+   21.4 ms  vdb (252:16) read           8    4.0 KiB    18501
+   12.7 ms  vdb (252:16) read           8    4.0 KiB    18501
 ```
+
+The device label resolves through `/sys/dev/block` (name plus
+`major:minor`); without a sysfs entry it falls back to `major:minor`.
 
 Verification: `fast io` against `sleep 60` collects no samples; against
 `./target/release/fast-workload io-hog --duration 30s --workers 2 --path
-<file-on-real-block-fs>` samples and the `rchar` delta grow steadily. The
-default path lives under `/tmp`, which is often tmpfs — reads there never
-reach the `block_rq_*` tracepoints, so only the `rchar` delta moves; point
-`--path` at a file on a real block filesystem (or the QEMU scratch disk) to
-collect latency samples.
+<file-on-real-block-fs>` the report names the device holding the file, the
+`rchar` delta and per-device byte totals grow together, and the slow-I/O
+table lists the slowest requests above `--threshold`. The default path
+lives under `/tmp`, which is often tmpfs — reads there never reach the
+`block_rq_*` tracepoints, so only the `rchar` delta moves; point `--path`
+at a file on a real block filesystem (or the QEMU scratch disk) to collect
+latency samples.
 
 ### `fast net`
 
