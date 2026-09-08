@@ -216,7 +216,7 @@ fn format_ns(ns: u64) -> String {
     if ns < 1_000_000_000 {
         return format!("{:.1} ms", ns as f64 / 1_000_000.0);
     }
-    format!("{:.2} s", ns as f64 / 1_000_000.0)
+    format!("{:.2} s", ns as f64 / 1_000_000_000.0)
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -503,6 +503,12 @@ mod tests {
         assert_eq!(format_bytes(1024), "1.0 KiB");
         assert_eq!(format_bytes(512 * 1024), "512.0 KiB");
         assert_eq!(format_bytes(2 * 1024 * 1024), "2.0 MiB");
+    }
+
+    #[test]
+    fn formats_seconds() {
+        assert_eq!(format_ns(1_250_000_000), "1.25 s");
+        assert_eq!(format_ns(2_000_000_000), "2.00 s");
     }
 
     #[test]

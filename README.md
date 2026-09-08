@@ -39,8 +39,8 @@ the process exits.
 | Subcommand  | Measures                                   | State |
 | ----------- | ------------------------------------------ | ----- |
 | `sched`     | runnable → running scheduler latency       | measured |
-| `cpu`       | CPU usage and on-CPU hot stacks            | measured, stacks not symbolized |
-| `io`        | block I/O latency                          | measured, device metadata stubbed |
+| `cpu`       | CPU usage and on-CPU hot stacks            | measured, symbolized top stacks |
+| `io`        | block I/O latency                          | measured, per-device latency with op split |
 | `net`       | TCP retransmissions                        | stub (RTT/endpoint fields zeroed) |
 | `off-cpu`   | off-CPU wait time                          | measured, stacks not symbolized |
 | `memory`    | PSI, page faults, swap                     | measured from `/proc` |
@@ -374,12 +374,15 @@ Honest state of each area, as of this version:
   inside the kernel (user-context samples carry user frames alone); libc
   frames stay raw on systems without libc symbol tables. The usage percentage
   is derived from `/proc` tick deltas, not from the eBPF samples.
-- `io`: requests are keyed by (device, start sector); two outstanding
-  requests on the exact same key would keep only the first (BPF_NOEXIST), and
-  empty flush requests all share sector 0. The kernel/user stack id space of
-  the CPU sampler is unaffected. Payload offsets are verified against the
-  7.2.x tracepoint format files; older kernel series (e.g. 5.x, where
-  `cmd_flags`/`rwbs` live at different offsets) would need re-verification.
+- `io`: requests are keyed by (device, start sector). Two outstanding
+  requests on the exact same key keep only the first issue (BPF_NOEXIST),
+  empty flush requests all share sector 0, and a completion from a
+  non-target process for the same key would consume the target's pending
+  entry and be misattributed to it — the request pointer that would remove
+  these races is not reachable from tracepoint programs. Payload offsets are
+  verified against the 7.2.x tracepoint format files; older kernel series
+  (e.g. 5.x, where the fields sit at different offsets) would need
+  re-verification.
 - `net`: only `tcp_retransmit_skb` is tracked; RTT and address/port fields
   are zeroed, so no endpoint or RTT table exists yet.
 - `off-cpu`: waits pair switch-out with the next wakeup, so the final
@@ -493,6 +496,6 @@ sudo ./target/release/fast sched --pid <TARGET_PID> --duration 10s
 
 The current commands measure runnable-to-running scheduler latency, on-CPU
 activity, block I/O, TCP retransmissions, off-CPU waits, and memory pressure
-for one process at a time. Symbolization, per-request I/O attribution,
-connection-level RTT, automatic diagnosis from real collectors, and
-long-running recording are planned for later versions.
+for one process at a time. CPU stack symbolization and per-request I/O
+attribution landed in v1.0; connection-level RTT, automatic diagnosis from
+real collectors, and long-running recording are planned for later versions.

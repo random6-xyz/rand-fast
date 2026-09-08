@@ -318,19 +318,24 @@ pub fn run(args: CpuArgs) -> Result<()> {
 
     // Attach a cpu-clock sampler to every online CPU. The BPF program filters
     // by TARGET_TIDS, so only the target's threads contribute samples, and the
-    // sample count scales with frequency times the CPU time they burn.
+    // sample count scales with frequency times the CPU time they burn. The
+    // link ids are kept so the sampler can be stopped the moment collection
+    // ends.
     let config = PerfEventConfig::Software(SoftwareEvent::CpuClock);
+    let mut links = Vec::new();
     for cpu in online_cpus()
         .map_err(|(path, error)| anyhow!("failed to read online CPU list from {path}: {error}"))?
     {
-        program
-            .attach(
-                config,
-                PerfEventScope::AllProcessesOneCpu { cpu },
-                SamplePolicy::Frequency(args.frequency),
-                false,
-            )
-            .with_context(|| format!("failed to attach cpu_sample to CPU {cpu}"))?;
+        links.push(
+            program
+                .attach(
+                    config,
+                    PerfEventScope::AllProcessesOneCpu { cpu },
+                    SamplePolicy::Frequency(args.frequency),
+                    false,
+                )
+                .with_context(|| format!("failed to attach cpu_sample to CPU {cpu}"))?,
+        );
     }
 
     let mut target_tids = runtime::take_target_map(&mut bpf)?;
@@ -356,6 +361,19 @@ pub fn run(args: CpuArgs) -> Result<()> {
             mode: COLLECT_CPU_SAMPLE,
         },
     )?;
+
+    // Stop the sampler before reading the stack maps and building the report:
+    // the perf readers are gone at this point, so continued sampling would
+    // only churn the stack maps and burn CPU while the report is built.
+    // Detach failures are best-effort here; the report is already complete.
+    let program: &mut PerfEvent = bpf
+        .program_mut("cpu_sample")
+        .context("eBPF program cpu_sample is missing")?
+        .try_into()
+        .context("cpu_sample is not a perf event program")?;
+    for link_id in links {
+        let _ = program.detach(link_id);
+    }
 
     stats.end_usage = read_proc_cpu_usage(pid).ok();
     stats.end_system = read_system_ticks().ok();

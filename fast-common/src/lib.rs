@@ -93,8 +93,9 @@ pub struct IoRequestKey {
     pub sector: u64,
 }
 
-/// Human-readable name for a block request operation code (the high 8 bits
-/// of the tracepoint's `cmd_flags`), matching the kernel's `req_op` values.
+/// Human-readable name for the operation code stored in I/O events. The
+/// eBPF side derives it from the rwbs field's first character: 0 read,
+/// 1 write, 2 anything else (discard, zone ops, ...).
 pub fn io_op_name(op: u32) -> &'static str {
     match op {
         0 => "read",
@@ -208,6 +209,30 @@ mod tests {
         assert_eq!(io_op_name(0), "read");
         assert_eq!(io_op_name(1), "write");
         assert_eq!(io_op_name(2), "other");
+    }
+
+    #[test]
+    fn cpu_sample_event_layout_is_stable() {
+        assert_eq!(size_of::<CpuSampleEvent>(), 32);
+        assert_eq!(align_of::<CpuSampleEvent>(), 8);
+    }
+
+    #[test]
+    fn cpu_sample_event_round_trips_through_bytes() {
+        let event = CpuSampleEvent {
+            tid: 42,
+            cpu: 3,
+            kernel_stack_id: 7,
+            user_stack_id: -1,
+            _pad: 0,
+            _pad2: 0,
+        };
+        let decoded: CpuSampleEvent = bytemuck::pod_read_unaligned(bytemuck::bytes_of(&event));
+        assert_eq!(bytemuck::bytes_of(&decoded), bytemuck::bytes_of(&event));
+        assert_eq!(decoded.tid, 42);
+        assert_eq!(decoded.cpu, 3);
+        assert_eq!(decoded.kernel_stack_id, 7);
+        assert_eq!(decoded.user_stack_id, -1);
     }
 
     #[test]
