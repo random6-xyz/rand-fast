@@ -5,18 +5,26 @@
 use core::panic::PanicInfo;
 
 use aya_ebpf::{
+    EbpfContext,
     bindings::{BPF_ANY, BPF_F_REUSE_STACKID, BPF_NOEXIST},
-    helpers::{bpf_get_current_pid_tgid, bpf_get_stackid, bpf_get_smp_processor_id, bpf_ktime_get_ns},
+    helpers::{
+        bpf_get_current_pid_tgid, bpf_get_smp_processor_id, bpf_get_stackid, bpf_ktime_get_ns,
+    },
     macros::{map, tracepoint},
     maps::{HashMap, LruHashMap, PerfEventArray, StackTrace},
     programs::TracePointContext,
-    EbpfContext,
 };
-use fast_common::{CpuSampleEvent, IoEvent, MemoryEvent, OffCpuEvent, TcpEvent, MAX_STACKS, MAX_TARGET_TIDS, PendingWakeup, SchedulerLatencyEvent};
+use fast_common::{
+    COLLECT_CPU_SAMPLE, COLLECT_OFFCPU, COLLECT_SCHEDULER_LATENCY, CpuSampleEvent, IoEvent,
+    MAX_STACKS, MAX_TARGET_TIDS, MemoryEvent, OffCpuEvent, PendingWakeup, SchedulerLatencyEvent,
+    TcpEvent,
+};
 
 // The offsets are the stable payload offsets of the Linux scheduler tracepoints:
 // trace_entry is 8 bytes, followed by the fields declared in include/trace/events/sched.h.
 const SCHED_WAKEUP_PID_OFFSET: usize = 24;
+const SCHED_SWITCH_PREV_PID_OFFSET: usize = 24;
+const SCHED_SWITCH_PREV_STATE_OFFSET: usize = 32;
 const SCHED_SWITCH_NEXT_PID_OFFSET: usize = 56;
 
 #[cfg(not(target_arch = "bpf"))]
@@ -24,6 +32,11 @@ fn main() {}
 
 #[map]
 static TARGET_TIDS: HashMap<u32, u8> = HashMap::with_max_entries(MAX_TARGET_TIDS, 0);
+
+/// Collector selector written by the userspace command before collection
+/// starts; tracepoint programs skip the paths their command does not consume.
+#[map]
+static MODE: HashMap<u32, u32> = HashMap::with_max_entries(1, 0);
 
 #[map]
 static PENDING_WAKEUPS: LruHashMap<u32, PendingWakeup> =
@@ -71,15 +84,49 @@ fn try_sched_wakeup(ctx: TracePointContext) -> Result<u32, u32> {
         return Ok(0);
     }
 
+    let mode = unsafe { MODE.get(0) }.copied().unwrap_or(0);
+
     // A runnable task should retain the timestamp of its first observed wakeup.
     // BPF_NOEXIST also avoids replacing it if multiple wakeup notifications race.
-    if unsafe { PENDING_WAKEUPS.get(tid) }.is_none() {
+    if mode & (COLLECT_SCHEDULER_LATENCY | COLLECT_CPU_SAMPLE) != 0
+        && unsafe { PENDING_WAKEUPS.get(tid) }.is_none()
+    {
         let pending = PendingWakeup {
             wake_ns: unsafe { bpf_ktime_get_ns() },
             wake_cpu: unsafe { bpf_get_smp_processor_id() },
             reserved: 0,
         };
         let _ = PENDING_WAKEUPS.insert(tid, pending, BPF_NOEXIST as u64);
+    }
+
+    // Off-CPU: the task was switched out in a sleepable state and just became
+    // runnable again, so the pending switch-out timestamp measures its wait.
+    if mode & COLLECT_OFFCPU != 0
+        && let Some(start) = unsafe { OFFCPU_START.get(tid) }
+    {
+        // Copy the timestamp before removing the entry; the LRU entry memory
+        // is freed by remove and must not be read afterwards.
+        let start_ns = *start;
+        let now = unsafe { bpf_ktime_get_ns() };
+        let _ = OFFCPU_START.remove(tid);
+        if now >= start_ns {
+            let stack = unsafe {
+                bpf_get_stackid(
+                    ctx.as_ptr(),
+                    &STACK_TRACES as *const _ as *mut core::ffi::c_void,
+                    0,
+                )
+            };
+            let event = OffCpuEvent {
+                wait_ns: now - start_ns,
+                stack_id: stack as i64,
+                tid,
+                reason: 0,
+                _pad: 0,
+                _pad2: 0,
+            };
+            OFFCPU_EVENTS.output(&ctx, event, BPF_ANY);
+        }
     }
 
     Ok(0)
@@ -95,66 +142,83 @@ pub fn sched_switch(ctx: TracePointContext) -> u32 {
 
 fn try_sched_switch(ctx: TracePointContext) -> Result<u32, u32> {
     let tid = unsafe { ctx.read_at::<u32>(SCHED_SWITCH_NEXT_PID_OFFSET) }.map_err(|_| 0u32)?;
+    let mode = unsafe { MODE.get(0) }.copied().unwrap_or(0);
+
+    // Off-CPU: a target task switched out in a sleepable state starts waiting.
+    if mode & COLLECT_OFFCPU != 0
+        && let Ok(prev_pid) = unsafe { ctx.read_at::<u32>(SCHED_SWITCH_PREV_PID_OFFSET) }
+        && unsafe { TARGET_TIDS.get(prev_pid) }.is_some()
+        && let Ok(prev_state) = unsafe { ctx.read_at::<u64>(SCHED_SWITCH_PREV_STATE_OFFSET) }
+        && prev_state != 0
+    {
+        let _ = OFFCPU_START.insert(prev_pid, unsafe { bpf_ktime_get_ns() }, BPF_ANY as u64);
+    }
 
     if unsafe { TARGET_TIDS.get(tid) }.is_none() {
         return Ok(0);
     }
 
-    let pending = match unsafe { PENDING_WAKEUPS.get(tid) } {
-        Some(pending) => *pending,
-        None => return Ok(0),
-    };
-    let _ = PENDING_WAKEUPS.remove(tid);
+    if mode & (COLLECT_SCHEDULER_LATENCY | COLLECT_CPU_SAMPLE) != 0 {
+        let pending = match unsafe { PENDING_WAKEUPS.get(tid) } {
+            Some(pending) => *pending,
+            None => return Ok(0),
+        };
+        let _ = PENDING_WAKEUPS.remove(tid);
 
-    let run_ns = unsafe { bpf_ktime_get_ns() };
-    if run_ns < pending.wake_ns {
-        return Ok(0);
+        let run_ns = unsafe { bpf_ktime_get_ns() };
+        if run_ns < pending.wake_ns {
+            return Ok(0);
+        }
+
+        let run_cpu = unsafe { bpf_get_smp_processor_id() };
+        if mode & COLLECT_SCHEDULER_LATENCY != 0 {
+            let event = SchedulerLatencyEvent {
+                latency_ns: run_ns - pending.wake_ns,
+                wake_ns: pending.wake_ns,
+                run_ns,
+                tid,
+                wake_cpu: pending.wake_cpu,
+                run_cpu,
+                reserved: 0,
+            };
+            EVENTS.output(&ctx, event, BPF_ANY);
+        }
+
+        // Best-effort on-CPU sampling for hot-stack reporting.
+        if mode & COLLECT_CPU_SAMPLE != 0 {
+            let kstack = unsafe {
+                bpf_get_stackid(
+                    ctx.as_ptr(),
+                    &STACK_TRACES as *const _ as *mut core::ffi::c_void,
+                    0,
+                )
+            };
+            let ustack = unsafe {
+                bpf_get_stackid(
+                    ctx.as_ptr(),
+                    &STACK_TRACES as *const _ as *mut core::ffi::c_void,
+                    256 | BPF_F_REUSE_STACKID as u64,
+                )
+            };
+            let cpu_sample = CpuSampleEvent {
+                tid,
+                cpu: run_cpu,
+                kernel_stack_id: kstack as i64,
+                user_stack_id: ustack as i64,
+                _pad: 0,
+                _pad2: 0,
+            };
+            CPU_EVENTS.output(&ctx, cpu_sample, BPF_ANY);
+        }
     }
-
-    let run_cpu = unsafe { bpf_get_smp_processor_id() };
-    let event = SchedulerLatencyEvent {
-        latency_ns: run_ns - pending.wake_ns,
-        wake_ns: pending.wake_ns,
-        run_ns,
-        tid,
-        wake_cpu: pending.wake_cpu,
-        run_cpu,
-        reserved: 0,
-    };
-    EVENTS.output(&ctx, event, BPF_ANY);
-
-    // Best-effort on-CPU sampling for hot-stack reporting.
-    let kstack = unsafe {
-        bpf_get_stackid(
-            ctx.as_ptr() as *mut core::ffi::c_void,
-            &STACK_TRACES as *const _ as *mut core::ffi::c_void,
-            0,
-        )
-    };
-    let ustack = unsafe {
-        bpf_get_stackid(
-            ctx.as_ptr() as *mut core::ffi::c_void,
-            &STACK_TRACES as *const _ as *mut core::ffi::c_void,
-            256 | BPF_F_REUSE_STACKID as u64,
-        )
-    };
-    let cpu_sample = CpuSampleEvent {
-        tid,
-        cpu: run_cpu,
-        kernel_stack_id: kstack as i64,
-        user_stack_id: ustack as i64,
-        _pad: 0,
-        _pad2: 0,
-    };
-    CPU_EVENTS.output(&ctx, cpu_sample, BPF_ANY);
 
     Ok(0)
 }
 
 // --- I/O: block_rq_issue / block_rq_complete ---
 #[tracepoint(name = "block_rq_issue", category = "block")]
-pub fn block_rq_issue(ctx: TracePointContext) -> u32 {
-    let tid = (bpf_get_current_pid_tgid() as u32) & 0xFFFF_FFFF;
+pub fn block_rq_issue(_ctx: TracePointContext) -> u32 {
+    let tid = bpf_get_current_pid_tgid() as u32;
     if unsafe { TARGET_TIDS.get(tid) }.is_none() {
         return 0;
     }
@@ -165,7 +229,7 @@ pub fn block_rq_issue(ctx: TracePointContext) -> u32 {
 
 #[tracepoint(name = "block_rq_complete", category = "block")]
 pub fn block_rq_complete(ctx: TracePointContext) -> u32 {
-    let tid = (bpf_get_current_pid_tgid() as u32) & 0xFFFF_FFFF;
+    let tid = bpf_get_current_pid_tgid() as u32;
     if unsafe { TARGET_TIDS.get(tid) }.is_none() {
         return 0;
     }
@@ -192,7 +256,7 @@ pub fn block_rq_complete(ctx: TracePointContext) -> u32 {
 // --- Network: tcp_retransmit_skb ---
 #[tracepoint(name = "tcp_retransmit_skb", category = "tcp")]
 pub fn tcp_retransmit_skb(ctx: TracePointContext) -> u32 {
-    let tid = (bpf_get_current_pid_tgid() as u32) & 0xFFFF_FFFF;
+    let tid = bpf_get_current_pid_tgid() as u32;
     if unsafe { TARGET_TIDS.get(tid) }.is_none() {
         return 0;
     }
@@ -210,48 +274,10 @@ pub fn tcp_retransmit_skb(ctx: TracePointContext) -> u32 {
     0
 }
 
-// --- Off-CPU: helper for sched_wakeup off-cpu measurement ---
-#[allow(dead_code)]
-fn try_offcpu_wakeup(ctx: TracePointContext) -> Result<u32, u32> {
-    let tid = unsafe { ctx.read_at::<u32>(SCHED_WAKEUP_PID_OFFSET) }.map_err(|_| 0u32)?;
-    if unsafe { TARGET_TIDS.get(tid) }.is_none() {
-        return Ok(0);
-    }
-    if let Some(start) = unsafe { OFFCPU_START.get(tid) } {
-        let end = unsafe { bpf_ktime_get_ns() };
-        let wait = end.saturating_sub(*start);
-        let _ = OFFCPU_START.remove(tid);
-        let stack = unsafe {
-            bpf_get_stackid(
-                ctx.as_ptr() as *mut core::ffi::c_void,
-                &STACK_TRACES as *const _ as *mut core::ffi::c_void,
-                0,
-            )
-        };
-        let event = OffCpuEvent {
-            wait_ns: wait,
-            stack_id: stack as i64,
-            tid,
-            reason: 0,
-            _pad: 0,
-            _pad2: 0,
-        };
-        OFFCPU_EVENTS.output(&ctx, event, BPF_ANY);
-    }
-    Ok(0)
-}
-
-#[tracepoint(name = "sched_stat_sleep", category = "sched")]
-pub fn sched_stat_sleep(ctx: TracePointContext) -> u32 {
-    // Fallback off-cpu trigger
-    let _ = try_offcpu_wakeup(ctx);
-    0
-}
-
 // --- Memory: page_fault ---
 #[tracepoint(name = "page_fault_user", category = "exceptions")]
 pub fn page_fault_user(ctx: TracePointContext) -> u32 {
-    let tid = (bpf_get_current_pid_tgid() as u32) & 0xFFFF_FFFF;
+    let tid = bpf_get_current_pid_tgid() as u32;
     if unsafe { TARGET_TIDS.get(tid) }.is_none() {
         return 0;
     }

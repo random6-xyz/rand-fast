@@ -2,37 +2,21 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     convert::TryInto,
     fs,
-    io,
-    mem::size_of,
-    os::fd::AsRawFd,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender},
-    },
-    thread::{self, JoinHandle},
-    time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
-use aya::{
-    Ebpf, include_bytes_aligned,
-    maps::{
-        HashMap as AyaHashMap, MapData, PerfEventArray,
-        perf::{PerfEvent, PerfEventArrayBuffer},
-    },
-    programs::TracePoint,
-    util::online_cpus,
-};
-use fast_common::{IoEvent, MAX_TARGET_TIDS};
+use anyhow::{Context, Result};
+use aya::{Ebpf, include_bytes_aligned, maps::HashMap as AyaHashMap, maps::MapData};
+use fast_common::IoEvent;
 
-use crate::{cli::IoArgs, process};
+use crate::{cli::IoArgs, process, runtime};
 
-const POLL_INTERVAL_MS: i32 = 100;
-const PERF_PAGE_COUNT: usize = 8;
+/// `block_rq_*` can be bursty on busy devices; 64 pages (256 KiB) per CPU
+/// keeps event loss low.
+const PERF_PAGE_COUNT: usize = 64;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct IoStats {
+    threshold_ns: u64,
     latencies: Vec<u64>,
     by_device: BTreeMap<u32, Vec<u64>>,
     slow: u64,
@@ -40,10 +24,23 @@ struct IoStats {
 }
 
 impl IoStats {
-    fn record(&mut self, event: IoEvent, threshold_ns: u64) {
+    fn new(threshold_ns: u64) -> Self {
+        Self {
+            threshold_ns,
+            latencies: Vec::new(),
+            by_device: BTreeMap::new(),
+            slow: 0,
+            lost: 0,
+        }
+    }
+
+    fn record(&mut self, event: IoEvent) {
         self.latencies.push(event.latency_ns);
-        self.by_device.entry(event.dev).or_default().push(event.latency_ns);
-        if event.latency_ns > threshold_ns {
+        self.by_device
+            .entry(event.dev)
+            .or_default()
+            .push(event.latency_ns);
+        if event.latency_ns > self.threshold_ns {
             self.slow += 1;
         }
     }
@@ -62,6 +59,16 @@ impl IoStats {
         }
         out.sort_by_key(|(d, _)| *d);
         out
+    }
+}
+
+impl runtime::EventHandler<IoEvent> for IoStats {
+    fn on_event(&mut self, event: IoEvent) {
+        self.record(event);
+    }
+
+    fn on_lost(&mut self, count: u64) {
+        self.record_lost(count);
     }
 }
 
@@ -126,98 +133,62 @@ fn read_proc_io(pid: u32) -> Result<(u64, u64)> {
 pub fn run(args: IoArgs) -> Result<()> {
     let pid = args.pid;
     let threshold = args.threshold;
-    let process_name = process::read_name(pid)
-        .with_context(|| format!("cannot read process {pid}"))?;
-    let initial_tids = process::thread_ids(pid)
-        .with_context(|| format!("cannot enumerate threads for {pid}"))?;
-    let initial_set: BTreeSet<u32> = initial_tids.iter().copied().collect();
+    let process_name =
+        process::read_name(pid).with_context(|| format!("cannot read process {pid}"))?;
+    let initial_tids =
+        process::thread_ids(pid).with_context(|| format!("cannot enumerate threads for {pid}"))?;
 
-    let mut bpf = Ebpf::load(include_bytes_aligned!(concat!(env!("OUT_DIR"), "/fast-ebpf")))
-        .context("failed to load eBPF object; run as root or grant CAP_BPF and CAP_PERFMON")?;
-    let _ = attach_tracepoint(&mut bpf, "block_rq_issue", "block_rq_issue");
-    let _ = attach_tracepoint(&mut bpf, "block_rq_complete", "block_rq_complete");
+    let mut bpf = Ebpf::load(include_bytes_aligned!(concat!(
+        env!("OUT_DIR"),
+        "/fast-ebpf"
+    )))
+    .context("failed to load eBPF object; run as root or grant CAP_BPF and CAP_PERFMON")?;
+    runtime::attach_tracepoint(&mut bpf, "block", "block_rq_issue")?;
+    runtime::attach_tracepoint(&mut bpf, "block", "block_rq_complete")?;
 
-    let target_map = bpf.take_map("TARGET_TIDS").context("TARGET_TIDS missing")?;
-    let mut target_tids: AyaHashMap<MapData, u32, u8> = target_map.try_into().context("TARGET_TIDS type")?;
-    let pending_map = bpf.take_map("PENDING_IO").context("PENDING_IO missing")?;
-    let mut pending_io: AyaHashMap<MapData, u32, u64> = pending_map.try_into().context("PENDING_IO type")?;
+    let mut target_tids = runtime::take_target_map(&mut bpf)?;
+    let pending_map = bpf
+        .take_map("PENDING_IO")
+        .context("eBPF map PENDING_IO is missing")?;
+    let mut pending_io: AyaHashMap<MapData, u32, u64> = pending_map
+        .try_into()
+        .context("PENDING_IO has an unexpected map type or layout")?;
 
     let mut known_tids = BTreeSet::new();
-    sync_target_tids(&mut target_tids, &mut pending_io, &mut known_tids, &initial_set)?;
-
-    let event_map = bpf.take_map("IO_EVENTS").context("IO_EVENTS missing")?;
-    let mut events: PerfEventArray<MapData> = event_map.try_into().context("IO_EVENTS type")?;
-    let cpus = online_cpus().map_err(|(p, e)| anyhow!("failed to read {p}: {e}"))?;
-    let mut buffers = Vec::with_capacity(cpus.len());
-    for cpu in cpus {
-        let buf = events.open(cpu, Some(PERF_PAGE_COUNT)).with_context(|| format!("perf buffer cpu {cpu}"))?;
-        buffers.push(buf);
-    }
-    drop(events);
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let interrupted = Arc::new(AtomicBool::new(false));
-    install_signal_handler(&stop, &interrupted)?;
-
-    let (sender, receiver) = mpsc::channel();
-    let readers = buffers.into_iter().map(|b| spawn_perf_reader(b, Arc::clone(&stop), sender.clone())).collect::<Vec<_>>();
-    drop(sender);
-
-    let started = Instant::now();
-    let mut next_refresh = started + Duration::from_millis(100);
-    let mut stats = IoStats::default();
+    let mut stats = IoStats::new(threshold.as_nanos() as u64);
     let (rchar_start, wchar_start) = read_proc_io(pid).unwrap_or((0, 0));
+    let summary = runtime::run_collection(
+        &mut bpf,
+        &mut target_tids,
+        &mut pending_io,
+        &mut known_tids,
+        &initial_tids,
+        &mut stats,
+        runtime::CollectionOptions {
+            pid,
+            duration: args.duration,
+            events_map: "IO_EVENTS",
+            perf_page_count: PERF_PAGE_COUNT,
+            mode: 0,
+        },
+    )?;
 
-    while started.elapsed() < args.duration {
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-        if Instant::now() >= next_refresh {
-            match refresh_process(pid, &mut target_tids, &mut pending_io, &mut known_tids) {
-                Ok(RefreshResult::Alive) => {}
-                Ok(RefreshResult::Exited) => {
-                    stop.store(true, Ordering::Relaxed);
-                    break;
-                }
-                Err(e) => {
-                    stop.store(true, Ordering::Relaxed);
-                    bail!("{e:#}");
-                }
-            }
-            next_refresh = Instant::now() + Duration::from_millis(100);
-        }
-        let remaining = args.duration.saturating_sub(started.elapsed());
-        let wait = remaining.min(Duration::from_millis(50));
-        match receiver.recv_timeout(wait) {
-            Ok(PerfMessage::Sample(ev)) => stats.record(ev, threshold.as_nanos() as u64),
-            Ok(PerfMessage::Lost(c)) => stats.record_lost(c),
-            Ok(PerfMessage::Error(e)) => {
-                stop.store(true, Ordering::Relaxed);
-                bail!("{e}");
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    stop.store(true, Ordering::Relaxed);
-    for h in readers {
-        let _ = h.join();
-    }
-    drain_messages(&receiver, &mut stats);
-
-    let elapsed = started.elapsed().min(args.duration);
     let (rchar_end, wchar_end) = read_proc_io(pid).unwrap_or((rchar_start, wchar_start));
     let rchar_delta = rchar_end.saturating_sub(rchar_start);
     let wchar_delta = wchar_end.saturating_sub(wchar_start);
 
     println!("PID: {process_name} ({pid})");
-    println!("Duration: {}", humantime::format_duration(elapsed));
-    if interrupted.load(Ordering::Relaxed) {
+    println!("Duration: {}", humantime::format_duration(summary.elapsed));
+    if summary.interrupted {
         println!("Status: interrupted");
     }
     println!("Samples: {}", stats.latencies.len());
     println!("Lost events: {}", stats.lost);
-    println!("Slow > {}: {}", humantime::format_duration(threshold), stats.slow);
+    println!(
+        "Slow > {}: {}",
+        humantime::format_duration(threshold),
+        stats.slow
+    );
     println!("rchar: {rchar_delta} bytes, wchar: {wchar_delta} bytes");
     println!();
     println!("I/O latency");
@@ -239,181 +210,74 @@ pub fn run(args: IoArgs) -> Result<()> {
         for (dev, s) in dev_summaries {
             let major = dev >> 20;
             let minor = dev & 0xFFFFF;
-            println!("dev {major}:{minor} samples {:<4} p50 {:>10} p95 {:>10} p99 {:>10} max {:>10}", s.count, format_ns(s.p50_ns), format_ns(s.p95_ns), format_ns(s.p99_ns), format_ns(s.max_ns));
+            println!(
+                "dev {major}:{minor} samples {:<4} p50 {:>10} p95 {:>10} p99 {:>10} max {:>10}",
+                s.count,
+                format_ns(s.p50_ns),
+                format_ns(s.p95_ns),
+                format_ns(s.p99_ns),
+                format_ns(s.max_ns)
+            );
         }
     }
     println!();
-    println!("Slow-device threshold: {} (configurable via --threshold)", humantime::format_duration(threshold));
+    println!(
+        "Slow-device threshold: {} (configurable via --threshold)",
+        humantime::format_duration(threshold)
+    );
     Ok(())
-}
-
-fn attach_tracepoint(bpf: &mut Ebpf, program_name: &str, event_name: &str) -> Result<()> {
-    let program = bpf.program_mut(program_name).with_context(|| format!("eBPF program {program_name} is missing"))?;
-    let program: &mut TracePoint = program.try_into().with_context(|| format!("{program_name} is not a tracepoint"))?;
-    let _ = program.load();
-    let _ = program.attach("block", event_name);
-    Ok(())
-}
-
-fn install_signal_handler(stop: &Arc<AtomicBool>, interrupted: &Arc<AtomicBool>) -> Result<()> {
-    let stop = Arc::clone(stop);
-    let interrupted = Arc::clone(interrupted);
-    ctrlc::set_handler(move || {
-        interrupted.store(true, Ordering::Relaxed);
-        stop.store(true, Ordering::Relaxed);
-    })
-    .context("failed to install Ctrl-C handler")
-}
-
-fn sync_target_tids(
-    target_tids: &mut AyaHashMap<MapData, u32, u8>,
-    pending_io: &mut AyaHashMap<MapData, u32, u64>,
-    known_tids: &mut BTreeSet<u32>,
-    current_tids: &BTreeSet<u32>,
-) -> Result<()> {
-    use aya::maps::MapError;
-    if current_tids.len() > MAX_TARGET_TIDS as usize {
-        bail!("process has {} threads, but the target map supports at most {}", current_tids.len(), MAX_TARGET_TIDS);
-    }
-    let removed = known_tids.difference(current_tids).copied().collect::<Vec<_>>();
-    for tid in removed {
-        target_tids.remove(&tid).with_context(|| format!("failed to remove thread {tid}"))?;
-        match pending_io.remove(&tid) {
-            Ok(()) | Err(MapError::KeyNotFound) => {}
-            Err(e) => return Err(e).with_context(|| format!("failed to clear pending for {tid}")),
-        }
-    }
-    let added = current_tids.difference(known_tids).copied().collect::<Vec<_>>();
-    for tid in added {
-        target_tids.insert(tid, 1, 0).with_context(|| format!("failed to add thread {tid}"))?;
-    }
-    *known_tids = current_tids.clone();
-    Ok(())
-}
-
-enum RefreshResult { Alive, Exited }
-
-fn refresh_process(
-    pid: u32,
-    target_tids: &mut AyaHashMap<MapData, u32, u8>,
-    pending_io: &mut AyaHashMap<MapData, u32, u64>,
-    known_tids: &mut BTreeSet<u32>,
-) -> Result<RefreshResult> {
-    if !process::is_alive(pid).with_context(|| format!("failed to inspect process {pid}"))? {
-        return Ok(RefreshResult::Exited);
-    }
-    match process::thread_ids(pid) {
-        Ok(current) => {
-            let set: BTreeSet<u32> = current.iter().copied().collect();
-            sync_target_tids(target_tids, pending_io, known_tids, &set)?;
-            Ok(RefreshResult::Alive)
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(RefreshResult::Exited),
-        Err(e) => Err(e).with_context(|| format!("failed to refresh threads for {pid}")),
-    }
-}
-
-#[derive(Debug)]
-enum PerfMessage {
-    Sample(IoEvent),
-    Lost(u64),
-    Error(String),
-}
-
-fn spawn_perf_reader(
-    mut buffer: PerfEventArrayBuffer<MapData>,
-    stop: Arc<AtomicBool>,
-    sender: Sender<PerfMessage>,
-) -> JoinHandle<()> {
-    thread::spawn(move || {
-        let mut poll_fd = libc::pollfd { fd: buffer.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        while !stop.load(Ordering::Relaxed) {
-            poll_fd.revents = 0;
-            let result = unsafe { libc::poll(&mut poll_fd, 1, POLL_INTERVAL_MS) };
-            if result < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                let _ = sender.send(PerfMessage::Error(format!("poll failed: {error}")));
-                break;
-            }
-            if result == 0 {
-                continue;
-            }
-            if poll_fd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) == 0 {
-                continue;
-            }
-            let mut failed = false;
-            buffer.for_each(|event| match event {
-                PerfEvent::Sample { head, tail } => match decode_io(head, tail) {
-                    Some(s) => {
-                        if sender.send(PerfMessage::Sample(s)).is_err() {
-                            failed = true;
-                        }
-                    }
-                    None => {
-                        let _ = sender.send(PerfMessage::Error(format!("invalid I/O event payload: expected {} bytes", size_of::<IoEvent>())));
-                        failed = true;
-                    }
-                },
-                PerfEvent::Lost { count } => {
-                    if sender.send(PerfMessage::Lost(count)).is_err() {
-                        failed = true;
-                    }
-                }
-            });
-            if failed {
-                break;
-            }
-        }
-    })
-}
-
-fn decode_io(head: &[u8], tail: &[u8]) -> Option<IoEvent> {
-    let sz = size_of::<IoEvent>();
-    if head.len().saturating_add(tail.len()) < sz {
-        return None;
-    }
-    let mut bytes = [0u8; size_of::<IoEvent>()];
-    let hl = head.len().min(sz);
-    bytes[..hl].copy_from_slice(&head[..hl]);
-    if hl < sz {
-        bytes[hl..].copy_from_slice(&tail[..sz - hl]);
-    }
-    Some(bytemuck::pod_read_unaligned(&bytes))
-}
-
-fn drain_messages(receiver: &Receiver<PerfMessage>, stats: &mut IoStats) {
-    for msg in receiver.try_iter() {
-        match msg {
-            PerfMessage::Sample(s) => stats.record(s, 10_000_000),
-            PerfMessage::Lost(c) => stats.record_lost(c),
-            PerfMessage::Error(_) => {}
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn counts_slow_and_device() {
-        let mut s = IoStats::default();
-        s.record(IoEvent { latency_ns: 5_000_000, tid: 1, dev: 0x0801, sectors: 8, op: 0 }, 1_000_000);
-        s.record(IoEvent { latency_ns: 5_000_000, tid: 1, dev: 0x0801, sectors: 8, op: 0 }, 10_000_000);
-        assert_eq!(s.slow, 1);
+        let mut s = IoStats::new(1_000_000);
+        s.record(IoEvent {
+            latency_ns: 5_000_000,
+            tid: 1,
+            dev: 0x0801,
+            sectors: 8,
+            op: 0,
+        });
+        s.record(IoEvent {
+            latency_ns: 5_000_000,
+            tid: 1,
+            dev: 0x0801,
+            sectors: 8,
+            op: 0,
+        });
+        assert_eq!(s.slow, 2);
         assert_eq!(s.by_device.len(), 1);
         assert_eq!(s.latencies.len(), 2);
+
+        let mut strict = IoStats::new(10_000_000);
+        strict.record(IoEvent {
+            latency_ns: 5_000_000,
+            tid: 1,
+            dev: 0x0801,
+            sectors: 8,
+            op: 0,
+        });
+        assert_eq!(strict.slow, 0);
     }
+
     #[test]
     fn summary_computed() {
-        let mut s = IoStats::default();
-        for i in 1..=10 {
-            s.record(IoEvent { latency_ns: i * 1_000_000, tid: 1, dev: 0, sectors: 1, op: 0 }, 100_000_000);
+        let mut s = IoStats::new(100_000_000);
+        for i in 1..=10u64 {
+            s.record(IoEvent {
+                latency_ns: i * 1_000_000,
+                tid: 1,
+                dev: 0,
+                sectors: 1,
+                op: 0,
+            });
         }
         let sum = s.summary().unwrap();
         assert!(sum.p50_ns > 0);
-        assert!(sum.max_ns == 10_000_000);
+        assert_eq!(sum.max_ns, 10_000_000);
     }
 }
