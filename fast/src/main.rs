@@ -9,6 +9,7 @@ mod network;
 mod offcpu;
 mod output;
 mod process;
+mod runtime;
 mod stats;
 
 use std::process::ExitCode;
