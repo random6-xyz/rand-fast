@@ -1,17 +1,22 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    convert::TryInto,
     fs,
 };
 
-use anyhow::{Context, Result, bail};
-use aya::{Ebpf, include_bytes_aligned, maps::HashMap as AyaHashMap, maps::MapData};
+use anyhow::{Context, Result, anyhow, bail};
+use aya::{
+    Ebpf, include_bytes_aligned,
+    programs::perf_event::{
+        PerfEvent, PerfEventConfig, PerfEventScope, SamplePolicy, SoftwareEvent,
+    },
+    util::online_cpus,
+};
 use fast_common::{COLLECT_CPU_SAMPLE, CpuSampleEvent};
 
 use crate::{cli::CpuArgs, process, runtime};
 
-/// One `CpuSampleEvent` is emitted per run of a target thread, matching the
-/// scheduler event volume; the default buffer is sufficient.
+/// Samples arrive at the configured frequency per CPU (default 99 Hz), so the
+/// default buffer is sufficient.
 const PERF_PAGE_COUNT: usize = runtime::DEFAULT_PERF_PAGE_COUNT;
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -119,18 +124,36 @@ pub fn run(args: CpuArgs) -> Result<()> {
         "/fast-ebpf"
     )))
     .context("failed to load the eBPF object; run as root or grant CAP_BPF and CAP_PERFMON")?;
-    runtime::attach_tracepoint(&mut bpf, "sched", "sched_wakeup")?;
-    runtime::attach_tracepoint(&mut bpf, "sched", "sched_switch")?;
+
+    let program = bpf
+        .program_mut("cpu_sample")
+        .context("eBPF program cpu_sample is missing")?;
+    let program: &mut PerfEvent = program
+        .try_into()
+        .context("cpu_sample is not a perf event program")?;
+    program
+        .load()
+        .context("failed to load eBPF program cpu_sample")?;
+
+    // Attach a cpu-clock sampler to every online CPU. The BPF program filters
+    // by TARGET_TIDS, so only the target's threads contribute samples, and the
+    // sample count scales with frequency times the CPU time they burn.
+    let config = PerfEventConfig::Software(SoftwareEvent::CpuClock);
+    for cpu in online_cpus()
+        .map_err(|(path, error)| anyhow!("failed to read online CPU list from {path}: {error}"))?
+    {
+        program
+            .attach(
+                config,
+                PerfEventScope::AllProcessesOneCpu { cpu },
+                SamplePolicy::Frequency(args.frequency),
+                false,
+            )
+            .with_context(|| format!("failed to attach cpu_sample to CPU {cpu}"))?;
+    }
 
     let mut target_tids = runtime::take_target_map(&mut bpf)?;
-    // Keep PENDING_WAKEUPS for scheduler correlation, even if CPU mode doesn't strictly need it
-    let pending_map = bpf
-        .take_map("PENDING_WAKEUPS")
-        .context("eBPF map PENDING_WAKEUPS is missing")?;
-    let mut pending_wakeups: AyaHashMap<MapData, u32, [u64; 2]> = pending_map
-        .try_into()
-        .context("PENDING_WAKEUPS has an unexpected map type or layout")?;
-
+    let mut no_pending = runtime::NoPendingCleanup;
     let mut known_tids = BTreeSet::new();
     let mut stats = CpuStats {
         start_usage: read_proc_cpu_usage(pid).ok(),
@@ -140,7 +163,7 @@ pub fn run(args: CpuArgs) -> Result<()> {
     let summary = runtime::run_collection(
         &mut bpf,
         &mut target_tids,
-        &mut pending_wakeups,
+        &mut no_pending,
         &mut known_tids,
         &initial_tids,
         &mut stats,

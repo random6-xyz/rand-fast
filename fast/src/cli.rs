@@ -59,6 +59,22 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
     Ok(duration)
 }
 
+fn parse_frequency(value: &str) -> Result<u64, String> {
+    let frequency = value
+        .parse::<u64>()
+        .map_err(|_| format!("invalid frequency: {value}"))?;
+    if frequency == 0 {
+        return Err("frequency must be greater than zero".to_string());
+    }
+    if frequency > 100_000 {
+        return Err(
+            "frequency must be at most 100000 Hz (the common perf_event_max_sample_rate)"
+                .to_string(),
+        );
+    }
+    Ok(frequency)
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct CpuArgs {
     /// Process ID (TGID) to observe.
@@ -68,6 +84,10 @@ pub struct CpuArgs {
     /// Collection duration, for example 10s or 500ms.
     #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
     pub duration: Duration,
+
+    /// On-CPU sampling frequency in Hz (default 99).
+    #[arg(long, value_name = "HZ", default_value_t = 99, value_parser = parse_frequency)]
+    pub frequency: u64,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -168,5 +188,18 @@ mod tests {
     fn rejects_zero_pid() {
         assert!(parse_pid("0").is_err());
         assert_eq!(parse_pid("1234").unwrap(), 1234);
+    }
+
+    #[test]
+    fn parses_frequency() {
+        assert_eq!(parse_frequency("99").unwrap(), 99);
+        assert_eq!(parse_frequency("100000").unwrap(), 100_000);
+    }
+
+    #[test]
+    fn rejects_invalid_frequency() {
+        assert!(parse_frequency("0").is_err());
+        assert!(parse_frequency("100001").is_err());
+        assert!(parse_frequency("high").is_err());
     }
 }

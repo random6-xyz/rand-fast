@@ -10,9 +10,9 @@ use aya_ebpf::{
     helpers::{
         bpf_get_current_pid_tgid, bpf_get_smp_processor_id, bpf_get_stackid, bpf_ktime_get_ns,
     },
-    macros::{map, tracepoint},
+    macros::{map, perf_event, tracepoint},
     maps::{HashMap, LruHashMap, PerfEventArray, StackTrace},
-    programs::TracePointContext,
+    programs::{PerfEventContext, TracePointContext},
 };
 use fast_common::{
     COLLECT_CPU_SAMPLE, COLLECT_OFFCPU, COLLECT_SCHEDULER_LATENCY, CpuSampleEvent, IoEvent,
@@ -88,9 +88,7 @@ fn try_sched_wakeup(ctx: TracePointContext) -> Result<u32, u32> {
 
     // A runnable task should retain the timestamp of its first observed wakeup.
     // BPF_NOEXIST also avoids replacing it if multiple wakeup notifications race.
-    if mode & (COLLECT_SCHEDULER_LATENCY | COLLECT_CPU_SAMPLE) != 0
-        && unsafe { PENDING_WAKEUPS.get(tid) }.is_none()
-    {
+    if mode & COLLECT_SCHEDULER_LATENCY != 0 && unsafe { PENDING_WAKEUPS.get(tid) }.is_none() {
         let pending = PendingWakeup {
             wake_ns: unsafe { bpf_ktime_get_ns() },
             wake_cpu: unsafe { bpf_get_smp_processor_id() },
@@ -158,7 +156,7 @@ fn try_sched_switch(ctx: TracePointContext) -> Result<u32, u32> {
         return Ok(0);
     }
 
-    if mode & (COLLECT_SCHEDULER_LATENCY | COLLECT_CPU_SAMPLE) != 0 {
+    if mode & COLLECT_SCHEDULER_LATENCY != 0 {
         let pending = match unsafe { PENDING_WAKEUPS.get(tid) } {
             Some(pending) => *pending,
             None => return Ok(0),
@@ -171,47 +169,74 @@ fn try_sched_switch(ctx: TracePointContext) -> Result<u32, u32> {
         }
 
         let run_cpu = unsafe { bpf_get_smp_processor_id() };
-        if mode & COLLECT_SCHEDULER_LATENCY != 0 {
-            let event = SchedulerLatencyEvent {
-                latency_ns: run_ns - pending.wake_ns,
-                wake_ns: pending.wake_ns,
-                run_ns,
-                tid,
-                wake_cpu: pending.wake_cpu,
-                run_cpu,
-                reserved: 0,
-            };
-            EVENTS.output(&ctx, event, BPF_ANY);
-        }
-
-        // Best-effort on-CPU sampling for hot-stack reporting.
-        if mode & COLLECT_CPU_SAMPLE != 0 {
-            let kstack = unsafe {
-                bpf_get_stackid(
-                    ctx.as_ptr(),
-                    &STACK_TRACES as *const _ as *mut core::ffi::c_void,
-                    0,
-                )
-            };
-            let ustack = unsafe {
-                bpf_get_stackid(
-                    ctx.as_ptr(),
-                    &STACK_TRACES as *const _ as *mut core::ffi::c_void,
-                    256 | BPF_F_REUSE_STACKID as u64,
-                )
-            };
-            let cpu_sample = CpuSampleEvent {
-                tid,
-                cpu: run_cpu,
-                kernel_stack_id: kstack as i64,
-                user_stack_id: ustack as i64,
-                _pad: 0,
-                _pad2: 0,
-            };
-            CPU_EVENTS.output(&ctx, cpu_sample, BPF_ANY);
-        }
+        let event = SchedulerLatencyEvent {
+            latency_ns: run_ns - pending.wake_ns,
+            wake_ns: pending.wake_ns,
+            run_ns,
+            tid,
+            wake_cpu: pending.wake_cpu,
+            run_cpu,
+            reserved: 0,
+        };
+        EVENTS.output(&ctx, event, BPF_ANY);
     }
 
+    Ok(0)
+}
+
+// --- CPU: on-CPU sampling via perf cpu-clock events ---
+/// Samples the stack of whichever target thread is running when the perf
+/// event fires. `fast cpu` attaches this program per CPU with a fixed
+/// frequency, so the sample count scales with sampling rate times CPU time —
+/// unlike the old switch-in capture, which scaled with wakeup count and
+/// never saw a busy thread that sleeps between wakeups.
+#[perf_event]
+pub fn cpu_sample(ctx: PerfEventContext) -> u32 {
+    match try_cpu_sample(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_cpu_sample(ctx: PerfEventContext) -> Result<u32, u32> {
+    if unsafe { MODE.get(0) }.copied().unwrap_or(0) & COLLECT_CPU_SAMPLE == 0 {
+        return Ok(0);
+    }
+
+    // The event fires in the context of the interrupted task, so the current
+    // TID identifies the thread that was on CPU. The idle task (TID 0) and
+    // all non-target threads are filtered out here.
+    let tid = bpf_get_current_pid_tgid() as u32;
+    if unsafe { TARGET_TIDS.get(tid) }.is_none() {
+        return Ok(0);
+    }
+
+    let cpu = unsafe { bpf_get_smp_processor_id() };
+    let kstack = unsafe {
+        bpf_get_stackid(
+            ctx.as_ptr(),
+            &STACK_TRACES as *const _ as *mut core::ffi::c_void,
+            0,
+        )
+    };
+    // BPF_F_USER_STACK (256) selects the user-space stack of the interrupted
+    // task; BPF_F_REUSE_STACKID lets different samples share one entry.
+    let ustack = unsafe {
+        bpf_get_stackid(
+            ctx.as_ptr(),
+            &STACK_TRACES as *const _ as *mut core::ffi::c_void,
+            256 | BPF_F_REUSE_STACKID as u64,
+        )
+    };
+    let cpu_sample = CpuSampleEvent {
+        tid,
+        cpu,
+        kernel_stack_id: kstack as i64,
+        user_stack_id: ustack as i64,
+        _pad: 0,
+        _pad2: 0,
+    };
+    CPU_EVENTS.output(&ctx, cpu_sample, BPF_ANY);
     Ok(0)
 }
 

@@ -3,7 +3,10 @@
 use bytemuck::{Pod, Zeroable};
 
 pub const MAX_TARGET_TIDS: u32 = 4096;
-pub const MAX_STACKS: u32 = 256;
+/// Stack trace map capacity. Sized for periodic on-CPU sampling where many
+/// distinct user/kernel stacks accumulate over a run; entries are allocated
+/// lazily (~1 KiB each at the default 127-frame depth).
+pub const MAX_STACKS: u32 = 4096;
 pub const MAX_STACK_DEPTH: u32 = 32;
 
 pub const SLOW_1MS_NS: u64 = 1_000_000;

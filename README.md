@@ -86,11 +86,15 @@ range), then repeat while `./target/release/sched-workload hog --duration
 
 ### `fast cpu`
 
-Reports process CPU usage (from `/proc` tick deltas) and on-CPU samples with
-hot kernel-stack ids, emitted from `sched_switch` for target threads.
+Samples on-CPU stacks of the target threads at `--frequency` (default 99 Hz)
+by attaching a BPF program to a perf `cpu-clock` event on every online CPU,
+and reports process CPU usage from `/proc` tick deltas. The sample count
+scales with sampling rate × CPU time: an idle target yields ~0 samples, a
+busy target ≈ frequency × duration × busy-core count, regardless of how many
+times the threads wake up.
 
 ```bash
-sudo ./target/release/fast cpu --pid 1234 --duration 10s
+sudo ./target/release/fast cpu --pid 1234 --duration 10s --frequency 199
 ```
 
 Sample output (8 hog workers):
@@ -114,11 +118,11 @@ CPU saturation likely contributes to scheduler latency (CPU 96.1% with 5211 samp
 ```
 
 Verification: `fast cpu` against `./target/release/sched-workload target
---duration 30s` shows thousands of samples (each wakeup emits one) and
-near-zero usage; against `./target/release/sched-workload hog --duration
-30s --workers 8` the usage jumps to ~100% per core and the correlation line
-reports pressure. The pure spin-loop hog emits no wakeup samples by design
-(it never sleeps), so the load signal is the usage percentage.
+--duration 30s` collects near-zero samples and near-zero usage; against
+`./target/release/sched-workload hog --duration 30s --workers 8` the sample
+count approaches frequency × duration × busy cores and the usage jumps to
+~100% per core. Doubling `--frequency` roughly doubles the load sample
+count, which is the acceptance check for rate scaling.
 
 ### `fast io`
 
