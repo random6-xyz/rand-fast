@@ -99,45 +99,59 @@ busy-core count, regardless of how many times the threads wake up.
 sudo ./target/release/fast cpu --pid 1234 --duration 10s --frequency 199
 ```
 
-Sample output (lock-hog fixture):
+Sample output (lock-hog fixture, 16 workers):
 
 ```text
-PID: fast-workload (18410)
+PID: fast-workload (326)
 Duration: 5s
-Samples: 972
+Samples: 3489
 Lost: 0
-CPU usage: 41.0% (over 5.0s wall, 1795 ticks total)
+CPU usage: 97.7% (over 5.0s wall, 4019 ticks total)
 
 On-CPU samples (hot stacks)
-stack (33, 12)  samples 541 (55.7%)
-  0  [k] futex_wait_queue
-  1  [k] futex_wait
+stack (952, 144)  samples 302 (8.7%)
+  0  [k] native_queued_spin_lock_slowpath+0x15
+  1  [k] _raw_spin_lock+0x29
+  2  [k] futex_wake+0x172
+  3  [k] do_futex+0xd8
+  4  [k] __x64_sys_futex+0x136
+  5  [k] do_syscall_64+0xaa
+  6  [k] entry_SYSCALL_64_after_hwframe+0x76
+  7  syscall+0x1d (libc.so.6)
+stack (-14, 2560)  samples 196 (5.6%)
+  0  std::sys::backtrace::__rust_begin_short_backtrace::<...>+0x90 (fast-workload)
+stack (3252, 144)  samples 190 (5.4%)
+  0  [k] native_queued_spin_lock_slowpath+0x13e
   ...
-  8  std::sys::sync::futex::wait (fast-workload)
-  9  std::sync::mpmc::wait
 
 Per-CPU samples
-cpu 0    samples 130
+cpu 0    samples 492
 
 Correlation
-Moderate CPU pressure (41.0%)
+CPU saturation likely contributes to scheduler latency (CPU 97.7% with 3489 samples)
 ```
 
+Kernel frames carry the `[k]` prefix and are resolved through kallsyms;
+user frames are resolved against the target's live maps (libc frames stay
+raw on systems without libc symbol tables). Kernel stacks are stored only
+for samples that interrupt the target inside the kernel; user-context
+samples report user frames alone.
+
 Verification: `fast cpu` against `./target/release/sched-workload target
---duration 30s` collects near-zero samples and near-zero usage; against
-`./target/release/fast-workload lock-hog --duration 30s --workers 16` the
-futex wait path appears in the symbolized top stacks, and against
+--duration 30s` collects 0 samples and near-zero usage; against
 `./target/release/sched-workload hog --duration 30s --workers 8` the sample
-count approaches frequency × duration × busy cores. Doubling `--frequency`
-roughly doubles the load sample count, which is the acceptance check for
-rate scaling.
+count approaches frequency × duration × busy cores (3943 samples at 99 Hz
+× 8 cores × 5 s) and the futex wait path shows up symbolized under
+`fast-workload lock-hog`. Rate scaling: 3928 samples at 99 Hz vs 15566 at
+396 Hz against the same hog (3.96x, expected ~4x).
 
 ### `fast io`
 
 Measures block I/O latency from `block_rq_issue` / `block_rq_complete`, and
 reads `/proc/<pid>/io` counters for byte deltas. The tracepoint payloads are
-parsed: each event carries the device (`major:minor`), start sector, size in
-sectors, and the operation (read/write) taken from the issue `cmd_flags`.
+parsed (offsets verified against the guest format files the init script
+dumps): each event carries the device (`major:minor`), start sector, size in
+sectors, and the operation (read/write) read from the rwbs field.
 Requests are paired per request, not per issuing thread: the pending map is
 keyed by (device, start sector), so completions that run in IRQ/softirq
 context still attribute to the issuing thread and completion rate tracks
@@ -148,33 +162,32 @@ issue rate.
 sudo ./target/release/fast io --pid 1234 --duration 10s --threshold 10ms
 ```
 
-Sample output (io-hog, sequential O_DIRECT reads on a real block device):
+Sample output (io-hog, sequential O_DIRECT reads on the QEMU scratch disk):
 
 ```text
-PID: fast-workload (18500)
+PID: fast-workload (204)
 Duration: 5s
-Samples: 412
+Samples: 151281
 Lost events: 0
-Slow > 10ms: 2
-rchar: 6321840128 bytes, wchar: 0 bytes
+Slow > 10ms: 1
+rchar: 634273792 bytes, wchar: 0 bytes
 
 I/O latency
-samples         412
-p50        1.2 ms
-p95        3.1 ms
-p99        5.8 ms
-max       21.4 ms
-ops: read 412 (1.6 GiB)
+samples     151281
+p50          47 µs
+p95          65 µs
+p99          87 µs
+max       536.3 ms
+ops: read 151281 (590.9 MiB)
 
 Per-device latency
-dev vdb (252:16)  samples 412  sectors 3355443
-ops: read 412 (1.6 GiB)
-  p50        1.2 ms p95        3.1 ms p99        5.8 ms max       21.4 ms
+dev vda (254:0)  samples 151281 sectors 1210248
+ops: read 151281 (590.9 MiB)
+  p50      47 µs p95      65 µs p99      87 µs max   536.3 ms
 
-Slow I/O > 10ms (top 2 of 2)
-   latency  device       op      sectors      bytes      tid
-   21.4 ms  vdb (252:16) read           8    4.0 KiB    18501
-   12.7 ms  vdb (252:16) read           8    4.0 KiB    18501
+Slow I/O > 10ms (top 1 of 1)
+   latency  device        op      sectors      bytes      tid
+  536.3 ms  vda (254:0)   read          8    4.0 KiB      207
 ```
 
 The device label resolves through `/sys/dev/block` (name plus
@@ -184,11 +197,13 @@ Verification: `fast io` against `sleep 60` collects no samples; against
 `./target/release/fast-workload io-hog --duration 30s --workers 2 --path
 <file-on-real-block-fs>` the report names the device holding the file, the
 `rchar` delta and per-device byte totals grow together, and the slow-I/O
-table lists the slowest requests above `--threshold`. The default path
-lives under `/tmp`, which is often tmpfs — reads there never reach the
-`block_rq_*` tracepoints, so only the `rchar` delta moves; point `--path`
-at a file on a real block filesystem (or the QEMU scratch disk) to collect
-latency samples.
+table lists the slowest requests above `--threshold`. Per-request pairing:
+284120 completions matched 290619 reads in the smoke run (97.8%; the old
+per-TID matching paired only a fraction of a percent because completions
+run in IRQ context). The default path lives under `/tmp`, which is often
+tmpfs — reads there never reach the `block_rq_*` tracepoints, so only the
+`rchar` delta moves; point `--path` at a file on a real block filesystem
+(or the QEMU scratch disk) to collect latency samples.
 
 ### `fast net`
 
@@ -355,14 +370,16 @@ is synthetic, see limitations).
 
 Honest state of each area, as of this version:
 
-- `cpu`: samples piggyback on `sched_switch`; stacks are raw kernel stack
-  ids, not symbolized frames, and user stacks are unresolvable. The usage
-  percentage is derived from `/proc` tick deltas, not from the eBPF samples.
-- `io`: issue/completion are paired by the current TID. Completions usually
-  run in interrupt/worker context, so many completions are not attributed to
-  the issuing thread; latency is approximate. Device, sector, and op fields
-  are zeroed in the eBPF payload, so the per-device table always shows
-  `dev 0:0`.
+- `cpu`: kernel stacks are stored only for samples that interrupt the target
+  inside the kernel (user-context samples carry user frames alone); libc
+  frames stay raw on systems without libc symbol tables. The usage percentage
+  is derived from `/proc` tick deltas, not from the eBPF samples.
+- `io`: requests are keyed by (device, start sector); two outstanding
+  requests on the exact same key would keep only the first (BPF_NOEXIST), and
+  empty flush requests all share sector 0. The kernel/user stack id space of
+  the CPU sampler is unaffected. Payload offsets are verified against the
+  7.2.x tracepoint format files; older kernel series (e.g. 5.x, where
+  `cmd_flags`/`rwbs` live at different offsets) would need re-verification.
 - `net`: only `tcp_retransmit_skb` is tracked; RTT and address/port fields
   are zeroed, so no endpoint or RTT table exists yet.
 - `off-cpu`: waits pair switch-out with the next wakeup, so the final
@@ -405,16 +422,26 @@ qemu-system-x86_64 -enable-kvm -m 2048 -smp 8 \
 ```
 
 Recorded results (QEMU KVM guest, 8 vCPUs, kernel 7.2.3-arch1-3 with BTF,
-2026-09-08; the `sched` row keeps the earlier 7.2.0-rc6 record):
+2026-09-08, v1.0 code; the `sched` 7.2.0-rc6 row keeps the earlier record):
 
 | Command   | Verifier | Idle                                   | Load                                            |
 | --------- | -------- | -------------------------------------- | ----------------------------------------------- |
-| `sched`   | pass     | p50 6µs p95 14µs p99 25µs max 172µs, slow>1ms 0 | p50 1µs p95 6µs p99 1.1ms max 1.9ms, slow>1ms 48 |
+| `sched`   | pass     | p50 6µs p95 19µs p99 29µs max 131µs, slow>1ms 0 | p50 3µs p95 5µs p99 1.1ms max 2.7ms, slow>1ms 46 |
 | `sched` (7.2.0-rc6, 2026-08-29) | pass | p50 7µs p95 9µs p99 11µs max 69µs, slow>1ms 0 | p50 3µs p95 2.3ms p99 4.0ms max 5.2ms, slow>1ms 297 |
-| `cpu`     | pass     | 4620 samples, usage 0.1%               | usage 99.2%; 0 samples (a spin hog never sleeps, samples ride wakeups) |
-| `io`      | pass     | 0 samples                              | 67 samples, p95 131µs, rchar 877 MB             |
+| `cpu`     | pass     | 0 samples, usage 0.1%                  | 3943 samples (99 Hz × 8 busy cores × 5 s), usage 99.0%, symbolized top stacks |
+| `io`      | pass     | 0 samples                              | 151281 samples on vda (254:0), p50 47µs p99 87µs, 590.9 MiB read |
 | `net`     | pass     | retransmissions 0                      | retransmissions 0 (loopback does not retransmit) |
-| `off-cpu` | pass     | 4598 samples, wait p50 1.1ms (timer sleep) | 557348 samples, wait p50 4µs p99 200µs (futex) |
+| `off-cpu` | pass     | 4621 samples                           | 529503 samples                                  |
+
+v1.0 accuracy checks from the same run (`tools/qemu-smoke.sh` prints them):
+
+- cpu rate scaling: 3928 samples at 99 Hz → 15566 samples at 396 Hz against
+  the same hog (3.96x, expected ~4x) — sample count tracks frequency × CPU
+  time, not wakeups.
+- cpu symbolization: the lock-hog futex wait path appears symbolized
+  (`[k] futex_wait` / `do_futex` kernel frames plus user frames).
+- io per-request pairing: 284120 completions for 290619 reads (97.8%); the
+  pre-v1.0 per-TID matching paired roughly 0.03% (67 of ~214k).
 
 All five eBPF-backed programs load and attach in the guest, and the load
 runs show the expected signal deltas.
