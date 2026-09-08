@@ -88,41 +88,49 @@ range), then repeat while `./target/release/sched-workload hog --duration
 
 Samples on-CPU stacks of the target threads at `--frequency` (default 99 Hz)
 by attaching a BPF program to a perf `cpu-clock` event on every online CPU,
-and reports process CPU usage from `/proc` tick deltas. The sample count
-scales with sampling rate × CPU time: an idle target yields ~0 samples, a
-busy target ≈ frequency × duration × busy-core count, regardless of how many
-times the threads wake up.
+and reports process CPU usage from `/proc` tick deltas. Top stacks are
+symbolized: kernel frames via the running kernel's kallsyms (full addresses
+require root), user frames via blazesym against the target process' live
+`/proc/<pid>` state. The sample count scales with sampling rate × CPU time:
+an idle target yields ~0 samples, a busy target ≈ frequency × duration ×
+busy-core count, regardless of how many times the threads wake up.
 
 ```bash
 sudo ./target/release/fast cpu --pid 1234 --duration 10s --frequency 199
 ```
 
-Sample output (8 hog workers):
+Sample output (lock-hog fixture):
 
 ```text
-PID: sched-workload (18410)
+PID: fast-workload (18410)
 Duration: 5s
-Samples: 5211
+Samples: 972
 Lost: 0
-CPU usage: 96.1% (over 5.0s wall, 4211 ticks total)
+CPU usage: 41.0% (over 5.0s wall, 1795 ticks total)
 
 On-CPU samples (hot stacks)
-stack 33     samples 4021
-stack 41     samples 1180
+stack (33, 12)  samples 541 (55.7%)
+  0  [k] futex_wait_queue
+  1  [k] futex_wait
+  ...
+  8  std::sys::sync::futex::wait (fast-workload)
+  9  std::sync::mpmc::wait
 
 Per-CPU samples
-cpu 0    samples 650
+cpu 0    samples 130
 
 Correlation
-CPU saturation likely contributes to scheduler latency (CPU 96.1% with 5211 samples)
+Moderate CPU pressure (41.0%)
 ```
 
 Verification: `fast cpu` against `./target/release/sched-workload target
 --duration 30s` collects near-zero samples and near-zero usage; against
+`./target/release/fast-workload lock-hog --duration 30s --workers 16` the
+futex wait path appears in the symbolized top stacks, and against
 `./target/release/sched-workload hog --duration 30s --workers 8` the sample
-count approaches frequency × duration × busy cores and the usage jumps to
-~100% per core. Doubling `--frequency` roughly doubles the load sample
-count, which is the acceptance check for rate scaling.
+count approaches frequency × duration × busy cores. Doubling `--frequency`
+roughly doubles the load sample count, which is the acceptance check for
+rate scaling.
 
 ### `fast io`
 

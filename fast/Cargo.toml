@@ -8,6 +8,7 @@ build = "build.rs"
 [dependencies]
 anyhow.workspace = true
 aya.workspace = true
+blazesym = "0.2.6"
 bytemuck.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
