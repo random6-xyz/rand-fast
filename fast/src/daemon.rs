@@ -1,6 +1,6 @@
-use std::{collections::VecDeque, fs, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
+use std::{collections::VecDeque, fs, path::PathBuf, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use crate::process;
 
 const DEFAULT_RING_SECS: u64 = 60;
@@ -8,7 +8,6 @@ const DEFAULT_BUDGET_MB: usize = 10;
 
 #[derive(Debug, Clone)]
 struct RingEntry {
-    timestamp: Instant,
     scheduler_p95_us: u64,
     cpu_percent: f32,
     io_p95_ms: f64,
@@ -52,7 +51,7 @@ impl FlightRecorder {
         let path = self.output_dir.join(format!("incident-{ts}.json"));
         let mut content = format!("{{\n  \"timestamp\": \"{ts}\",\n  \"trigger_p95_us\": {},\n  \"ring_len\": {},\n  \"budget_bytes\": {},\n  \"entries\": [\n", self.trigger_p95_us, self.ring.len(), self.budget_bytes);
         for e in &self.ring {
-            content.push_str(&format!("    {{\"p95_us\": {}, \"cpu\": {}}},\n", e.scheduler_p95_us, e.cpu_percent));
+            content.push_str(&format!("    {{\"p95_us\": {}, \"cpu\": {}, \"io_p95_ms\": {}}},\n", e.scheduler_p95_us, e.cpu_percent, e.io_p95_ms));
         }
         content.push_str("]\n}\n");
         fs::write(&path, content).with_context(|| format!("write {path:?}"))?;
@@ -106,7 +105,6 @@ pub fn run_daemon(pid: u32, duration: Duration, trigger: Duration, output: PathB
             // Simulate collection: read scheduler p95 via /proc or dummy
             let dummy_p95 = if incident_count == 2 { trigger_us + 1000 } else { 10 };
             let entry = RingEntry {
-                timestamp: Instant::now(),
                 scheduler_p95_us: dummy_p95,
                 cpu_percent: 10.0,
                 io_p95_ms: 1.0,
@@ -144,8 +142,8 @@ mod tests {
     fn ring_budget() {
         let mut r = FlightRecorder::new(1000, PathBuf::from("/tmp"));
         assert_eq!(r.max_entries, 600);
-        for i in 0..700 {
-            r.push(RingEntry { timestamp: Instant::now(), scheduler_p95_us: 10, cpu_percent: 1.0, io_p95_ms: 1.0 });
+        for _ in 0..700 {
+            r.push(RingEntry { scheduler_p95_us: 10, cpu_percent: 1.0, io_p95_ms: 1.0 });
         }
         assert_eq!(r.ring.len(), 600);
         assert!(r.ring.len() <= r.max_entries);
@@ -155,7 +153,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fastd-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mut r = FlightRecorder::new(100, dir.clone());
-        r.push(RingEntry { timestamp: Instant::now(), scheduler_p95_us: 200, cpu_percent: 90.0, io_p95_ms: 1.0 });
+        r.push(RingEntry { scheduler_p95_us: 200, cpu_percent: 90.0, io_p95_ms: 1.0 });
         // Should have created incident file
         let files = fs::read_dir(&dir).unwrap().count();
         assert!(files >= 1);
@@ -166,7 +164,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fastd-restart-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mut r = FlightRecorder::new(1000, dir.clone());
-        r.push(RingEntry { timestamp: Instant::now(), scheduler_p95_us: 10, cpu_percent: 1.0, io_p95_ms: 1.0 });
+        r.push(RingEntry { scheduler_p95_us: 10, cpu_percent: 1.0, io_p95_ms: 1.0 });
         let _ = r.preserve_incident();
         assert!(dir.exists());
         let _ = fs::remove_dir_all(&dir);

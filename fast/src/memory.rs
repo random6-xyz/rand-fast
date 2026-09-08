@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, fs, time::{Duration, Instant}, sync::{Arc, atomic::{AtomicBool, Ordering}}};
+use std::{fs, time::{Duration, Instant}, sync::{Arc, atomic::{AtomicBool, Ordering}}};
 
 use anyhow::{Context, Result, bail};
 use crate::{cli::MemoryArgs, process};
@@ -117,7 +117,6 @@ pub fn run(args: MemoryArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     #[test]
     fn psi_parse() {
         let s = "some avg10=12.34 avg60=5.00 avg300=1.00 total=12345\nfull avg10=2.00 avg60=1.00 total=2345\n";

@@ -1,5 +1,3 @@
-use std::{collections::HashMap, time::Duration};
-
 use anyhow::{Result, Context};
 use crate::{cli::DiagnoseArgs, process};
 
@@ -8,7 +6,6 @@ struct Signal {
     name: &'static str,
     confidence: f32,
     evidence: String,
-    value: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -50,7 +47,6 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
         name: "CPU contention",
         confidence: if cpu_conf > 50.0 { cpu_conf } else { 10.0 },
         evidence: format!("loadavg {:.2}, estimated CPU pressure {:.0}%", cpu_pressure, cpu_conf),
-        value: cpu_pressure,
     });
 
     // Signal 2: Disk I/O - check /proc/diskstats or /proc/<pid>/io
@@ -62,16 +58,14 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
         name: "Disk I/O",
         confidence: io_conf,
         evidence: format!("rchar {:.0} bytes", io_wait),
-        value: io_wait,
     });
 
     // Signal 3: Network - check retrans from /proc/net/snmp (simplified)
-    let retrans = std::fs::read_to_string("/proc/net/snmp").ok().map(|c| c.contains("RetransSegs").then(|| 5.0).unwrap_or(0.0)).unwrap_or(0.0);
+    let retrans = std::fs::read_to_string("/proc/net/snmp").ok().map(|c| if c.contains("RetransSegs") { 5.0 } else { 0.0 }).unwrap_or(0.0);
     signals.push(Signal {
         name: "Network",
         confidence: if retrans > 0.0 { 15.0 } else { 5.0 },
         evidence: format!("TCP retrans indicator {:.0}", retrans),
-        value: retrans,
     });
 
     // Signal 4: Lock contention - check voluntary_ctxt_switches
@@ -83,7 +77,6 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
         name: "Lock contention",
         confidence: lock_conf,
         evidence: format!("voluntary_ctxt_switches {:.0}", ctxt),
-        value: ctxt,
     });
 
     // Signal 5: Memory pressure - check PSI
@@ -95,7 +88,6 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
         name: "Memory pressure",
         confidence: mem_conf,
         evidence: format!("PSI memory avg10 {:.1}%", psi),
-        value: psi,
     });
 
     // Signal 6: Scheduler latency - placeholder, would be from eBPF
@@ -103,7 +95,6 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
         name: "Scheduler latency",
         confidence: 20.0,
         evidence: "scheduler p95 estimated from run-queue (requires eBPF for precise)".to_string(),
-        value: 0.0,
     });
 
     let ranked = rank_signals(signals);
@@ -129,9 +120,9 @@ mod tests {
     #[test]
     fn ranking_deterministic() {
         let signals = vec![
-            Signal { name: "CPU contention", confidence: 80.0, evidence: "a".to_string(), value: 0.0 },
-            Signal { name: "Disk I/O", confidence: 80.0, evidence: "b".to_string(), value: 0.0 },
-            Signal { name: "Memory pressure", confidence: 10.0, evidence: "c".to_string(), value: 0.0 },
+            Signal { name: "CPU contention", confidence: 80.0, evidence: "a".to_string() },
+            Signal { name: "Disk I/O", confidence: 80.0, evidence: "b".to_string() },
+            Signal { name: "Memory pressure", confidence: 10.0, evidence: "c".to_string() },
         ];
         let ranked = rank_signals(signals);
         // Same confidence: sorted by name asc, so CPU before Disk
@@ -142,8 +133,8 @@ mod tests {
     #[test]
     fn confidence_preserved() {
         let signals = vec![
-            Signal { name: "A", confidence: 90.0, evidence: "ev1".to_string(), value: 1.0 },
-            Signal { name: "B", confidence: 10.0, evidence: "ev2".to_string(), value: 2.0 },
+            Signal { name: "A", confidence: 90.0, evidence: "ev1".to_string() },
+            Signal { name: "B", confidence: 10.0, evidence: "ev2".to_string() },
         ];
         let ranked = rank_signals(signals);
         assert_eq!(ranked[0].confidence, 90.0);

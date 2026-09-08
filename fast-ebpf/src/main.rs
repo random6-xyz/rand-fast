@@ -126,14 +126,14 @@ fn try_sched_switch(ctx: TracePointContext) -> Result<u32, u32> {
     // Best-effort on-CPU sampling for hot-stack reporting.
     let kstack = unsafe {
         bpf_get_stackid(
-            ctx.as_ptr() as *mut core::ffi::c_void,
+            ctx.as_ptr(),
             &STACK_TRACES as *const _ as *mut core::ffi::c_void,
             0,
         )
     };
     let ustack = unsafe {
         bpf_get_stackid(
-            ctx.as_ptr() as *mut core::ffi::c_void,
+            ctx.as_ptr(),
             &STACK_TRACES as *const _ as *mut core::ffi::c_void,
             256 | BPF_F_REUSE_STACKID as u64,
         )
@@ -153,8 +153,8 @@ fn try_sched_switch(ctx: TracePointContext) -> Result<u32, u32> {
 
 // --- I/O: block_rq_issue / block_rq_complete ---
 #[tracepoint(name = "block_rq_issue", category = "block")]
-pub fn block_rq_issue(ctx: TracePointContext) -> u32 {
-    let tid = (bpf_get_current_pid_tgid() as u32) & 0xFFFF_FFFF;
+pub fn block_rq_issue(_ctx: TracePointContext) -> u32 {
+    let tid = bpf_get_current_pid_tgid() as u32;
     if unsafe { TARGET_TIDS.get(tid) }.is_none() {
         return 0;
     }
@@ -165,7 +165,7 @@ pub fn block_rq_issue(ctx: TracePointContext) -> u32 {
 
 #[tracepoint(name = "block_rq_complete", category = "block")]
 pub fn block_rq_complete(ctx: TracePointContext) -> u32 {
-    let tid = (bpf_get_current_pid_tgid() as u32) & 0xFFFF_FFFF;
+    let tid = bpf_get_current_pid_tgid() as u32;
     if unsafe { TARGET_TIDS.get(tid) }.is_none() {
         return 0;
     }
@@ -192,7 +192,7 @@ pub fn block_rq_complete(ctx: TracePointContext) -> u32 {
 // --- Network: tcp_retransmit_skb ---
 #[tracepoint(name = "tcp_retransmit_skb", category = "tcp")]
 pub fn tcp_retransmit_skb(ctx: TracePointContext) -> u32 {
-    let tid = (bpf_get_current_pid_tgid() as u32) & 0xFFFF_FFFF;
+    let tid = bpf_get_current_pid_tgid() as u32;
     if unsafe { TARGET_TIDS.get(tid) }.is_none() {
         return 0;
     }
@@ -223,7 +223,7 @@ fn try_offcpu_wakeup(ctx: TracePointContext) -> Result<u32, u32> {
         let _ = OFFCPU_START.remove(tid);
         let stack = unsafe {
             bpf_get_stackid(
-                ctx.as_ptr() as *mut core::ffi::c_void,
+                ctx.as_ptr(),
                 &STACK_TRACES as *const _ as *mut core::ffi::c_void,
                 0,
             )
@@ -251,7 +251,7 @@ pub fn sched_stat_sleep(ctx: TracePointContext) -> u32 {
 // --- Memory: page_fault ---
 #[tracepoint(name = "page_fault_user", category = "exceptions")]
 pub fn page_fault_user(ctx: TracePointContext) -> u32 {
-    let tid = (bpf_get_current_pid_tgid() as u32) & 0xFFFF_FFFF;
+    let tid = bpf_get_current_pid_tgid() as u32;
     if unsafe { TARGET_TIDS.get(tid) }.is_none() {
         return 0;
     }

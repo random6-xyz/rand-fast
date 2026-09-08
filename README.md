@@ -33,11 +33,12 @@ The report contains overall p50, p95, p99, and maximum latency, running-CPU summ
 ## Tests
 
 ```bash
-cargo test -p fast-common -p fast
-cargo clippy -p fast --all-targets -- -D warnings
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-The eBPF object is built as part of these commands.
+Both commands also build the eBPF object. CI must keep clippy clean with
+`-D warnings`.
 
 ### Privileged smoke test (QEMU, no host sudo)
 
