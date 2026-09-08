@@ -416,8 +416,16 @@ fn lock_worker(
                 Ok(_) => break,
                 Err(_) => unsafe {
                     // FUTEX_WAIT re-checks the value == 1 before parking, so
-                    // a concurrent release wakes us with EAGAIN.
-                    libc::syscall(libc::SYS_futex, word, futex_wait, 1);
+                    // a concurrent release wakes us with EAGAIN. The timeout
+                    // argument must be passed explicitly: variadic syscall
+                    // arguments left out are read as garbage by the kernel.
+                    libc::syscall(
+                        libc::SYS_futex,
+                        word,
+                        futex_wait,
+                        1,
+                        ptr::null::<libc::timespec>(),
+                    );
                 },
             }
         }
@@ -430,7 +438,13 @@ fn lock_worker(
         // Release: wake every parked contender to keep the convoy hot.
         futex_word.store(0, Ordering::Release);
         unsafe {
-            libc::syscall(libc::SYS_futex, word, futex_wake, i32::MAX);
+            libc::syscall(
+                libc::SYS_futex,
+                word,
+                futex_wake,
+                i32::MAX,
+                ptr::null::<libc::timespec>(),
+            );
         }
     }
     Ok(())

@@ -1,7 +1,7 @@
-use std::{collections::BTreeMap, collections::BTreeSet, convert::TryInto};
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result};
-use aya::{Ebpf, include_bytes_aligned, maps::HashMap as AyaHashMap, maps::MapData};
+use aya::{Ebpf, include_bytes_aligned};
 use fast_common::OffCpuEvent;
 
 use crate::{cli::OffCpuArgs, process, runtime};
@@ -74,23 +74,22 @@ pub fn run(args: OffCpuArgs) -> Result<()> {
 
     let mut bpf = Ebpf::load(include_bytes_aligned!(concat!(env!("OUT_DIR"), "/fast-ebpf")))
         .context("failed to load eBPF object; run as root or grant CAP_BPF and CAP_PERFMON")?;
-    runtime::attach_tracepoint(&mut bpf, "sched", "sched_stat_sleep")?;
+    // The switch handler records when a target thread starts waiting and the
+    // wakeup handler pairs it into an off-CPU event, so both must attach.
+    runtime::attach_tracepoint(&mut bpf, "sched", "sched_switch")?;
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_wakeup")?;
 
     let mut target_tids = runtime::take_target_map(&mut bpf)?;
-    let pending_map = bpf
-        .take_map("OFFCPU_START")
-        .context("eBPF map OFFCPU_START is missing")?;
-    let mut pending: AyaHashMap<MapData, u32, u64> = pending_map
-        .try_into()
-        .context("OFFCPU_START has an unexpected map type or layout")?;
 
+    // The collector reads sleep durations straight from sched_stat_sleep and
+    // keeps no per-thread pending state.
+    let mut no_pending = runtime::NoPending;
     let mut known = BTreeSet::new();
     let mut stats = OffCpuStats::default();
     let summary = runtime::run_collection(
         &mut bpf,
         &mut target_tids,
-        &mut pending,
+        &mut no_pending,
         &mut known,
         &initial_tids,
         &mut stats,

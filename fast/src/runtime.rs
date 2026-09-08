@@ -92,6 +92,30 @@ pub trait EventHandler<E> {
     fn on_lost(&mut self, count: u64);
 }
 
+/// Per-thread pending state that must be cleared when a target thread exits.
+pub trait PendingCleanup {
+    /// Removes any pending state tracked for `tid`.
+    fn clear(&mut self, tid: u32) -> Result<(), MapError>;
+}
+
+impl<V: AyaPod> PendingCleanup for AyaHashMap<MapData, u32, V> {
+    fn clear(&mut self, tid: u32) -> Result<(), MapError> {
+        match self.remove(&tid) {
+            Ok(()) | Err(MapError::KeyNotFound) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Placeholder for collectors without per-thread pending state.
+pub struct NoPending;
+
+impl PendingCleanup for NoPending {
+    fn clear(&mut self, _tid: u32) -> Result<(), MapError> {
+        Ok(())
+    }
+}
+
 /// Takes the shared `TARGET_TIDS` map out of the loaded eBPF object.
 pub fn take_target_map(bpf: &mut Ebpf) -> Result<AyaHashMap<MapData, u32, u8>> {
     let map = bpf
@@ -121,9 +145,9 @@ pub fn attach_tracepoint(bpf: &mut Ebpf, category: &str, name: &str) -> Result<(
 
 /// Installs `current_tids` into the target map, removing stale entries and
 /// their pending state.
-pub fn sync_target_tids<V: AyaPod>(
+pub fn sync_target_tids(
     target_tids: &mut AyaHashMap<MapData, u32, u8>,
-    pending: &mut AyaHashMap<MapData, u32, V>,
+    pending: &mut dyn PendingCleanup,
     known_tids: &mut BTreeSet<u32>,
     current_tids: &BTreeSet<u32>,
 ) -> Result<()> {
@@ -143,13 +167,9 @@ pub fn sync_target_tids<V: AyaPod>(
         target_tids
             .remove(&tid)
             .with_context(|| format!("failed to remove thread {tid} from the target map"))?;
-        match pending.remove(&tid) {
-            Ok(()) | Err(MapError::KeyNotFound) => {}
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to clear pending state for thread {tid}"));
-            }
-        }
+        pending
+            .clear(tid)
+            .with_context(|| format!("failed to clear pending state for thread {tid}"))?;
     }
 
     let added = current_tids
@@ -170,10 +190,10 @@ pub fn sync_target_tids<V: AyaPod>(
 ///
 /// Returns `Ok(true)` while the process is alive and `Ok(false)` once it has
 /// exited.
-pub fn refresh_target_threads<V: AyaPod>(
+pub fn refresh_target_threads(
     pid: u32,
     target_tids: &mut AyaHashMap<MapData, u32, u8>,
-    pending: &mut AyaHashMap<MapData, u32, V>,
+    pending: &mut dyn PendingCleanup,
     known_tids: &mut BTreeSet<u32>,
 ) -> Result<bool> {
     if !process::is_alive(pid).with_context(|| format!("failed to inspect process {pid}"))? {
@@ -198,10 +218,10 @@ pub fn refresh_target_threads<V: AyaPod>(
 /// on the map named `options.events_map`, spawns one reader thread per buffer,
 /// and feeds decoded events of type `E` to `handler` until the duration
 /// elapses, Ctrl-C arrives, the process exits, or a fatal error occurs.
-pub fn run_collection<E, V, H>(
+pub fn run_collection<E, H>(
     bpf: &mut Ebpf,
     target_tids: &mut AyaHashMap<MapData, u32, u8>,
-    pending: &mut AyaHashMap<MapData, u32, V>,
+    pending: &mut dyn PendingCleanup,
     known_tids: &mut BTreeSet<u32>,
     initial_tids: &BTreeSet<u32>,
     handler: &mut H,
@@ -209,7 +229,6 @@ pub fn run_collection<E, V, H>(
 ) -> Result<CollectionSummary>
 where
     E: Pod + Send,
-    V: AyaPod,
     H: EventHandler<E>,
 {
     if options.perf_page_count == 0 {

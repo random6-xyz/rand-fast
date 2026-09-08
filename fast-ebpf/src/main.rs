@@ -17,6 +17,8 @@ use fast_common::{CpuSampleEvent, IoEvent, MemoryEvent, OffCpuEvent, TcpEvent, M
 // The offsets are the stable payload offsets of the Linux scheduler tracepoints:
 // trace_entry is 8 bytes, followed by the fields declared in include/trace/events/sched.h.
 const SCHED_WAKEUP_PID_OFFSET: usize = 24;
+const SCHED_SWITCH_PREV_PID_OFFSET: usize = 24;
+const SCHED_SWITCH_PREV_STATE_OFFSET: usize = 32;
 const SCHED_SWITCH_NEXT_PID_OFFSET: usize = 56;
 
 #[cfg(not(target_arch = "bpf"))]
@@ -82,6 +84,34 @@ fn try_sched_wakeup(ctx: TracePointContext) -> Result<u32, u32> {
         let _ = PENDING_WAKEUPS.insert(tid, pending, BPF_NOEXIST as u64);
     }
 
+    // Off-CPU: the task was switched out in a sleepable state and just became
+    // runnable again, so the pending switch-out timestamp measures its wait.
+    if let Some(start) = unsafe { OFFCPU_START.get(tid) } {
+        // Copy the timestamp before removing the entry; the LRU entry memory
+        // is freed by remove and must not be read afterwards.
+        let start_ns = *start;
+        let now = unsafe { bpf_ktime_get_ns() };
+        let _ = OFFCPU_START.remove(tid);
+        if now >= start_ns {
+            let stack = unsafe {
+                bpf_get_stackid(
+                    ctx.as_ptr(),
+                    &STACK_TRACES as *const _ as *mut core::ffi::c_void,
+                    0,
+                )
+            };
+            let event = OffCpuEvent {
+                wait_ns: now - start_ns,
+                stack_id: stack as i64,
+                tid,
+                reason: 0,
+                _pad: 0,
+                _pad2: 0,
+            };
+            OFFCPU_EVENTS.output(&ctx, event, BPF_ANY);
+        }
+    }
+
     Ok(0)
 }
 
@@ -95,6 +125,15 @@ pub fn sched_switch(ctx: TracePointContext) -> u32 {
 
 fn try_sched_switch(ctx: TracePointContext) -> Result<u32, u32> {
     let tid = unsafe { ctx.read_at::<u32>(SCHED_SWITCH_NEXT_PID_OFFSET) }.map_err(|_| 0u32)?;
+
+    // Off-CPU: a target task switched out in a sleepable state starts waiting.
+    if let Ok(prev_pid) = unsafe { ctx.read_at::<u32>(SCHED_SWITCH_PREV_PID_OFFSET) }
+        && unsafe { TARGET_TIDS.get(prev_pid) }.is_some()
+        && let Ok(prev_state) = unsafe { ctx.read_at::<u64>(SCHED_SWITCH_PREV_STATE_OFFSET) }
+        && prev_state != 0
+    {
+        let _ = OFFCPU_START.insert(prev_pid, unsafe { bpf_ktime_get_ns() }, BPF_ANY as u64);
+    }
 
     if unsafe { TARGET_TIDS.get(tid) }.is_none() {
         return Ok(0);
@@ -207,44 +246,6 @@ pub fn tcp_retransmit_skb(ctx: TracePointContext) -> u32 {
         _pad: [0; 3],
     };
     NET_EVENTS.output(&ctx, event, BPF_ANY);
-    0
-}
-
-// --- Off-CPU: helper for sched_wakeup off-cpu measurement ---
-#[allow(dead_code)]
-fn try_offcpu_wakeup(ctx: TracePointContext) -> Result<u32, u32> {
-    let tid = unsafe { ctx.read_at::<u32>(SCHED_WAKEUP_PID_OFFSET) }.map_err(|_| 0u32)?;
-    if unsafe { TARGET_TIDS.get(tid) }.is_none() {
-        return Ok(0);
-    }
-    if let Some(start) = unsafe { OFFCPU_START.get(tid) } {
-        let end = unsafe { bpf_ktime_get_ns() };
-        let wait = end.saturating_sub(*start);
-        let _ = OFFCPU_START.remove(tid);
-        let stack = unsafe {
-            bpf_get_stackid(
-                ctx.as_ptr(),
-                &STACK_TRACES as *const _ as *mut core::ffi::c_void,
-                0,
-            )
-        };
-        let event = OffCpuEvent {
-            wait_ns: wait,
-            stack_id: stack as i64,
-            tid,
-            reason: 0,
-            _pad: 0,
-            _pad2: 0,
-        };
-        OFFCPU_EVENTS.output(&ctx, event, BPF_ANY);
-    }
-    Ok(0)
-}
-
-#[tracepoint(name = "sched_stat_sleep", category = "sched")]
-pub fn sched_stat_sleep(ctx: TracePointContext) -> u32 {
-    // Fallback off-cpu trigger
-    let _ = try_offcpu_wakeup(ctx);
     0
 }
 
