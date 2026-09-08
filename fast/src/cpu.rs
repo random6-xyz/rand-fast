@@ -26,10 +26,6 @@ use crate::{cli::CpuArgs, process, runtime};
 /// default buffer is sufficient.
 const PERF_PAGE_COUNT: usize = runtime::DEFAULT_PERF_PAGE_COUNT;
 
-/// `BPF_F_USER_STACK` for `STACK_TRACES` lookups: user-space stacks are
-/// stored under ids looked up with this flag, kernel stacks without it.
-const BPF_F_USER_STACK: u64 = 256;
-
 /// Upper bound on frames printed per hot stack.
 const MAX_REPORT_FRAMES: usize = 24;
 
@@ -260,22 +256,41 @@ impl StackSymbolizer {
     }
 }
 
-/// Reads raw instruction pointers of one stack id out of the eBPF
-/// `STACK_TRACES` map (`user` selects the user-space half of the id).
-fn read_stack_ips(
-    stack_map: &StackTraceMap<MapData>,
-    stack_id: i64,
-    user: bool,
-) -> Result<Vec<u64>> {
-    if stack_id < 0 {
-        return Ok(Vec::new());
+/// The kernel and user stack trace maps, taken out of the loaded eBPF object
+/// after collection. Lookups take no flags: `BPF_F_USER_STACK` only affects
+/// the capture side, and kernel/user stacks are separated by map.
+struct StackMaps {
+    kernel: StackTraceMap<MapData>,
+    user: StackTraceMap<MapData>,
+}
+
+impl StackMaps {
+    fn take(bpf: &mut Ebpf) -> Result<Self> {
+        let kernel: StackTraceMap<MapData> = bpf
+            .take_map("STACK_TRACES")
+            .context("eBPF map STACK_TRACES is missing")?
+            .try_into()
+            .context("STACK_TRACES has an unexpected map type or layout")?;
+        let user: StackTraceMap<MapData> = bpf
+            .take_map("STACK_TRACES_USER")
+            .context("eBPF map STACK_TRACES_USER is missing")?
+            .try_into()
+            .context("STACK_TRACES_USER has an unexpected map type or layout")?;
+        Ok(Self { kernel, user })
     }
-    let id = u32::try_from(stack_id).context("stack id overflows u32")?;
-    let flags = if user { BPF_F_USER_STACK } else { 0 };
-    let trace = stack_map
-        .get(&id, flags)
-        .with_context(|| format!("failed to read stack {stack_id} from the stack trace map"))?;
-    Ok(trace.frames().iter().map(|frame| frame.ip).collect())
+
+    /// Reads the raw instruction pointers stored under one stack id.
+    fn read(&self, stack_id: i64, user: bool) -> Result<Vec<u64>> {
+        if stack_id < 0 {
+            return Ok(Vec::new());
+        }
+        let id = u32::try_from(stack_id).context("stack id overflows u32")?;
+        let map = if user { &self.user } else { &self.kernel };
+        let trace = map
+            .get(&id, 0)
+            .with_context(|| format!("failed to read stack {stack_id} from the stack trace map"))?;
+        Ok(trace.frames().iter().map(|frame| frame.ip).collect())
+    }
 }
 
 pub fn run(args: CpuArgs) -> Result<()> {
@@ -345,11 +360,7 @@ pub fn run(args: CpuArgs) -> Result<()> {
     stats.end_usage = read_proc_cpu_usage(pid).ok();
     stats.end_system = read_system_ticks().ok();
 
-    let stack_map: StackTraceMap<MapData> = bpf
-        .take_map("STACK_TRACES")
-        .context("eBPF map STACK_TRACES is missing")?
-        .try_into()
-        .context("STACK_TRACES has an unexpected map type or layout")?;
+    let stack_maps = StackMaps::take(&mut bpf)?;
 
     print_cpu_report(
         pid,
@@ -358,12 +369,12 @@ pub fn run(args: CpuArgs) -> Result<()> {
         &stats,
         summary.interrupted,
         summary.process_exited,
-        &stack_map,
+        &stack_maps,
     );
     Ok(())
 }
 
-fn print_hot_stacks(pid: u32, stats: &CpuStats, stack_map: &StackTraceMap<MapData>) {
+fn print_hot_stacks(pid: u32, stats: &CpuStats, stack_maps: &StackMaps) {
     let mut symbolizer = StackSymbolizer::new(pid);
     println!();
     println!("On-CPU samples (hot stacks)");
@@ -381,11 +392,11 @@ fn print_hot_stacks(pid: u32, stats: &CpuStats, stack_map: &StackTraceMap<MapDat
         println!("stack {stack_id:?}  samples {count} ({percent:.1}%)");
         let (kernel_id, user_id) = stack_id;
         let mut frames = Vec::new();
-        match read_stack_ips(stack_map, kernel_id, false) {
+        match stack_maps.read(kernel_id, false) {
             Ok(ips) => frames.extend(symbolizer.kernel_frames(&ips)),
             Err(error) => println!("  (kernel stack unavailable: {error})"),
         }
-        match read_stack_ips(stack_map, user_id, true) {
+        match stack_maps.read(user_id, true) {
             Ok(ips) => frames.extend(symbolizer.user_frames(&ips)),
             Err(error) => println!("  (user stack unavailable: {error})"),
         }
@@ -409,7 +420,7 @@ fn print_cpu_report(
     stats: &CpuStats,
     interrupted: bool,
     exited: bool,
-    stack_map: &StackTraceMap<MapData>,
+    stack_maps: &StackMaps,
 ) {
     use humantime::format_duration;
     println!("PID: {name} ({pid})");
@@ -432,7 +443,7 @@ fn print_cpu_report(
         println!("CPU usage: unavailable (could not read /proc)");
     }
 
-    print_hot_stacks(pid, stats, stack_map);
+    print_hot_stacks(pid, stats, stack_maps);
 
     println!();
     println!("Per-CPU samples");

@@ -27,15 +27,19 @@ const SCHED_SWITCH_PREV_PID_OFFSET: usize = 24;
 const SCHED_SWITCH_PREV_STATE_OFFSET: usize = 32;
 const SCHED_SWITCH_NEXT_PID_OFFSET: usize = 56;
 
-// Payload offsets of the block request tracepoints: trace_entry is 8 bytes,
-// then dev (dev_t, 4 bytes), a 4-byte alignment hole, sector (u64), and
-// nr_sector (u32). block_rq_issue carries cmd_flags at 28; block_rq_complete
-// carries the completion error there instead. Verified against the tracepoint
-// format files on the 6.x/7.x kernels used in the QEMU smoke matrix.
+// Payload offsets of the block request tracepoints, verified against the
+// format files that tools/qemu-guest-init.sh dumps on the target kernel
+// (7.2.3-arch1-3):
+//   issue:    dev=8(4) sector=16(8) nr_sector=24(4) bytes=28(4) ioprio=32(2)
+//             rwbs[10]=34 comm[16]=44 cmd=60
+//   complete: dev=8(4) sector=16(8) nr_sector=24(4) error=28(4) ioprio=32(2)
+//             rwbs[10]=34 cmd=44
+// The operation is the first character of the rwbs string, which is how the
+// kernel renders req_op for the trace (R read, W write, D discard, ...).
 const BLOCK_RQ_DEV_OFFSET: usize = 8;
 const BLOCK_RQ_SECTOR_OFFSET: usize = 16;
 const BLOCK_RQ_NR_SECTOR_OFFSET: usize = 24;
-const BLOCK_RQ_ISSUE_CMD_FLAGS_OFFSET: usize = 28;
+const BLOCK_RQ_RWBS_OFFSET: usize = 34;
 
 #[cfg(not(target_arch = "bpf"))]
 fn main() {}
@@ -60,6 +64,13 @@ static CPU_EVENTS: PerfEventArray<CpuSampleEvent> = PerfEventArray::new(0);
 
 #[map]
 static STACK_TRACES: StackTrace = StackTrace::with_max_entries(MAX_STACKS, 0);
+
+/// User-space stacks live in their own map: `bpf_get_stackid` chains entries
+/// with equal ids (the id is a hash index, not a unique key), so sharing one
+/// map between kernel and user captures would make lookups return whichever
+/// stack was captured last for that id.
+#[map]
+static STACK_TRACES_USER: StackTrace = StackTrace::with_max_entries(MAX_STACKS, 0);
 
 #[map]
 static IO_EVENTS: PerfEventArray<IoEvent> = PerfEventArray::new(0);
@@ -235,7 +246,7 @@ fn try_cpu_sample(ctx: PerfEventContext) -> Result<u32, u32> {
     let ustack = unsafe {
         bpf_get_stackid(
             ctx.as_ptr(),
-            &STACK_TRACES as *const _ as *mut core::ffi::c_void,
+            &STACK_TRACES_USER as *const _ as *mut core::ffi::c_void,
             256 | BPF_F_REUSE_STACKID as u64,
         )
     };
@@ -268,8 +279,7 @@ fn try_block_rq_issue(ctx: TracePointContext) -> Result<u32, u32> {
 
     let dev = unsafe { ctx.read_at::<u32>(BLOCK_RQ_DEV_OFFSET) }.map_err(|_| 0u32)?;
     let sector = unsafe { ctx.read_at::<u64>(BLOCK_RQ_SECTOR_OFFSET) }.map_err(|_| 0u32)?;
-    let cmd_flags =
-        unsafe { ctx.read_at::<u32>(BLOCK_RQ_ISSUE_CMD_FLAGS_OFFSET) }.map_err(|_| 0u32)?;
+    let rwbs_op = unsafe { ctx.read_at::<u8>(BLOCK_RQ_RWBS_OFFSET) }.map_err(|_| 0u32)?;
 
     // Key the request by (device, start sector) so the completion can find it
     // from IRQ/softirq context. BPF_NOEXIST keeps the first outstanding
@@ -283,7 +293,11 @@ fn try_block_rq_issue(ctx: TracePointContext) -> Result<u32, u32> {
     let pending = PendingIo {
         start_ns: unsafe { bpf_ktime_get_ns() },
         tid,
-        cmd_flags,
+        op: match rwbs_op {
+            b'R' => 0,
+            b'W' => 1,
+            _ => 2,
+        },
     };
     let _ = PENDING_IO.insert(key, pending, BPF_NOEXIST as u64);
     Ok(0)
@@ -325,7 +339,7 @@ fn try_block_rq_complete(ctx: TracePointContext) -> Result<u32, u32> {
         tid: pending.tid,
         dev,
         sectors: nr_sector,
-        op: pending.cmd_flags >> 24,
+        op: pending.op,
     };
     IO_EVENTS.output(&ctx, event, BPF_ANY);
     Ok(0)

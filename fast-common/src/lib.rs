@@ -68,14 +68,14 @@ pub struct PendingWakeup {
 }
 
 /// Pending block I/O request state carried from `block_rq_issue` to
-/// `block_rq_complete`. `cmd_flags` is the raw request flag word; the
-/// operation occupies its high 8 bits (see [`io_op_name`]).
+/// `block_rq_complete`. `op` is the operation code derived from the trace's
+/// rwbs field: 0 read, 1 write, 2 anything else (see [`io_op_name`]).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct PendingIo {
     pub start_ns: u64,
     pub tid: u32,
-    pub cmd_flags: u32,
+    pub op: u32,
 }
 
 /// Identity of one in-flight block request: the device and its start sector.
