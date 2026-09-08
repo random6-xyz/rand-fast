@@ -37,6 +37,8 @@ fn run() -> anyhow::Result<()> {
         Command::OffCpu(args) => offcpu::run(args),
         Command::Memory(args) => memory::run(args),
         Command::Diagnose(args) => diagnose::run(args),
-        Command::Daemon(args) => daemon::run_daemon(args.pid, args.duration, args.trigger, args.output),
+        Command::Daemon(args) => {
+            daemon::run_daemon(args.pid, args.duration, args.trigger, args.output)
+        }
     }
 }
