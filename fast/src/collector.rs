@@ -2,15 +2,9 @@ use std::collections::BTreeSet;
 
 use anyhow::{Context, Result};
 use aya::{Ebpf, include_bytes_aligned, maps::HashMap as AyaHashMap, maps::MapData};
-use fast_common::SchedulerLatencyEvent;
+use fast_common::{COLLECT_SCHEDULER_LATENCY, SchedulerLatencyEvent};
 
-use crate::{
-    cli::SchedArgs,
-    output,
-    process,
-    runtime,
-    stats::Statistics,
-};
+use crate::{cli::SchedArgs, output, process, runtime, stats::Statistics};
 
 /// The scheduler emits at most one event per wakeup of the target threads, so
 /// the default buffer size matches earlier releases.
@@ -63,6 +57,7 @@ pub fn run(args: SchedArgs) -> Result<()> {
             duration: args.duration,
             events_map: "EVENTS",
             perf_page_count: PERF_PAGE_COUNT,
+            mode: COLLECT_SCHEDULER_LATENCY,
         },
     )?;
 

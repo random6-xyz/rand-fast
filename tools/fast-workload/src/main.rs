@@ -154,7 +154,15 @@ fn run_io_hog(args: IoHogArgs) -> Result<(), String> {
             thread::Builder::new()
                 .name(format!("io-hog-{worker}"))
                 .spawn(move || {
-                    io_worker(&path, file_size, args.random, worker, deadline, &cursor, &bytes_read)
+                    io_worker(
+                        &path,
+                        file_size,
+                        args.random,
+                        worker,
+                        deadline,
+                        &cursor,
+                        &bytes_read,
+                    )
                 })
                 .map_err(|error| format!("failed to spawn io worker: {error}"))?,
         );
@@ -170,7 +178,8 @@ fn run_io_hog(args: IoHogArgs) -> Result<(), String> {
 }
 
 fn prepare_file(path: &PathBuf, size: u64) -> Result<(), String> {
-    let mut file = File::create(path).map_err(|error| format!("create {}: {error}", path.display()))?;
+    let mut file =
+        File::create(path).map_err(|error| format!("create {}: {error}", path.display()))?;
     let chunk = vec![0u8; CHUNK_SIZE];
     let mut written = 0u64;
     while written < size {
@@ -206,24 +215,20 @@ fn io_worker(
 
     let mut seed = (worker as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15);
     let mut offset;
+    let chunk = CHUNK_SIZE as u64;
     while Instant::now() < deadline {
         if random {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
-            offset = seed % file_size;
+            // O_DIRECT requires sector-aligned offsets; keep reads on chunk
+            // boundaries.
+            offset = (seed % (file_size / chunk)) * chunk;
         } else {
-            offset = cursor.fetch_add(CHUNK_SIZE as u64, Ordering::Relaxed) % file_size;
+            offset = cursor.fetch_add(chunk, Ordering::Relaxed) % file_size;
         }
 
-        let n = unsafe {
-            libc::pread(
-                fd,
-                buffer.cast(),
-                CHUNK_SIZE,
-                offset as libc::off_t,
-            )
-        };
+        let n = unsafe { libc::pread(fd, buffer.cast(), CHUNK_SIZE, offset as libc::off_t) };
         if n < 0 {
             let error = std::io::Error::last_os_error();
             unsafe { dealloc(buffer, layout) };
@@ -491,7 +496,12 @@ fn run_mem_hog(args: MemHogArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn mem_worker(size: usize, deadline: Instant, rounds: &AtomicU64, bytes_faulted: &AtomicU64) -> Result<(), String> {
+fn mem_worker(
+    size: usize,
+    deadline: Instant,
+    rounds: &AtomicU64,
+    bytes_faulted: &AtomicU64,
+) -> Result<(), String> {
     while Instant::now() < deadline {
         let region = unsafe {
             libc::mmap(

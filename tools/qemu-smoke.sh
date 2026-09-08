@@ -15,6 +15,9 @@
 #   OUT_DIR     where raw reports are written (default /tmp/fast-smoke)
 #   IO_HOG_PATH file the io-hog reads; put it on a real block device (not
 #               tmpfs) so block_rq_* tracepoints fire (default /tmp/fast-workload-io)
+#
+# Exit status: 0 when every verifier load and idle/load collection succeeded,
+# 1 otherwise (failures are also counted in the summary).
 set -u
 
 FAST=${FAST:-./fast}
@@ -23,6 +26,14 @@ FAST_WORKLOAD=${FAST_WORKLOAD:-./fast-workload}
 DURATION=${DURATION:-5s}
 OUT_DIR=${OUT_DIR:-/tmp/fast-smoke}
 IO_HOG_PATH=${IO_HOG_PATH:-/tmp/fast-workload-io}
+FAILURES=0
+
+cleanup() {
+    kill $(jobs -p) 2>/dev/null
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 mkdir -p "$OUT_DIR"
 for binary in "$FAST" "$SCHED_WORKLOAD" "$FAST_WORKLOAD"; do
@@ -51,6 +62,7 @@ run_case() {
     else
         echo "$command_name verifier: FAIL"
         cat "$report"
+        FAILURES=$((FAILURES + 1))
         kill "$target_pid" 2>/dev/null
         return
     fi
@@ -59,8 +71,13 @@ run_case() {
     "$@" >"$OUT_DIR/$command_name-fixture.log" 2>&1 &
     local load_pid=$!
     sleep 0.5
-    "$FAST" "$command_name" --pid "$load_pid" --duration "$DURATION" \
-        >"$OUT_DIR/$command_name-load.txt" 2>&1 || true
+    if "$FAST" "$command_name" --pid "$load_pid" --duration "$DURATION" \
+        >"$OUT_DIR/$command_name-load.txt" 2>&1; then
+        : # counted as success; the report itself carries the numbers
+    else
+        echo "$command_name load collection: FAIL (see $OUT_DIR/$command_name-load.txt)"
+        FAILURES=$((FAILURES + 1))
+    fi
     kill "$load_pid" "$target_pid" 2>/dev/null
     wait "$load_pid" 2>/dev/null
     wait "$target_pid" 2>/dev/null
@@ -83,13 +100,19 @@ run_sched_case() {
     else
         echo "sched verifier: FAIL"
         cat "$report_idle"
+        FAILURES=$((FAILURES + 1))
         kill "$target_pid" 2>/dev/null
         return
     fi
 
     "$SCHED_WORKLOAD" hog --duration 30s --workers 8 >/dev/null 2>&1 &
     local hog_pid=$!
-    "$FAST" sched --pid "$target_pid" --duration "$DURATION" >"$report_load" 2>&1 || true
+    if "$FAST" sched --pid "$target_pid" --duration "$DURATION" >"$report_load" 2>&1; then
+        : # counted as success
+    else
+        echo "sched load collection: FAIL (see $report_load)"
+        FAILURES=$((FAILURES + 1))
+    fi
     kill "$hog_pid" "$target_pid" 2>/dev/null
     wait 2>/dev/null
 
@@ -123,3 +146,9 @@ print_metrics net 'Retransmissions:'
 print_metrics off-cpu 'Samples:'
 echo
 echo "Raw reports saved under $OUT_DIR"
+
+if [ "$FAILURES" -gt 0 ]; then
+    echo "smoke matrix: FAILED ($FAILURES failure(s))"
+    exit 1
+fi
+echo "smoke matrix: all cases passed"

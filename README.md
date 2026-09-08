@@ -153,8 +153,12 @@ Slow-device threshold: 10ms (configurable via --threshold)
 ```
 
 Verification: `fast io` against `sleep 60` collects no samples; against
-`./target/release/fast-workload io-hog --duration 30s --workers 2` samples
-and the `rchar` delta grow steadily.
+`./target/release/fast-workload io-hog --duration 30s --workers 2 --path
+<file-on-real-block-fs>` samples and the `rchar` delta grow steadily. The
+default path lives under `/tmp`, which is often tmpfs — reads there never
+reach the `block_rq_*` tracepoints, so only the `rchar` delta moves; point
+`--path` at a file on a real block filesystem (or the QEMU scratch disk) to
+collect latency samples.
 
 ### `fast net`
 
@@ -201,17 +205,17 @@ Sample output (lock-hog, 16 contending threads on 8 CPUs):
 ```text
 PID: fast-workload (18700)
 Duration: 5s
-Samples: 484380
+Samples: 557348
 Lost: 0
 
 Off-CPU wait
-p50          5 µs
-p95         55 µs
-p99        219 µs
-max        1.5 ms
+p50          4 µs
+p95         43 µs
+p99        200 µs
+max        2.7 ms
 
 Hot wait stacks
-stack 140    samples 258910
+stack 210    samples 294700
 ```
 
 Verification: `fast off-cpu` against `./target/release/sched-workload target
@@ -353,7 +357,8 @@ its matching load fixture and records verifier results and deltas:
 tools/qemu-smoke.sh                 # writes raw reports to /tmp/fast-smoke
 ```
 
-The script also runs on a host where you hold the required capabilities.
+The script exits non-zero if any verifier load or collection fails.
+It also runs on a host where you hold the required capabilities.
 `tools/qemu-guest-init.sh` boots a minimal initramfs-only guest (busybox,
 the release binaries, a loopback link, and an optional ext4 scratch disk for
 the io-hog fixture) and runs the matrix automatically:
@@ -374,12 +379,12 @@ Recorded results (QEMU KVM guest, 8 vCPUs, kernel 7.2.3-arch1-3 with BTF,
 
 | Command   | Verifier | Idle                                   | Load                                            |
 | --------- | -------- | -------------------------------------- | ----------------------------------------------- |
-| `sched`   | pass     | p50 7µs p95 19µs p99 35µs max 298µs, slow>1ms 0 | p50 3µs p95 15µs p99 1.0ms max 1.8ms, slow>1ms 43 |
+| `sched`   | pass     | p50 6µs p95 14µs p99 25µs max 172µs, slow>1ms 0 | p50 1µs p95 6µs p99 1.1ms max 1.9ms, slow>1ms 48 |
 | `sched` (7.2.0-rc6, 2026-08-29) | pass | p50 7µs p95 9µs p99 11µs max 69µs, slow>1ms 0 | p50 3µs p95 2.3ms p99 4.0ms max 5.2ms, slow>1ms 297 |
-| `cpu`     | pass     | 4585 samples, usage 0.1%               | usage 99.4%; 0 samples (a spin hog never sleeps, samples ride wakeups) |
-| `io`      | pass     | 0 samples                              | 59 samples, p95 128µs, rchar 954 MB             |
+| `cpu`     | pass     | 4620 samples, usage 0.1%               | usage 99.2%; 0 samples (a spin hog never sleeps, samples ride wakeups) |
+| `io`      | pass     | 0 samples                              | 67 samples, p95 131µs, rchar 877 MB             |
 | `net`     | pass     | retransmissions 0                      | retransmissions 0 (loopback does not retransmit) |
-| `off-cpu` | pass     | 4576 samples, wait p50 1.1ms (timer sleep) | 484380 samples, wait p50 5µs p99 219µs (futex) |
+| `off-cpu` | pass     | 4598 samples, wait p50 1.1ms (timer sleep) | 557348 samples, wait p50 4µs p99 200µs (futex) |
 
 All five eBPF-backed programs load and attach in the guest, and the load
 runs show the expected signal deltas.

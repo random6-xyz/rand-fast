@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use aya::{Ebpf, include_bytes_aligned, maps::HashMap as AyaHashMap, maps::MapData};
-use fast_common::CpuSampleEvent;
+use fast_common::{COLLECT_CPU_SAMPLE, CpuSampleEvent};
 
 use crate::{cli::CpuArgs, process, runtime};
 
@@ -149,6 +149,7 @@ pub fn run(args: CpuArgs) -> Result<()> {
             duration: args.duration,
             events_map: "CPU_EVENTS",
             perf_page_count: PERF_PAGE_COUNT,
+            mode: COLLECT_CPU_SAMPLE,
         },
     )?;
 
@@ -185,7 +186,12 @@ fn print_cpu_report(
     println!("Samples: {}", stats.samples.len());
     println!("Lost: {}", stats.lost);
     if let Some(p) = stats.cpu_percent() {
-        println!("CPU usage: {:.1}% (over {:.1}s wall, {} ticks total)", p, duration.as_secs_f64(), stats.end_system.unwrap_or(0) - stats.start_system.unwrap_or(0));
+        println!(
+            "CPU usage: {:.1}% (over {:.1}s wall, {} ticks total)",
+            p,
+            duration.as_secs_f64(),
+            stats.end_system.unwrap_or(0) - stats.start_system.unwrap_or(0)
+        );
     } else {
         println!("CPU usage: unavailable (could not read /proc)");
     }
@@ -216,7 +222,11 @@ fn print_cpu_report(
     println!("Correlation");
     if let Some(p) = stats.cpu_percent() {
         if p > 80.0 && !stats.samples.is_empty() {
-            println!("CPU saturation likely contributes to scheduler latency (CPU {:.1}% with {} samples)", p, stats.samples.len());
+            println!(
+                "CPU saturation likely contributes to scheduler latency (CPU {:.1}% with {} samples)",
+                p,
+                stats.samples.len()
+            );
         } else if p > 50.0 {
             println!("Moderate CPU pressure ({:.1}%)", p);
         } else {
@@ -232,7 +242,14 @@ mod tests {
     use super::*;
 
     fn sample(tid: u32, cpu: u32, kstack: i64) -> CpuSampleEvent {
-        CpuSampleEvent { tid, cpu, kernel_stack_id: kstack, user_stack_id: -1, _pad: 0, _pad2: 0 }
+        CpuSampleEvent {
+            tid,
+            cpu,
+            kernel_stack_id: kstack,
+            user_stack_id: -1,
+            _pad: 0,
+            _pad2: 0,
+        }
     }
 
     #[test]
@@ -248,8 +265,14 @@ mod tests {
     #[test]
     fn cpu_percent_calc() {
         let stats = CpuStats {
-            start_usage: Some(CpuUsage { utime: 100, stime: 0 }),
-            end_usage: Some(CpuUsage { utime: 200, stime: 0 }),
+            start_usage: Some(CpuUsage {
+                utime: 100,
+                stime: 0,
+            }),
+            end_usage: Some(CpuUsage {
+                utime: 200,
+                stime: 0,
+            }),
             start_system: Some(1000),
             end_system: Some(2000),
             ..CpuStats::default()

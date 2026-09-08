@@ -29,10 +29,20 @@ mkdir -p /sys/kernel/tracing /sys/kernel/debug
 # Networking: bring loopback up so the net-hog fixture can run.
 ip link set lo up
 
-# Real block device for the io-hog fixture, when one is attached.
+# Real block device for the io-hog fixture, when one is attached. Only use
+# /mnt/io when the mount actually succeeded; otherwise fall back to the
+# default tmpfs path (which collects no block_rq_* samples).
+IO_HOG_PATH=/tmp/fast-workload-io
 if [ -e /dev/vda ]; then
     mkdir -p /mnt/io
-    /bin/mount2 /dev/vda ext4 /mnt/io
+    if /bin/mount2 /dev/vda ext4 /mnt/io; then
+        IO_HOG_PATH=/mnt/io/fast-workload-io
+        echo "guest: block device /dev/vda mounted at /mnt/io"
+    else
+        echo "guest: block device mount FAILED; io-hog falls back to tmpfs"
+    fi
+else
+    echo "guest: block device MISSING; io-hog falls back to tmpfs"
 fi
 
 echo "guest: kernel $(uname -r)"
@@ -46,18 +56,13 @@ if [ -e /sys/kernel/tracing/events/sched/sched_wakeup ]; then
 else
     echo "guest: tracefs NOT available"
 fi
-if [ -e /dev/vda ]; then
-    echo "guest: block device /dev/vda mounted at /mnt/io"
-else
-    echo "guest: block device MISSING (io case falls back to tmpfs)"
-fi
 
 export FAST=/bin/fast
 export SCHED_WORKLOAD=/bin/sched-workload
 export FAST_WORKLOAD=/bin/fast-workload
 export OUT_DIR=/tmp/fast-smoke
 export DURATION=5s
-export IO_HOG_PATH=/mnt/io/fast-workload-io
+export IO_HOG_PATH
 
 sh /tools/qemu-smoke.sh
 rc=$?

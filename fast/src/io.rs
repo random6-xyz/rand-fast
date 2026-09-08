@@ -36,7 +36,10 @@ impl IoStats {
 
     fn record(&mut self, event: IoEvent) {
         self.latencies.push(event.latency_ns);
-        self.by_device.entry(event.dev).or_default().push(event.latency_ns);
+        self.by_device
+            .entry(event.dev)
+            .or_default()
+            .push(event.latency_ns);
         if event.latency_ns > self.threshold_ns {
             self.slow += 1;
         }
@@ -130,13 +133,16 @@ fn read_proc_io(pid: u32) -> Result<(u64, u64)> {
 pub fn run(args: IoArgs) -> Result<()> {
     let pid = args.pid;
     let threshold = args.threshold;
-    let process_name = process::read_name(pid)
-        .with_context(|| format!("cannot read process {pid}"))?;
-    let initial_tids = process::thread_ids(pid)
-        .with_context(|| format!("cannot enumerate threads for {pid}"))?;
+    let process_name =
+        process::read_name(pid).with_context(|| format!("cannot read process {pid}"))?;
+    let initial_tids =
+        process::thread_ids(pid).with_context(|| format!("cannot enumerate threads for {pid}"))?;
 
-    let mut bpf = Ebpf::load(include_bytes_aligned!(concat!(env!("OUT_DIR"), "/fast-ebpf")))
-        .context("failed to load eBPF object; run as root or grant CAP_BPF and CAP_PERFMON")?;
+    let mut bpf = Ebpf::load(include_bytes_aligned!(concat!(
+        env!("OUT_DIR"),
+        "/fast-ebpf"
+    )))
+    .context("failed to load eBPF object; run as root or grant CAP_BPF and CAP_PERFMON")?;
     runtime::attach_tracepoint(&mut bpf, "block", "block_rq_issue")?;
     runtime::attach_tracepoint(&mut bpf, "block", "block_rq_complete")?;
 
@@ -163,11 +169,11 @@ pub fn run(args: IoArgs) -> Result<()> {
             duration: args.duration,
             events_map: "IO_EVENTS",
             perf_page_count: PERF_PAGE_COUNT,
+            mode: 0,
         },
     )?;
 
-    let (rchar_end, wchar_end) =
-        read_proc_io(pid).unwrap_or((rchar_start, wchar_start));
+    let (rchar_end, wchar_end) = read_proc_io(pid).unwrap_or((rchar_start, wchar_start));
     let rchar_delta = rchar_end.saturating_sub(rchar_start);
     let wchar_delta = wchar_end.saturating_sub(wchar_start);
 
@@ -178,7 +184,11 @@ pub fn run(args: IoArgs) -> Result<()> {
     }
     println!("Samples: {}", stats.latencies.len());
     println!("Lost events: {}", stats.lost);
-    println!("Slow > {}: {}", humantime::format_duration(threshold), stats.slow);
+    println!(
+        "Slow > {}: {}",
+        humantime::format_duration(threshold),
+        stats.slow
+    );
     println!("rchar: {rchar_delta} bytes, wchar: {wchar_delta} bytes");
     println!();
     println!("I/O latency");
@@ -200,11 +210,21 @@ pub fn run(args: IoArgs) -> Result<()> {
         for (dev, s) in dev_summaries {
             let major = dev >> 20;
             let minor = dev & 0xFFFFF;
-            println!("dev {major}:{minor} samples {:<4} p50 {:>10} p95 {:>10} p99 {:>10} max {:>10}", s.count, format_ns(s.p50_ns), format_ns(s.p95_ns), format_ns(s.p99_ns), format_ns(s.max_ns));
+            println!(
+                "dev {major}:{minor} samples {:<4} p50 {:>10} p95 {:>10} p99 {:>10} max {:>10}",
+                s.count,
+                format_ns(s.p50_ns),
+                format_ns(s.p95_ns),
+                format_ns(s.p99_ns),
+                format_ns(s.max_ns)
+            );
         }
     }
     println!();
-    println!("Slow-device threshold: {} (configurable via --threshold)", humantime::format_duration(threshold));
+    println!(
+        "Slow-device threshold: {} (configurable via --threshold)",
+        humantime::format_duration(threshold)
+    );
     Ok(())
 }
 
@@ -215,14 +235,32 @@ mod tests {
     #[test]
     fn counts_slow_and_device() {
         let mut s = IoStats::new(1_000_000);
-        s.record(IoEvent { latency_ns: 5_000_000, tid: 1, dev: 0x0801, sectors: 8, op: 0 });
-        s.record(IoEvent { latency_ns: 5_000_000, tid: 1, dev: 0x0801, sectors: 8, op: 0 });
+        s.record(IoEvent {
+            latency_ns: 5_000_000,
+            tid: 1,
+            dev: 0x0801,
+            sectors: 8,
+            op: 0,
+        });
+        s.record(IoEvent {
+            latency_ns: 5_000_000,
+            tid: 1,
+            dev: 0x0801,
+            sectors: 8,
+            op: 0,
+        });
         assert_eq!(s.slow, 2);
         assert_eq!(s.by_device.len(), 1);
         assert_eq!(s.latencies.len(), 2);
 
         let mut strict = IoStats::new(10_000_000);
-        strict.record(IoEvent { latency_ns: 5_000_000, tid: 1, dev: 0x0801, sectors: 8, op: 0 });
+        strict.record(IoEvent {
+            latency_ns: 5_000_000,
+            tid: 1,
+            dev: 0x0801,
+            sectors: 8,
+            op: 0,
+        });
         assert_eq!(strict.slow, 0);
     }
 
@@ -230,7 +268,13 @@ mod tests {
     fn summary_computed() {
         let mut s = IoStats::new(100_000_000);
         for i in 1..=10u64 {
-            s.record(IoEvent { latency_ns: i * 1_000_000, tid: 1, dev: 0, sectors: 1, op: 0 });
+            s.record(IoEvent {
+                latency_ns: i * 1_000_000,
+                tid: 1,
+                dev: 0,
+                sectors: 1,
+                op: 0,
+            });
         }
         let sum = s.summary().unwrap();
         assert!(sum.p50_ns > 0);

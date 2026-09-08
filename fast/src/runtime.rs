@@ -69,6 +69,10 @@ pub struct CollectionOptions {
     /// Perf buffer page count per CPU. Use a larger value than
     /// [`DEFAULT_PERF_PAGE_COUNT`] for chatty tracepoints.
     pub perf_page_count: usize,
+    /// Collector mode bits (`fast_common::COLLECT_*`) written into the eBPF
+    /// `MODE` map so tracepoint programs only run the paths this command
+    /// consumes.
+    pub mode: u32,
 }
 
 /// How a collection ended.
@@ -104,15 +108,6 @@ impl<V: AyaPod> PendingCleanup for AyaHashMap<MapData, u32, V> {
             Ok(()) | Err(MapError::KeyNotFound) => Ok(()),
             Err(error) => Err(error),
         }
-    }
-}
-
-/// Placeholder for collectors without per-thread pending state.
-pub struct NoPending;
-
-impl PendingCleanup for NoPending {
-    fn clear(&mut self, _tid: u32) -> Result<(), MapError> {
-        Ok(())
     }
 }
 
@@ -235,6 +230,16 @@ where
         bail!("perf page count must be greater than zero");
     }
 
+    // Select the collector paths the tracepoint programs execute before any
+    // event can flow.
+    let mode_map = bpf.take_map("MODE").context("eBPF map MODE is missing")?;
+    let mut mode_map: AyaHashMap<MapData, u32, u32> = mode_map
+        .try_into()
+        .context("MODE has an unexpected map type or layout")?;
+    mode_map
+        .insert(0, options.mode, 0)
+        .context("failed to write the collector mode")?;
+
     sync_target_tids(target_tids, pending, known_tids, initial_tids)?;
 
     let event_map = bpf
@@ -335,7 +340,9 @@ where
     drain_messages(&receiver, handler);
 
     let summary = CollectionSummary {
-        elapsed: started.elapsed(),
+        // Cap at the requested duration: joining the readers and draining the
+        // channel must not inflate the reported measurement window.
+        elapsed: started.elapsed().min(options.duration),
         interrupted: interrupted.load(Ordering::Relaxed),
         process_exited,
     };
@@ -496,7 +503,8 @@ mod tests {
         let event_data = sample_event();
         let bytes = bytemuck::bytes_of(&event_data);
         let split = 13;
-        let event = decode_event::<SchedulerLatencyEvent>(&bytes[..split], &bytes[split..]).unwrap();
+        let event =
+            decode_event::<SchedulerLatencyEvent>(&bytes[..split], &bytes[split..]).unwrap();
         assert_eq!(event.run_cpu, 2);
         assert_eq!(event.latency_ns, 7);
     }

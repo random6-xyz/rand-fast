@@ -11,14 +11,13 @@ struct MemStats {
     swap_kb: Vec<u64>,
 }
 
-fn read_psi(path: &str) -> Result<f32> {
+fn read_psi(path: &str, which: &str) -> Result<f32> {
     let content = fs::read_to_string(path).with_context(|| format!("read {path}"))?;
     for line in content.lines() {
-        if line.starts_with("some") || line.starts_with("full") {
-            for part in line.split_whitespace() {
-                if part.starts_with("avg10=") {
-                    let v = part.strip_prefix("avg10=").unwrap_or("0").parse::<f32>().unwrap_or(0.0);
-                    return Ok(v);
+        if let Some(rest) = line.strip_prefix(which) {
+            for part in rest.split_whitespace() {
+                if let Some(v) = part.strip_prefix("avg10=") {
+                    return Ok(v.parse::<f32>().unwrap_or(0.0));
                 }
             }
         }
@@ -66,8 +65,8 @@ pub fn run(args: MemoryArgs) -> Result<()> {
     while started.elapsed() < args.duration {
         if stop.load(Ordering::Relaxed) { break; }
         if Instant::now() >= next_poll {
-            let some = read_psi("/proc/pressure/memory").unwrap_or(0.0);
-            let full = read_psi("/proc/pressure/cpu").unwrap_or(0.0);
+            let some = read_psi("/proc/pressure/memory", "some").unwrap_or(0.0);
+            let full = read_psi("/proc/pressure/memory", "full").unwrap_or(0.0);
             let faults = read_faults(pid).unwrap_or((0,0));
             let swap = read_meminfo_swap();
             stats.psi_some.push(some);
@@ -117,20 +116,21 @@ pub fn run(args: MemoryArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn psi_parse() {
-        let s = "some avg10=12.34 avg60=5.00 avg300=1.00 total=12345\nfull avg10=2.00 avg60=1.00 total=2345\n";
-        // simulate read_psi logic
-        let mut some = 0.0;
-        for line in s.lines() {
-            if line.starts_with("some") {
-                for part in line.split_whitespace() {
-                    if part.starts_with("avg10=") {
-                        some = part.strip_prefix("avg10=").unwrap().parse().unwrap();
-                    }
-                }
-            }
-        }
-        assert!((some - 12.34f32).abs() < 0.01);
+    fn psi_parse_reads_requested_line() {
+        let dir = std::env::temp_dir().join(format!("fast-psi-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pressure");
+        fs::write(
+            &path,
+            "some avg10=12.34 avg60=5.00 avg300=1.00 total=12345\nfull avg10=2.00 avg60=1.00 total=2345\n",
+        )
+        .unwrap();
+        let path = path.to_str().unwrap();
+        assert!((read_psi(path, "some").unwrap() - 12.34f32).abs() < 0.01);
+        assert!((read_psi(path, "full").unwrap() - 2.00f32).abs() < 0.01);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

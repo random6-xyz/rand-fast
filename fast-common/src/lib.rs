@@ -10,6 +10,13 @@ pub const SLOW_1MS_NS: u64 = 1_000_000;
 pub const SLOW_10MS_NS: u64 = 10_000_000;
 pub const SLOW_50MS_NS: u64 = 50_000_000;
 
+/// Collector mode bits written into the eBPF `MODE` map by the userspace
+/// command, so each tracepoint program only does the work its command
+/// consumes.
+pub const COLLECT_SCHEDULER_LATENCY: u32 = 1;
+pub const COLLECT_CPU_SAMPLE: u32 = 2;
+pub const COLLECT_OFFCPU: u32 = 4;
+
 /// Event type discriminator for the extensible ABI.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
