@@ -769,6 +769,46 @@ check_diagnose_parallel() {
     fi
 }
 
+# Proves the ranking comes from measurements rather than from the machine.
+#
+# The old implementation read /proc/loadavg and reported a CPU confidence for a
+# process that was blocked on a futex and using no CPU at all. The check is
+# that a futex-bound process is ranked on its futex time, with CPU nowhere in
+# sight, which is only possible if the ranking is computed from what was
+# measured about the process.
+check_diagnose_ranking() {
+    local report="$OUT_DIR/diagnose-load.txt"
+    if [ ! -f "$report" ]; then
+        echo "diagnose ranking: SKIP (no diagnose report from the matrix)"
+        return
+    fi
+
+    local top
+    top=$(awk '/^Ranked causes/ { getline; while ($0 ~ /^ *$/) getline; print $2; exit }' "$report")
+    if [ -z "$top" ]; then
+        echo "diagnose ranking: FAIL (no ranked causes in the report)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    # lock-hog spends its off-CPU time on a futex and nothing else, so that has
+    # to be the first named cause.
+    if [ "$top" != "Lock" ]; then
+        echo "diagnose ranking: FAIL (lock-hog ranked '$top' first, expected Lock contention)"
+        grep -A 6 '^Ranked causes' "$report" | sed 's/^/    /' >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    # Every ranked line has to carry its measurements, otherwise the number is
+    # an assertion rather than a conclusion.
+    if ! awk '/^Ranked causes/ { f = 1; next } f && /^[0-9]\./ { if ($0 !~ /us |%|s,/) { bad = 1 } }
+               END { exit bad ? 1 : 0 }' "$report"; then
+        echo "diagnose ranking: FAIL (a ranked cause has no measurements behind it)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    echo "diagnose ranking: top cause is $top, with measurements on every ranked line"
+}
+
 check_cpu_rate_scaling
 check_cpu_symbolization
 check_io_pairing
@@ -777,6 +817,7 @@ check_offcpu_ranking
 check_memory_fault_counter
 check_memory_verdict
 check_diagnose_parallel
+check_diagnose_ranking
 check_net_rtt_crosscheck
 check_net_field_crosscheck
 check_net_retransmit_attribution

@@ -10,6 +10,7 @@ mod offcpu;
 mod output;
 mod process;
 mod runtime;
+mod scoring;
 mod stats;
 mod symbolize;
 

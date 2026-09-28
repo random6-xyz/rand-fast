@@ -70,6 +70,29 @@ pub struct Evidence {
     pub lost: Vec<(&'static str, u64)>,
 }
 
+/// One cause and the share of the measured slowdown attributed to it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Diagnosis {
+    /// Stable cause name, used for sorting and for tests.
+    pub cause: &'static str,
+    /// Share of the slowdown attributed to this cause, 0 to 100.
+    pub confidence: f32,
+    /// Measurements behind the number, one entry per line in the report.
+    pub evidence: Vec<String>,
+}
+
+impl Diagnosis {
+    /// Renders one ranked line of the report.
+    pub fn render(&self, rank: usize) -> String {
+        format!(
+            "{rank}. {:<17}{:>5.1}%  {}",
+            self.cause,
+            self.confidence,
+            self.evidence.join("; ")
+        )
+    }
+}
+
 pub fn run(args: DiagnoseArgs) -> Result<()> {
     let pid = args.pid;
     let process_name =
@@ -316,17 +339,36 @@ fn print_report(name: &str, pid: u32, summary: &runtime::CollectionSummary, evid
     );
     println!("  memory psi: {}", describe_psi(evidence));
     println!("  swap used: {} KiB", evidence.swap_kb);
-    if evidence.lost.is_empty() {
-        println!("  lost events: none");
+    println!("  lost events: {}", describe_lost(evidence));
+
+    let ranked = crate::scoring::score(evidence);
+    println!();
+    println!("Ranked causes");
+    if ranked.is_empty() {
+        println!("  nothing was measured, so nothing can be concluded");
     } else {
-        let detail = evidence
-            .lost
-            .iter()
-            .map(|(name, count)| format!("{name} {count}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!("  lost events: {detail} (those signals are incomplete)");
+        for (index, diagnosis) in ranked.iter().enumerate() {
+            println!("  {}", diagnosis.render(index + 1));
+        }
     }
+    println!();
+    println!("Confidence is each cause's share of the measured slowdown, not a probability.");
+    println!("The signals are measured; the weighting between them is a judgement, and the");
+    println!("thresholds behind each verdict are documented in fast/src/scoring.rs.");
+}
+
+/// Renders the dropped-record line, naming the streams it came from.
+fn describe_lost(evidence: &Evidence) -> String {
+    if evidence.lost.is_empty() {
+        return "none".to_string();
+    }
+    let detail = evidence
+        .lost
+        .iter()
+        .map(|(name, count)| format!("{name} {count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{detail} (those signals are incomplete)")
 }
 
 /// Renders the PSI line, naming the absence rather than printing a zero.
