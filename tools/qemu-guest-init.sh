@@ -72,6 +72,19 @@ for event in block_rq_issue block_rq_complete; do
     fi
 done
 
+# Record the TCP tracepoint payload layouts the eBPF network programs rely
+# on. Both events carry the socket 5-tuple in the payload, so the programs
+# need no BTF and no struct offsets: tcp_probe also carries srtt, and
+# tcp_retransmit_skb carries the IPv4 and IPv6 addresses.
+for event in tcp_probe tcp_retransmit_skb; do
+    if [ -e /sys/kernel/tracing/events/tcp/$event/format ]; then
+        echo "=== $event format ==="
+        cat /sys/kernel/tracing/events/tcp/$event/format
+    else
+        echo "=== $event format MISSING ==="
+    fi
+done
+
 export FAST=/bin/fast
 export SCHED_WORKLOAD=/bin/sched-workload
 export FAST_WORKLOAD=/bin/fast-workload

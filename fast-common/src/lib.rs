@@ -16,6 +16,10 @@ pub const MAX_TARGET_TIDS: u32 = 4096;
 /// requests enter the map, so this is generous headroom over any realistic
 /// queue depth.
 pub const MAX_PENDING_IO: u32 = 8192;
+/// Upper bound for remembered TCP sockets. Entries are added only for sockets
+/// a target thread is seen using, so this is generous headroom over the
+/// number of connections a process keeps open.
+pub const MAX_TCP_SOCKETS: u32 = 8192;
 /// Stack trace map capacity. Sized for periodic on-CPU sampling where many
 /// distinct user/kernel stacks accumulate over a run; entries are allocated
 /// lazily (~1 KiB each at the default 127-frame depth).
@@ -32,6 +36,12 @@ pub const SLOW_50MS_NS: u64 = 50_000_000;
 pub const COLLECT_SCHEDULER_LATENCY: u32 = 1;
 pub const COLLECT_CPU_SAMPLE: u32 = 2;
 pub const COLLECT_OFFCPU: u32 = 4;
+pub const COLLECT_NET: u32 = 8;
+
+/// Address family of an IPv4 socket, as stored in [`TcpEvent::family`].
+pub const AF_INET: u16 = 2;
+/// Address family of an IPv6 socket, as stored in [`TcpEvent::family`].
+pub const AF_INET6: u16 = 10;
 
 /// Event type discriminator for the extensible ABI.
 #[repr(u32)]
@@ -136,18 +146,40 @@ pub struct IoEvent {
     pub op: u32,
 }
 
-/// TCP/network event for RTT and retransmission.
+/// A TCP sample or retransmission attributed to a socket.
+///
+/// Addresses are stored in network byte order. For [`AF_INET`] only the first
+/// four bytes of each address are meaningful and the rest are zero; for
+/// [`AF_INET6`] all sixteen are. Ports are stored in host byte order.
+///
+/// The kernel's `tcp_probe` tracepoint reports its smoothed RTT as
+/// `tp->srtt_us >> 3`, so [`Self::rtt_us`] carries the shifted-back value in
+/// microseconds. Retransmission events have no RTT and report zero.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct TcpEvent {
+    /// Thread the event was attributed to.
     pub tid: u32,
-    pub saddr: u32,
-    pub daddr: u32,
-    pub rtt_us: u32,
-    pub sport: u16,
-    pub dport: u16,
+    /// [`AF_INET`] or [`AF_INET6`].
+    pub family: u16,
+    /// 1 for a retransmission, 0 for an ordinary sample.
     pub retrans: u8,
-    pub _pad: [u8; 3],
+    /// Padding, always zero.
+    pub _pad: u8,
+    /// Source port, host byte order.
+    pub sport: u16,
+    /// Destination port, host byte order.
+    pub dport: u16,
+    /// Smoothed RTT in microseconds, zero for retransmissions.
+    pub rtt_us: u32,
+    /// Congestion window in segments, zero for retransmissions.
+    pub snd_cwnd: u32,
+    /// Receive window in bytes, zero for retransmissions.
+    pub rcv_wnd: u32,
+    /// Source address, network byte order.
+    pub saddr: [u8; 16],
+    /// Destination address, network byte order.
+    pub daddr: [u8; 16],
 }
 
 /// Off-CPU wait event with stack.
@@ -243,8 +275,41 @@ mod tests {
 
     #[test]
     fn tcp_event_layout_is_stable() {
-        assert_eq!(size_of::<TcpEvent>(), 24);
+        assert_eq!(size_of::<TcpEvent>(), 56);
         assert_eq!(align_of::<TcpEvent>(), 4);
+    }
+
+    #[test]
+    fn tcp_event_fits_the_decode_buffer() {
+        // runtime::MAX_EVENT_SIZE is 64, so a TcpEvent must stay under it.
+        assert!(size_of::<TcpEvent>() <= 64);
+    }
+
+    fn sample_tcp_event() -> TcpEvent {
+        TcpEvent {
+            tid: 42,
+            family: AF_INET,
+            retrans: 0,
+            _pad: 0,
+            sport: 1234,
+            dport: 80,
+            rtt_us: 1500,
+            snd_cwnd: 10,
+            rcv_wnd: 65535,
+            saddr: [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            daddr: [10, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        }
+    }
+
+    #[test]
+    fn tcp_event_round_trips_through_bytes() {
+        let event = sample_tcp_event();
+        let decoded: TcpEvent = bytemuck::pod_read_unaligned(bytemuck::bytes_of(&event));
+        assert_eq!(decoded.tid, 42);
+        assert_eq!(decoded.family, AF_INET);
+        assert_eq!(decoded.sport, 1234);
+        assert_eq!(decoded.rtt_us, 1500);
+        assert_eq!(decoded.daddr[0], 10);
     }
 
     #[test]

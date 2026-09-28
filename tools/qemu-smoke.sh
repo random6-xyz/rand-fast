@@ -219,9 +219,253 @@ check_io_pairing() {
     wait "$hog_pid" 2>/dev/null
 }
 
+# Proves the RTT measurement is real, in two independent ways.
+#
+# 1. Absolute cross-check against the kernel: `ss -ti` prints the same
+#    smoothed RTT the `tcp_probe` tracepoint carries, in milliseconds. If
+#    rand-fast and the kernel agree, the payload offsets and the srtt scaling
+#    are both right. This needs no special kernel configuration, so it is the
+#    primary check.
+# 2. Relative separation: the same workload is run again behind a shaped link
+#    and must show a clearly higher RTT.
+#
+# The comparison uses the median of the per-endpoint values, because the
+# net-hog fixture opens several connections and the aggregate is what
+# matters.
+NETEM_DELAY=${NETEM_DELAY:-25ms}
+HTB_RATE=${HTB_RATE:-1mbit}
+RTT_MIN_RATIO=${RTT_MIN_RATIO:-2}
+
+# rand-fast reports microseconds, ss reports milliseconds. The two must agree
+# within a factor of two: wide enough for the run-to-run drift of a smoothed
+# RTT, tight enough to catch a wrong scale factor or a misread offset.
+RTT_CROSSCHECK_TOLERANCE=${RTT_CROSSCHECK_TOLERANCE:-2}
+
+# Locates ss, which busybox does not provide at all.
+SS_BIN=""
+for candidate in /sbin/ss /bin/ss; do
+    [ -x "$candidate" ] && { SS_BIN=$candidate; break; }
+done
+
+# Median of the per-endpoint p50 values rand-fast reported, in microseconds.
+median_p50_us() {
+    awk '/RTT p50/ { for (i = 1; i <= NF; i++) if ($i == "p50") { print $(i+1); next } }' \
+        "$1" | sort -n | awk '{ v[NR] = $1 } END { if (NR == 0) { print 0 } else { print v[int((NR+1)/2)] } }'
+}
+
+# Median of the `rtt:` values `ss -ti` printed for loopback sockets, in
+# microseconds.
+#
+# `ss -ti` prints two lines per socket: a header with the addresses, then an
+# indented detail line carrying `rtt:<smoothed>/<last>`. The detail line is
+# what holds the number, so the header is remembered and checked to decide
+# whether the detail line belongs to a loopback socket. The first number of
+# `rtt:` is the same srtt the tracepoint carries.
+median_ss_rtt_us() {
+    awk '/127\.0\.0\.1/ { loopback = 1; next }
+         loopback && /rtt:/ {
+             for (i = 1; i <= NF; i++)
+                 if ($i ~ /^rtt:/ && $i != "rtt:") {
+                     split($i, part, "/")
+                     split(part[1], pair, ":")
+                     if (pair[2] + 0 > 0) print pair[2] * 1000
+                 }
+             loopback = 0
+         }' "$1" | sort -n \
+        | awk '{ v[NR] = $1 } END { if (NR == 0) { print 0 } else { print v[int((NR+1)/2)] } }'
+}
+
+# Collects RTT for a net-hog fixture. Arguments are the report path and the
+# path the ss snapshot is written to. Returns non-zero when the collection
+# fails; the fixture is always cleaned up.
+#
+# The ss snapshot is sampled repeatedly while the eBPF collection runs, not
+# once before it. rand-fast adds its own overhead to a saturated guest, so a
+# snapshot taken before collection starts would compare a lightly loaded
+# loopback against a heavily loaded one and report a large false mismatch.
+collect_net_rtt() {
+    report=$1
+    ss_out=$2
+    "$FAST_WORKLOAD" net-hog --duration 20s --workers 2 >/dev/null 2>&1 &
+    fixture_pid=$!
+    sleep 0.3
+    : >"$ss_out"
+    if [ -n "$SS_BIN" ]; then
+        # 0.25s of settle time, then 16 samples spaced 0.4s apart across the
+        # 8s collection window.
+        ( sleep 0.25
+          i=0
+          while [ "$i" -lt 16 ]; do
+              "$SS_BIN" -ti state established 2>/dev/null >>"$ss_out" || true
+              echo >>"$ss_out"
+              i=$((i + 1))
+              sleep 0.4
+          done ) &
+        ss_pid=$!
+    else
+        ss_pid=""
+    fi
+    if ! "$FAST" net --pid "$fixture_pid" --duration 8s >"$report" 2>&1; then
+        [ -n "$ss_pid" ] && kill "$ss_pid" 2>/dev/null
+        kill "$fixture_pid" 2>/dev/null
+        wait "$fixture_pid" 2>/dev/null
+        return 1
+    fi
+    [ -n "$ss_pid" ] && { kill "$ss_pid" 2>/dev/null; wait "$ss_pid" 2>/dev/null; }
+    kill "$fixture_pid" 2>/dev/null
+    wait "$fixture_pid" 2>/dev/null
+    return 0
+}
+
+# Cross-checks rand-fast's RTT against the kernel's own estimate.
+check_net_rtt_crosscheck() {
+    if [ -z "$SS_BIN" ]; then
+        echo "net RTT cross-check: SKIP (no ss binary in the guest)"
+        return
+    fi
+    if ! collect_net_rtt "$OUT_DIR/net-rtt-xcheck.txt" "$OUT_DIR/net-ss-xcheck.txt"; then
+        echo "net RTT cross-check: FAIL (collection failed)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    mine=$(median_p50_us "$OUT_DIR/net-rtt-xcheck.txt")
+    kernel=$(median_ss_rtt_us "$OUT_DIR/net-ss-xcheck.txt")
+    # The raw snapshots are summarised so a mismatch can be diagnosed from
+    # the log alone instead of re-running the guest.
+    echo "    fast: $(awk '/RTT p50/{n++} END{print n+0}' "$OUT_DIR/net-rtt-xcheck.txt") endpoints, p50 $(awk '/RTT p50/{for(i=1;i<=NF;i++) if($i=="p50"){print $(i+1); exit}}' "$OUT_DIR/net-rtt-xcheck.txt") us, cwnd $(awk '/RTT p50/{for(i=1;i<=NF;i++) if($i=="cwnd"){print $(i+1); exit}}' "$OUT_DIR/net-rtt-xcheck.txt")"
+    echo "    ss:   $(awk '/rtt:/{n++} END{print n+0}' "$OUT_DIR/net-ss-xcheck.txt") samples, first $(awk '/rtt:/{for(i=1;i<=NF;i++) if($i ~ /^rtt:/ && $i != "rtt:"){print $i; exit}}' "$OUT_DIR/net-ss-xcheck.txt"), cwnd $(awk '/cwnd:/{for(i=1;i<=NF;i++) if($i ~ /^cwnd:/){split($i,p,":"); print p[2]; exit}}' "$OUT_DIR/net-ss-xcheck.txt")"
+
+    if [ "${mine:-0}" -le 0 ] || [ "${kernel:-0}" -le 0 ]; then
+        echo "net RTT cross-check: FAIL (no samples; fast=$mine us kernel=$kernel us)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if ! awk -v a="$mine" -v b="$kernel" -v tol="$RTT_CROSSCHECK_TOLERANCE" \
+            'BEGIN { lo = (a < b ? a : b); hi = (a > b ? a : b)
+                     ratio = (lo + 0) == 0 ? 0 : hi / lo
+                     printf "net RTT cross-check: fast %d us vs kernel ss %d us (%.2fx, tolerance %gx)\n", a, b, ratio, tol
+                     exit (ratio <= tol) ? 0 : 1 }'; then
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
+# Confirms the payload offsets are right by checking a second field. `ss -ti`
+# prints the congestion window the same way it prints the RTT, so agreement
+# on both values means the reads land on the intended fields rather than
+# merely on plausible-looking numbers.
+check_net_field_crosscheck() {
+    if [ -z "$SS_BIN" ]; then
+        echo "net field cross-check: SKIP (no ss binary in the guest)"
+        return
+    fi
+    local report="$OUT_DIR/net-rtt-xcheck.txt"
+    local ss_out="$OUT_DIR/net-ss-xcheck.txt"
+    [ -f "$report" ] && [ -f "$ss_out" ] || {
+        echo "net field cross-check: SKIP (no snapshots from the RTT cross-check)"
+        return
+    }
+
+    local mine kernel
+    mine=$(awk '/RTT p50/{for(i=1;i<=NF;i++) if($i=="cwnd"){print $(i+1); exit}}' "$report")
+    kernel=$(awk '/cwnd:/{for(i=1;i<=NF;i++) if($i ~ /^cwnd:/){split($i,p,":"); print p[2]; exit}}' "$ss_out")
+    if [ "${mine:-0}" -le 0 ] || [ "${kernel:-0}" -le 0 ]; then
+        echo "net field cross-check: FAIL (no cwnd samples; fast=$mine kernel=$kernel)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if ! awk -v a="$mine" -v b="$kernel" \
+            'BEGIN { printf "net field cross-check: fast snd_cwnd %d vs kernel ss cwnd %d\n", a, b
+                     exit (a == b) ? 0 : 1 }'; then
+        echo "    the payload offsets do not line up with the kernel layout"
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
+# Installs a link shaper on lo, echoing a description of what it applied.
+apply_link_shaper() {
+    local tc_bin="$1"
+    if "$tc_bin" qdisc add dev lo root netem delay "$NETEM_DELAY" 2>>"$OUT_DIR/shaper.err"; then
+        SHAPER_KIND=netem
+        SHAPER_DESC="$NETEM_DELAY netem delay"
+        return 0
+    fi
+    if "$tc_bin" qdisc add dev lo root htb default 1 2>>"$OUT_DIR/shaper.err" \
+        && "$tc_bin" class add dev lo parent 1: classid 1:1 htb rate "$HTB_RATE" 2>>"$OUT_DIR/shaper.err"; then
+        SHAPER_KIND=htb
+        SHAPER_DESC="$HTB_RATE HTB rate limit"
+        return 0
+    fi
+    return 1
+}
+
+check_net_rtt_separation() {
+    local tc_bin=""
+    for candidate in /sbin/tc /bin/tc; do
+        [ -x "$candidate" ] && { tc_bin=$candidate; break; }
+    done
+    if [ -z "$tc_bin" ]; then
+        echo "net RTT separation: SKIP (no tc binary in the guest)"
+        return
+    fi
+
+    # The unthrottled baseline was collected before any shaper existed.
+    local base
+    base=$(median_p50_us "$OUT_DIR/net-rtt-base.txt")
+    if [ "${base:-0}" -le 0 ]; then
+        echo "net RTT separation: FAIL (no RTT samples in the baseline)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    # Now the same workload behind a shaped link.
+    : >"$OUT_DIR/shaper.err"
+    if ! apply_link_shaper "$tc_bin"; then
+        echo "net RTT separation: SKIP (no usable qdisc on this kernel)"
+        sed 's/^/    /' "$OUT_DIR/shaper.err"
+        return
+    fi
+
+    "$FAST_WORKLOAD" net-hog --duration 20s --workers 2 >/dev/null 2>&1 &
+    local shaped_pid=$!
+    sleep 0.3
+    if ! "$FAST" net --pid "$shaped_pid" --duration 8s >"$OUT_DIR/net-rtt-shaped.txt" 2>&1; then
+        echo "net RTT separation: FAIL (shaped collection failed)"
+        FAILURES=$((FAILURES + 1))
+    fi
+    kill "$shaped_pid" 2>/dev/null
+    wait "$shaped_pid" 2>/dev/null
+    "$tc_bin" qdisc del dev lo root 2>/dev/null
+
+    local shaped ratio_ok=1
+    shaped=$(median_p50_us "$OUT_DIR/net-rtt-shaped.txt")
+    if [ "${shaped:-0}" -le 0 ]; then
+        echo "net RTT separation: FAIL (no RTT samples; baseline=$base shaped=$shaped)"
+        ratio_ok=0
+    elif ! awk -v b="$base" -v d="$shaped" -v need="$RTT_MIN_RATIO" -v desc="$SHAPER_DESC" \
+            'BEGIN { r = (b + 0) == 0 ? 0 : d / b
+                     printf "net RTT separation: median endpoint p50 %d us baseline vs %d us with %s (%.1fx)\n", b, d, desc, r
+                     exit (r >= need) ? 0 : 1 }'; then
+        ratio_ok=0
+    fi
+    [ "$ratio_ok" -eq 1 ] || FAILURES=$((FAILURES + 1))
+}
+
+# The unthrottled baseline both net checks compare against, taken before any
+# qdisc is installed.
+if collect_net_rtt "$OUT_DIR/net-rtt-base.txt" "$OUT_DIR/net-ss-base.txt"; then
+    :
+else
+    echo "net RTT baseline: FAIL (collection failed)"
+    FAILURES=$((FAILURES + 1))
+fi
+
 check_cpu_rate_scaling
 check_cpu_symbolization
 check_io_pairing
+check_net_rtt_crosscheck
+check_net_field_crosscheck
+check_net_rtt_separation
 
 echo "=== key metrics ==="
 print_metrics() {
@@ -238,7 +482,7 @@ print_metrics() {
 print_metrics sched 'p95|> 1ms'
 print_metrics cpu 'Samples:|CPU usage:'
 print_metrics io 'Samples:|rchar:'
-print_metrics net 'Retransmissions:'
+print_metrics net 'Retransmissions:|RTT p50'
 print_metrics off-cpu 'Samples:'
 echo
 echo "Raw reports saved under $OUT_DIR"

@@ -115,6 +115,37 @@ awk '/=> \//{print $3}' "$OUT_DIR/ldd.txt" | while read -r lib; do
 done
 log "staged loader $(basename "$LOADER") and $(awk '/=> \//{print $3}' "$OUT_DIR/ldd.txt" | wc -l) libraries"
 
+# The network checks need two extra host tools in the guest:
+#   tc  to build a delayed or rate-limited link, so the RTT distribution can
+#       be shown to move. busybox ships a `tc` applet but it only understands
+#       fifo/tbf/prio/red, so the real iproute2 binary is staged.
+#   ss  to read the kernel's own `rtt` estimate with `ss -ti`, which
+#       cross-checks the value rand-fast reports. busybox has no `ss` at all.
+# Both are staged with their shared libraries and a symlink in /bin so the
+# guest init finds them regardless of PATH. A missing tool is not fatal: the
+# matrix reports the skip and the affected check is skipped.
+stage_iproute2_tool() {
+    tool="$1"
+    bin=$(command -v "$tool" 2>/dev/null) || return 1
+    [ -x "$bin" ] || return 1
+    mkdir -p "$STAGE/sbin" "$STAGE/lib"
+    cp "$bin" "$STAGE/sbin/$tool"
+    ln -sf "/sbin/$tool" "$STAGE/bin/$tool"
+    ldd "$bin" > "$OUT_DIR/ldd-$tool.txt" 2>/dev/null || true
+    awk '/=> \//{print $3} /^\//{print $1}' "$OUT_DIR/ldd-$tool.txt" 2>/dev/null \
+        | while read -r lib; do
+            [ -f "$lib" ] || continue
+            cp "$lib" "$STAGE/lib/" 2>/dev/null || true
+        done
+    log "staged $tool with $(awk '/=> \//{print $3}' "$OUT_DIR/ldd-$tool.txt" 2>/dev/null | wc -l) libraries"
+    return 0
+}
+
+for tool in tc ss; do
+    stage_iproute2_tool "$tool" \
+        || log "WARNING: $tool not found on the host; related net checks will be skipped"
+done
+
 cp "$ROOT/tools/qemu-smoke.sh" "$STAGE/tools/qemu-smoke.sh"
 cp "$ROOT/tools/qemu-guest-init.sh" "$STAGE/init"
 
