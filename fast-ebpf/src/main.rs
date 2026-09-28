@@ -17,8 +17,8 @@ use aya_ebpf::{
 use fast_common::{
     AF_INET, AF_INET6, COLLECT_CPU_SAMPLE, COLLECT_NET, COLLECT_OFFCPU, COLLECT_SCHEDULER_LATENCY,
     CpuSampleEvent, IoEvent, IoRequestKey, MAX_PENDING_IO, MAX_STACKS, MAX_TARGET_TIDS,
-    MAX_TCP_SOCKETS, MemoryEvent, OffCpuEvent, PendingIo, PendingWakeup, SchedulerLatencyEvent,
-    TcpEvent,
+    MAX_TCP_SOCKETS, MemoryEvent, OFFCPU_REASON_IO, OFFCPU_REASON_UNKNOWN, OFFCPU_REASON_WAIT,
+    OffCpuEvent, OffCpuPending, PendingIo, PendingWakeup, SchedulerLatencyEvent, TcpEvent,
 };
 
 // The offsets are the stable payload offsets of the Linux scheduler tracepoints:
@@ -138,8 +138,14 @@ static TCP_SOCKETS: LruHashMap<u64, u32> = LruHashMap::with_max_entries(MAX_TCP_
 #[map]
 static OFFCPU_EVENTS: PerfEventArray<OffCpuEvent> = PerfEventArray::new(0);
 
+/// Pending off-CPU waits, keyed by TID.
+///
+/// The value carries the blocking stack and the wait reason alongside the
+/// timestamp, because all three have to be read at switch-out: by the time
+/// the thread is woken, the frame that blocked it is gone.
 #[map]
-static OFFCPU_START: LruHashMap<u32, u64> = LruHashMap::with_max_entries(MAX_TARGET_TIDS, 0);
+static OFFCPU_START: LruHashMap<u32, OffCpuPending> =
+    LruHashMap::with_max_entries(MAX_TARGET_TIDS, 0);
 
 #[map]
 static MEMORY_EVENTS: PerfEventArray<MemoryEvent> = PerfEventArray::new(0);
@@ -173,28 +179,21 @@ fn try_sched_wakeup(ctx: TracePointContext) -> Result<u32, u32> {
     }
 
     // Off-CPU: the task was switched out in a sleepable state and just became
-    // runnable again, so the pending switch-out timestamp measures its wait.
+    // runnable again, so the pending switch-out record measures its wait.
     if mode & COLLECT_OFFCPU != 0
-        && let Some(start) = unsafe { OFFCPU_START.get(tid) }
+        && let Some(pending) = unsafe { OFFCPU_START.get(tid) }
     {
-        // Copy the timestamp before removing the entry; the LRU entry memory
-        // is freed by remove and must not be read afterwards.
-        let start_ns = *start;
-        let now = unsafe { bpf_ktime_get_ns() };
+        // Copy the record before removing the entry; the LRU entry memory is
+        // freed by remove and must not be read afterwards.
+        let pending = *pending;
         let _ = OFFCPU_START.remove(tid);
-        if now >= start_ns {
-            let stack = unsafe {
-                bpf_get_stackid(
-                    ctx.as_ptr(),
-                    &STACK_TRACES as *const _ as *mut core::ffi::c_void,
-                    0,
-                )
-            };
+        let now = unsafe { bpf_ktime_get_ns() };
+        if now >= pending.start_ns {
             let event = OffCpuEvent {
-                wait_ns: now - start_ns,
-                stack_id: stack as i64,
+                wait_ns: now - pending.start_ns,
+                stack_id: pending.stack_id,
                 tid,
-                reason: 0,
+                reason: pending.reason,
                 _pad: 0,
                 _pad2: 0,
             };
@@ -203,6 +202,30 @@ fn try_sched_wakeup(ctx: TracePointContext) -> Result<u32, u32> {
     }
 
     Ok(0)
+}
+
+/// Classifies a wait from the task state the scheduler recorded.
+///
+/// `sched_switch` reports `prev_state` as a bitmask, and the two bits that
+/// matter are TASK_INTERRUPTIBLE (1) and TASK_UNINTERRUPTIBLE (2). Sleeping
+/// in an interruptible wait is what futexes, condition variables and timed
+/// sleeps use; an uninterruptible wait is what disk and network I/O use for
+/// the duration of a request.
+///
+/// This is deliberately coarse. It separates "waiting on a lock or a timer"
+/// from "waiting on a device", which is the split a user acts on, and the
+/// finer classification comes from symbolizing the captured stack. A state
+/// with neither bit set is reported as unknown rather than guessed at.
+fn offcpu_reason_from_state(prev_state: u64) -> u32 {
+    const TASK_INTERRUPTIBLE: u64 = 1;
+    const TASK_UNINTERRUPTIBLE: u64 = 2;
+    if prev_state & TASK_UNINTERRUPTIBLE != 0 {
+        OFFCPU_REASON_IO
+    } else if prev_state & TASK_INTERRUPTIBLE != 0 {
+        OFFCPU_REASON_WAIT
+    } else {
+        OFFCPU_REASON_UNKNOWN
+    }
 }
 
 #[tracepoint(name = "sched_switch", category = "sched")]
@@ -217,14 +240,37 @@ fn try_sched_switch(ctx: TracePointContext) -> Result<u32, u32> {
     let tid = unsafe { ctx.read_at::<u32>(SCHED_SWITCH_NEXT_PID_OFFSET) }.map_err(|_| 0u32)?;
     let mode = unsafe { MODE.get(0) }.copied().unwrap_or(0);
 
-    // Off-CPU: a target task switched out in a sleepable state starts waiting.
+    // Off-CPU: a target task that switched out in a non-runnable state starts
+    // waiting. The stack and the reason are captured here rather than at
+    // wakeup, because the frame that blocked the thread is only on the stack
+    // at this point.
+    //
+    // prev_state is 0 when the task was merely preempted, which is not a wait
+    // and must not be recorded: preemption is what the scheduler collector
+    // measures.
     if mode & COLLECT_OFFCPU != 0
         && let Ok(prev_pid) = unsafe { ctx.read_at::<u32>(SCHED_SWITCH_PREV_PID_OFFSET) }
         && unsafe { TARGET_TIDS.get(prev_pid) }.is_some()
         && let Ok(prev_state) = unsafe { ctx.read_at::<u64>(SCHED_SWITCH_PREV_STATE_OFFSET) }
         && prev_state != 0
     {
-        let _ = OFFCPU_START.insert(prev_pid, unsafe { bpf_ktime_get_ns() }, BPF_ANY as u64);
+        let stack = unsafe {
+            bpf_get_stackid(
+                ctx.as_ptr(),
+                &STACK_TRACES as *const _ as *mut core::ffi::c_void,
+                // BPF_F_REUSE_STACKID lets a recurring blocking path share one
+                // entry. Without it every distinct stack takes a slot, and a
+                // thread that blocks in a tight loop evicts everything else.
+                BPF_F_REUSE_STACKID as u64,
+            )
+        };
+        let pending = OffCpuPending {
+            start_ns: unsafe { bpf_ktime_get_ns() },
+            stack_id: stack as i64,
+            reason: offcpu_reason_from_state(prev_state),
+            _pad: 0,
+        };
+        let _ = OFFCPU_START.insert(prev_pid, pending, BPF_ANY as u64);
     }
 
     if unsafe { TARGET_TIDS.get(tid) }.is_none() {

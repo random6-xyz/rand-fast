@@ -5,7 +5,7 @@ use aya::{
     Ebpf, include_bytes_aligned,
     maps::{HashMap as AyaHashMap, MapData},
 };
-use fast_common::{COLLECT_OFFCPU, OffCpuEvent};
+use fast_common::{COLLECT_OFFCPU, OffCpuEvent, OffCpuPending};
 
 use crate::{cli::OffCpuArgs, process, runtime};
 
@@ -103,13 +103,12 @@ pub fn run(args: OffCpuArgs) -> Result<()> {
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_wakeup")?;
 
     let mut target_tids = runtime::take_target_map(&mut bpf)?;
-    // Pending switch-out timestamps live in OFFCPU_START; clearing it when a
-    // target thread exits prevents stale entries from pairing with reused
-    // TIDs.
+    // Pending waits live in OFFCPU_START; clearing it when a target thread
+    // exits prevents stale entries from pairing with reused TIDs.
     let pending_map = bpf
         .take_map("OFFCPU_START")
         .context("eBPF map OFFCPU_START is missing")?;
-    let mut offcpu_start: AyaHashMap<MapData, u32, u64> = pending_map
+    let mut offcpu_start: AyaHashMap<MapData, u32, OffCpuPending> = pending_map
         .try_into()
         .context("OFFCPU_START has an unexpected map type or layout")?;
     let mut known = BTreeSet::new();

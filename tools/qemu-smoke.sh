@@ -550,9 +550,60 @@ else
     FAILURES=$((FAILURES + 1))
 fi
 
+# Proves off-CPU waits are attributed to the right process shape.
+#
+# A CPU-bound process never blocks, so it should report almost no waits. A
+# futex-contending one blocks constantly and should report many. If the
+# switch-out pairing were wrong these would come out the same way, or the
+# busy process would show waits it never took.
+#
+# The hog is the CPU-bound case: it busy-spins, so every switch-out of it is
+# a preemption (prev_state 0), which is deliberately not counted as a wait.
+check_offcpu_shape() {
+    "$SCHED_WORKLOAD" hog --duration 20s --workers 1 >/dev/null 2>&1 &
+    local hog_pid=$!
+    sleep 0.3
+    if ! "$FAST" off-cpu --pid "$hog_pid" --duration 6s >"$OUT_DIR/off-cpu-busy.txt" 2>&1; then
+        echo "off-CPU shape: FAIL (collection against the CPU-bound hog failed)"
+        FAILURES=$((FAILURES + 1))
+        kill "$hog_pid" 2>/dev/null
+        wait "$hog_pid" 2>/dev/null
+        return
+    fi
+    kill "$hog_pid" 2>/dev/null
+    wait "$hog_pid" 2>/dev/null
+
+    "$FAST_WORKLOAD" lock-hog --duration 20s --workers 16 >/dev/null 2>&1 &
+    local lock_pid=$!
+    sleep 0.3
+    if ! "$FAST" off-cpu --pid "$lock_pid" --duration 6s >"$OUT_DIR/off-cpu-locked.txt" 2>&1; then
+        echo "off-CPU shape: FAIL (collection against lock-hog failed)"
+        FAILURES=$((FAILURES + 1))
+        kill "$lock_pid" 2>/dev/null
+        wait "$lock_pid" 2>/dev/null
+        return
+    fi
+    kill "$lock_pid" 2>/dev/null
+    wait "$lock_pid" 2>/dev/null
+
+    local busy locked
+    busy=$(awk '/^Samples:/ {print $2; exit}' "$OUT_DIR/off-cpu-busy.txt")
+    locked=$(awk '/^Samples:/ {print $2; exit}' "$OUT_DIR/off-cpu-locked.txt")
+    if [ "${busy:-0}" -gt 500 ]; then
+        echo "off-CPU shape: FAIL (CPU-bound hog reported $busy waits; a busy-spinning thread should not block)"
+        FAILURES=$((FAILURES + 1))
+    elif [ "${locked:-0}" -lt 1000 ]; then
+        echo "off-CPU shape: FAIL (lock-hog reported only $locked waits; futex contention should block constantly)"
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "off-CPU shape: $busy waits for the CPU-bound hog against $locked for lock-hog"
+    fi
+}
+
 check_cpu_rate_scaling
 check_cpu_symbolization
 check_io_pairing
+check_offcpu_shape
 check_net_rtt_crosscheck
 check_net_field_crosscheck
 check_net_retransmit_attribution

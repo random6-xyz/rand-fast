@@ -9,6 +9,7 @@ use bytemuck::{Pod, Zeroable};
 mod aya_pod {
     unsafe impl aya::Pod for crate::PendingIo {}
     unsafe impl aya::Pod for crate::IoRequestKey {}
+    unsafe impl aya::Pod for crate::OffCpuPending {}
 }
 
 pub const MAX_TARGET_TIDS: u32 = 4096;
@@ -182,6 +183,35 @@ pub struct TcpEvent {
     pub daddr: [u8; 16],
 }
 
+/// The wait reason could not be classified from the task state alone.
+pub const OFFCPU_REASON_UNKNOWN: u32 = 0;
+/// The task was sleeping in an interruptible wait. Futexes, condition
+/// variables and timed sleeps all land here, because the kernel blocks them
+/// the same way.
+pub const OFFCPU_REASON_WAIT: u32 = 1;
+/// The task was in an uninterruptible wait, which is what disk and network
+/// I/O use for the duration of a request.
+pub const OFFCPU_REASON_IO: u32 = 2;
+
+/// A target thread that has switched out and not yet been woken.
+///
+/// The blocking stack is captured here, at switch-out, rather than at
+/// wakeup: by the time the task is woken the frame that blocked it is gone,
+/// and the captured stack would describe whatever woke the task instead.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct OffCpuPending {
+    /// When the thread stopped running, from `bpf_ktime_get_ns`.
+    pub start_ns: u64,
+    /// Stack id of the blocking context, or a negative value when the capture
+    /// failed.
+    pub stack_id: i64,
+    /// One of the `OFFCPU_REASON_*` constants, derived from the task state.
+    pub reason: u32,
+    /// Padding, always zero.
+    pub _pad: u32,
+}
+
 /// Off-CPU wait event with stack.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -316,6 +346,26 @@ mod tests {
     fn offcpu_event_layout_is_stable() {
         assert_eq!(size_of::<OffCpuEvent>(), 32);
         assert_eq!(align_of::<OffCpuEvent>(), 8);
+    }
+
+    #[test]
+    fn offcpu_pending_layout_is_stable() {
+        assert_eq!(size_of::<OffCpuPending>(), 24);
+        assert_eq!(align_of::<OffCpuPending>(), 8);
+    }
+
+    #[test]
+    fn offcpu_pending_round_trips_through_bytes() {
+        let pending = OffCpuPending {
+            start_ns: 1_000,
+            stack_id: -3,
+            reason: OFFCPU_REASON_IO,
+            _pad: 0,
+        };
+        let decoded: OffCpuPending = bytemuck::pod_read_unaligned(bytemuck::bytes_of(&pending));
+        assert_eq!(decoded.start_ns, 1_000);
+        assert_eq!(decoded.stack_id, -3);
+        assert_eq!(decoded.reason, OFFCPU_REASON_IO);
     }
 
     #[test]
