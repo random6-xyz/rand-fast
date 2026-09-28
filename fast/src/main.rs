@@ -11,6 +11,7 @@ mod output;
 mod process;
 mod runtime;
 mod stats;
+mod symbolize;
 
 use std::process::ExitCode;
 

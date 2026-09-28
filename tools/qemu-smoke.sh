@@ -600,10 +600,58 @@ check_offcpu_shape() {
     fi
 }
 
+# Proves the off-CPU report answers the question it exists for: which wait is
+# costing this process the most time, and where is it waiting.
+#
+# lock-hog blocks on a futex in a tight loop, so the report must rank the futex
+# bucket first and the leading stack must resolve to the futex path. A report
+# that only counted waits, or that ranked by sample count instead of total
+# time, would fail this.
+check_offcpu_ranking() {
+    local report="$OUT_DIR/off-cpu-load.txt"
+    if [ ! -f "$report" ]; then
+        echo "off-CPU ranking: SKIP (no off-CPU report from the matrix)"
+        return
+    fi
+
+    local top_reason
+    top_reason=$(awk '/Wait reasons/ { getline; print $1; exit }' "$report")
+    if [ "$top_reason" != "futex" ]; then
+        echo "off-CPU ranking: FAIL (top wait reason is '$top_reason', expected futex)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    # The leading stack is the first "stack <id>" line under the stack section.
+    local stack_line
+    stack_line=$(awk '/Top wait stacks/ { f = 1 } f && /^  stack / { print; exit }' "$report")
+    if [ -z "$stack_line" ]; then
+        echo "off-CPU ranking: FAIL (no wait stacks listed)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    # The frames of that stack follow, indented. A symbolized futex frame is
+    # what makes the report actionable.
+    if ! awk '/Top wait stacks/ { f = 1; next }
+               f && /^  stack / { s = 1; next }
+               s && /^  stack / { exit }
+               s && /futex/ { found = 1 }
+               END { exit found ? 0 : 1 }' "$report"; then
+        echo "off-CPU ranking: FAIL (the top wait stack has no symbolized futex frame)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    local total
+    total=$(awk '/^Total off-CPU:/ { print $3; exit }' "$report")
+    echo "off-CPU ranking: futex is the top reason, $total total off-CPU, leading stack $stack_line"
+}
+
 check_cpu_rate_scaling
 check_cpu_symbolization
 check_io_pairing
 check_offcpu_shape
+check_offcpu_ranking
 check_net_rtt_crosscheck
 check_net_field_crosscheck
 check_net_retransmit_attribution
