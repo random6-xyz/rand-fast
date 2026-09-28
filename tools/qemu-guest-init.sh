@@ -142,6 +142,13 @@ for f in /tmp/fast-smoke/*.txt; do
     echo "----- $f -----"
     cat "$f"
 done
+# The diagnose scenario documents are single-line JSON, so they are dumped
+# wrapped rather than raw, to keep the console log readable.
+for f in /tmp/fast-smoke/scenario-*.json; do
+    [ -f "$f" ] || continue
+    echo "----- $f -----"
+    tr ',' '\n' <"$f"
+done
 sync
 poweroff -f
 # Fallback if poweroff is not honored

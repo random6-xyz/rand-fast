@@ -11,7 +11,9 @@ use crate::{
     cli::DiagnoseArgs,
     cpu, io,
     json::{self, Envelope, Format},
-    memory, network, offcpu, process, runtime, stats,
+    memory, network,
+    offcpu::{self, WaitReason},
+    process, runtime, stats,
 };
 
 /// Perf pages per CPU, per stream.
@@ -21,6 +23,14 @@ use crate::{
 /// streams dominate the totals regardless, and I/O and TCP are comparatively
 /// sparse even under load.
 const PERF_PAGE_COUNT: usize = 16;
+
+/// On-CPU sampling frequency, in Hz.
+///
+/// The default matches `fast cpu`, so a p95 or a usage figure means the same
+/// thing in both reports. Diagnose does not expose it as a flag: it is
+/// watching six things at once, and a knob nobody should reach for is a knob
+/// that makes two reports disagree.
+const CPU_SAMPLE_HZ: u64 = 99;
 
 /// Everything the collectors measured during one run.
 ///
@@ -56,6 +66,12 @@ pub struct Evidence {
     pub offcpu_total_us: u64,
     /// Share of off-CPU time spent waiting on a futex, from 0.0 to 1.0.
     pub offcpu_futex_ratio: f64,
+    /// Share of off-CPU time spent waiting on disk, from 0.0 to 1.0.
+    pub offcpu_io_ratio: f64,
+    /// Share of off-CPU time spent waiting on a socket, from 0.0 to 1.0.
+    pub offcpu_network_ratio: f64,
+    /// Share of off-CPU time spent waiting on a page, from 0.0 to 1.0.
+    pub offcpu_memory_ratio: f64,
     /// Minor faults per second, from process accounting.
     pub minor_faults_per_s: f64,
     /// Major faults per second, from process accounting.
@@ -131,9 +147,13 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
     runtime::attach_tracepoint(&mut bpf, "exceptions", "page_fault_user")?;
     runtime::attach_tracepoint(&mut bpf, "vmscan", "mm_vmscan_direct_reclaim_begin")?;
 
+    // The on-CPU sampler is a perf event program rather than a tracepoint, so
+    // it is attached separately. Without it the CPU signal collects nothing
+    // and the ranking silently omits the one bottleneck a busy process has.
+    let (cpu_links, mut cpu_stats) = cpu::attach_cpu_sampler(&mut bpf, pid, CPU_SAMPLE_HZ)?;
+
     let mut target_tids = runtime::take_target_map(&mut bpf)?;
     let mut sched_stats = stats::Statistics::default();
-    let mut cpu_stats = cpu::CpuStats::default();
     // The same default threshold `fast io` uses, so a p99 here means what it
     // means there.
     let mut io_stats = io::IoStats::new(io::DEFAULT_SLOW_THRESHOLD_NS);
@@ -177,6 +197,11 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
             ),
         ],
     )?;
+
+    cpu::detach_sampler(&mut bpf, cpu_links);
+    // Usage is a difference between two readings, so the end-of-window
+    // counters have to be read or every run reports zero.
+    cpu_stats.finalize(pid);
 
     // Memory is counted in a map rather than streamed, so it is read after the
     // event loop instead of through it. The kernel counters give the fault and
@@ -292,7 +317,10 @@ fn collect_evidence(
         offcpu_samples: offcpu.sample_count(),
         offcpu_p95_us: offcpu_p95 / 1_000,
         offcpu_total_us: offcpu.total_ns() / 1_000,
-        offcpu_futex_ratio: futex_share(offcpu),
+        offcpu_futex_ratio: reason_share(offcpu, WaitReason::Futex),
+        offcpu_io_ratio: reason_share(offcpu, WaitReason::Io),
+        offcpu_network_ratio: reason_share(offcpu, WaitReason::Network),
+        offcpu_memory_ratio: reason_share(offcpu, WaitReason::Memory),
         minor_faults_per_s: faults.minor as f64 / seconds,
         major_faults_per_s: faults.major as f64 / seconds,
         reclaims_per_s: kernel_memory.reclaims as f64 / seconds,
@@ -304,19 +332,19 @@ fn collect_evidence(
     }
 }
 
-/// Share of off-CPU time spent waiting on a futex, from 0.0 to 1.0.
-fn futex_share(offcpu: &offcpu::OffCpuStats) -> f64 {
+/// Share of off-CPU time spent in one wait reason, from 0.0 to 1.0.
+fn reason_share(offcpu: &offcpu::OffCpuStats, want: offcpu::WaitReason) -> f64 {
     let total = offcpu.total_ns();
     if total == 0 {
         return 0.0;
     }
-    let futex: u64 = offcpu
+    let matched: u64 = offcpu
         .reasons_by_total_time()
         .into_iter()
-        .filter(|(reason, _)| *reason == offcpu::WaitReason::Futex)
+        .filter(|(reason, _)| *reason == want)
         .map(|(_, totals)| totals.total_ns)
         .sum();
-    futex as f64 / total as f64
+    matched as f64 / total as f64
 }
 
 fn print_report(name: &str, pid: u32, summary: &runtime::CollectionSummary, evidence: &Evidence) {
@@ -431,9 +459,18 @@ mod tests {
     }
 
     #[test]
-    fn futex_share_is_zero_without_offcpu_time() {
+    fn every_reason_share_is_zero_without_offcpu_time() {
+        // No waits means no share, whatever the reason.
         let offcpu = offcpu::OffCpuStats::default();
-        assert_eq!(futex_share(&offcpu), 0.0);
+        for reason in [
+            WaitReason::Futex,
+            WaitReason::Io,
+            WaitReason::Network,
+            WaitReason::Memory,
+            WaitReason::Sleep,
+        ] {
+            assert_eq!(reason_share(&offcpu, reason), 0.0);
+        }
     }
 
     #[test]

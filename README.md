@@ -449,6 +449,58 @@ v1.0 accuracy checks from the same run (`tools/qemu-smoke.sh` prints them):
 All five eBPF-backed programs load and attach in the guest, and the load
 runs show the expected signal deltas.
 
+## Diagnosis ranking
+
+`fast diagnose` ranks causes from what it measured, not from the machine. The
+table below is the acceptance record: five processes, each with exactly one
+thing wrong, each expected to be ranked on that thing. Every row is produced
+by running `fast diagnose --format json` against a real workload and reading
+the first entry of the causes array, so what is checked is the number a
+consumer would act on.
+
+Reproduce with:
+
+```bash
+tools/qemu-run.sh          # runs the whole matrix, scenarios included
+```
+
+| Scenario | Fixture | Ranked first | Evidence it rests on |
+| -------- | ------- | ------------ | --------------------- |
+| CPU | `sched-workload hog --workers 1` | CPU contention | 99% of one CPU, so ~100% of wall time on CPU |
+| Disk I/O | `fast-workload io-hog --workers 2 --size-mib 256` | Disk I/O | p99 past the slow threshold, plus the share of off-CPU time waiting on the device |
+| Lock | `fast-workload lock-hog --workers 16` | Lock contention | share of off-CPU time on a futex, above the 33% threshold |
+| Memory | `fast-workload mem-hog --workers 1 --size-mib 1024` | Memory pressure | direct reclaim attempts per second, through the memory report's own verdict |
+| Network | `fast-workload net-hog --workers 2 --delay-ms 600` | Network | retransmission ratio, plus the share of off-CPU time blocked on a socket |
+
+Recorded 2026-09-28 on the kernel-server bpf-next image (7.2.0-rc6, 8 vCPUs,
+BTF present, no CONFIG_PSI): all five ranked as expected, twice in a row, with
+the matrix exiting rc=0.
+
+Three of the five fixtures differ from the ones the roadmap first suggested,
+because the originals cannot be run on this kernel and a check that cannot run
+is not a check:
+
+- `stress --vm` is replaced by `mem-hog`. The guest is built without
+  `CONFIG_PSI` and has no swap device, so there is no PSI to observe and no
+  swap to fault from. Direct reclaim is the per-process memory signal that is
+  available, and it is the one the memory verdict already uses.
+- The netem-delayed link is replaced by the net-hog receive-window cycle. The
+  kernel has neither netem nor TBF built in, and HTB shapes loopback so hard
+  the connection never gets going. The cycle closes the window repeatedly,
+  which produces both real retransmissions and a round trip stretched from
+  ~43 us to ~1295 us.
+- The I/O fixture reads through O_DIRECT from the ext4 scratch image, because
+  reads served from tmpfs never reach the block tracepoints at all.
+
+Two limits are worth stating plainly rather than hiding behind the passes:
+
+- The CPU row uses a single worker. Several busy workers on eight vCPUs is not
+  contention, and the report should not claim otherwise; multi-worker CPU
+  pressure is a different question and is not what this row tests.
+- The memory row depends on the guest being memory-constrained. An oversized
+  fixture is OOM-killed in a fraction of a second, which produces a run too
+  short to measure and would test the fixture rather than the ranking.
+
 ## Tests
 
 ```bash

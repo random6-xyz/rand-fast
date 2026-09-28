@@ -36,9 +36,10 @@ use crate::{diagnose::Evidence, memory::Verdict as MemoryVerdict};
 /// Every constant says what it means and why the value was chosen, because a
 /// threshold nobody can argue with is a threshold nobody can trust.
 pub mod threshold {
-    /// On-CPU usage of one CPU, in percent, that counts as fully busy. The
-    /// process is competing for a core here, not sharing it.
-    pub const CPU_BUSY_PERCENT: f64 = 80.0;
+    /// Share of wall time spent on CPU that counts as compute-bound. A process
+    /// using a whole core continuously reaches 1.0, and the ramp saturates
+    /// before then so that "very busy" does not outrank a cause outright.
+    pub const CPU_BUSY_SHARE: f64 = 0.9;
 
     /// Scheduler p95, in microseconds, that counts as a run-queue wait worth
     /// naming. Ten milliseconds is long enough that a user would feel it and
@@ -50,6 +51,12 @@ pub mod threshold {
     /// means there.
     pub const IO_P99_US: u64 = 10_000;
 
+    /// Share of off-CPU time spent in an I/O wait that counts as being blocked
+    /// on the device. Half the time is a deliberate choice: a process that
+    /// spends more of its life waiting on storage than working is not healthy
+    /// whatever its per-request latency looks like.
+    pub const IO_WAIT_SHARE: f64 = 0.5;
+
     /// Share of off-CPU time on a futex that counts as lock contention rather
     /// than ordinary sleeping. A third is the point where waiting on other
     /// threads stops being incidental.
@@ -58,6 +65,20 @@ pub mod threshold {
     /// Retransmission ratio that counts as a network problem. One segment in
     /// fifty is well above a healthy path and low enough to catch a lossy one.
     pub const RETRANS_RATIO: f64 = 0.02;
+
+    /// Share of off-CPU time spent blocked on a socket that counts as a network
+    /// problem. Half the time is deliberate: past that the process is waiting on
+    /// the link rather than working around it.
+    pub const NETWORK_WAIT_SHARE: f64 = 0.5;
+
+    /// Waits that must be observed before a wait share may outrank anything.
+    ///
+    /// A share is a ratio, and a ratio over one sample is not a measurement: a
+    /// single two-millisecond stall reads as a hundred percent of the time
+    /// spent on the device, which would let a process that merely paused once
+    /// outrank a process that was demonstrably out of memory. Below this the
+    /// wait share is ignored and only the directly measured signals count.
+    pub const MIN_WAIT_SAMPLES: usize = 100;
 
     /// A signal needs this share of the total before it is reported at all.
     /// Reporting every cause with a few percent of noise is how a report stops
@@ -84,6 +105,15 @@ struct Severity {
     evidence: String,
 }
 
+/// Ramps an off-CPU wait share into a severity, ignoring a share taken from too
+/// few samples to be a measurement.
+fn wait_severity(share: f64, saturate: f64, evidence: &Evidence) -> f64 {
+    if evidence.offcpu_samples < threshold::MIN_WAIT_SAMPLES {
+        return 0.0;
+    }
+    ramp(share.clamp(0.0, 1.0), 0.0, saturate)
+}
+
 /// Ramps a value from 0 at `below` to 1 at `above`, and clamps outside that.
 ///
 /// A linear ramp rather than a step, so a signal just over its threshold does
@@ -97,20 +127,30 @@ fn ramp(value: f64, below: f64, above: f64) -> f64 {
 
 /// Scores the CPU signal.
 ///
+/// CPU time is a consequence of every other cause as much as it is a cause of
+/// its own: sixteen threads fighting over a futex burn CPU between their waits,
+/// and a process that spends most of its life blocked is not "CPU bound" just
+/// because it used a whole core while it had the chance. So the signal is the
+/// share of wall time spent on CPU, which is what separates a process that is
+/// genuinely compute-bound from one that is busy between waits.
+///
 /// Saturation is one full core. Beyond that the process is already fully
 /// consuming a CPU and more usage cannot be attributed to contention, which
-/// is what the two-CPU fixture is for: two busy workers are worse off than one
-/// for a reason this signal cannot see, and the other signals pick that up.
+/// is what a multi-worker fixture is for: several busy threads are worse off
+/// than one for a reason this signal cannot see, and the other signals pick
+/// that up.
 fn score_cpu(evidence: &Evidence) -> Option<Severity> {
     if evidence.cpu_samples == 0 {
         return None;
     }
     let percent = evidence.cpu_percent.clamp(0.0, 100.0);
+    let on_cpu_share = percent / 100.0;
     Some(Severity {
         cause: "CPU contention",
-        severity: ramp(percent, 0.0, threshold::CPU_BUSY_PERCENT),
+        severity: ramp(on_cpu_share, 0.0, threshold::CPU_BUSY_SHARE),
         evidence: format!(
-            "{percent:.1}% of one CPU over {} on-CPU samples",
+            "{percent:.1}% of one CPU, so {:.0}% of wall time on CPU, over {} samples",
+            on_cpu_share * 100.0,
             evidence.cpu_samples
         ),
     })
@@ -137,31 +177,51 @@ fn score_scheduler(evidence: &Evidence) -> Option<Severity> {
     })
 }
 
-/// Scores block I/O, counting only the completions past the slow threshold.
+/// Scores block I/O from two independent measurements.
 ///
-/// The p99 alone is misleading on a small sample: one slow completion out of
-/// two is a p99 of half the sample, so the count of slow completions is what
-/// the severity is built from.
+/// The p99 alone is misleading. A process that issues many small, fast requests
+/// has a low p99 and can still spend most of its life waiting for the device,
+/// because the wait is spread across many short stalls. And on a small sample
+/// one slow completion out of two makes a p99 of half the sample.
+///
+/// So the severity is the worse of:
+/// - latency: the p99 measured against the slow threshold, and
+/// - wait: the share of off-CPU time the process spent in an I/O wait, which is
+///   what a device-bound process actually looks like from inside.
+///
+/// Either one on its own can be misleading; together they separate a process
+/// that is genuinely waiting on storage from one that merely issues requests.
 fn score_io(evidence: &Evidence) -> Option<Severity> {
-    if evidence.io_samples == 0 {
+    if evidence.io_samples == 0 && evidence.offcpu_samples == 0 {
         return None;
     }
-    // A completion at four times the threshold is as bad as this signal goes.
-    let severity = ramp(
+    // A completion at four times the threshold is as bad as latency gets.
+    let latency = ramp(
         evidence.io_p99_us as f64,
         threshold::IO_P99_US as f64 / 4.0,
         threshold::IO_P99_US as f64 * 4.0,
     );
+    // Half the time spent waiting on I/O is as bad as the wait share gets,
+    // but only once there are enough waits for the ratio to mean anything.
+    let wait = wait_severity(evidence.offcpu_io_ratio, threshold::IO_WAIT_SHARE, evidence);
+    let mut detail = format!(
+        "p99 {} us over {} completions, {} past the {} us threshold",
+        evidence.io_p99_us,
+        evidence.io_samples,
+        evidence.io_slow,
+        threshold::IO_P99_US
+    );
+    if evidence.offcpu_samples > 0 {
+        detail.push_str(&format!(
+            ", {:.0}% of {} us off-CPU waiting on I/O",
+            evidence.offcpu_io_ratio.clamp(0.0, 1.0) * 100.0,
+            evidence.offcpu_total_us
+        ));
+    }
     Some(Severity {
         cause: "Disk I/O",
-        severity,
-        evidence: format!(
-            "p99 {} us over {} completions, {} past the {} us threshold",
-            evidence.io_p99_us,
-            evidence.io_samples,
-            evidence.io_slow,
-            threshold::IO_P99_US
-        ),
+        severity: latency.max(wait),
+        evidence: detail,
     })
 }
 
@@ -174,7 +234,7 @@ fn score_lock(evidence: &Evidence) -> Option<Severity> {
     let share = evidence.offcpu_futex_ratio.clamp(0.0, 1.0);
     Some(Severity {
         cause: "Lock contention",
-        severity: ramp(share, 0.0, threshold::FUTEX_SHARE * 3.0),
+        severity: wait_severity(share, threshold::FUTEX_SHARE * 3.0, evidence),
         evidence: format!(
             "{:.0}% of {} us off-CPU on a futex over {} waits, threshold {:.0}%",
             share * 100.0,
@@ -187,19 +247,35 @@ fn score_lock(evidence: &Evidence) -> Option<Severity> {
 
 /// Scores packet loss.
 fn score_network(evidence: &Evidence) -> Option<Severity> {
-    if evidence.net_samples == 0 {
+    if evidence.net_samples == 0 && evidence.offcpu_samples == 0 {
         return None;
     }
     let ratio = evidence.retrans_ratio.clamp(0.0, 1.0);
+    let loss = ramp(ratio, 0.0, threshold::RETRANS_RATIO * 10.0);
+    // A process blocked on a socket is a network problem whether or not a
+    // segment was lost, so the wait share counts alongside the loss.
+    let wait = wait_severity(
+        evidence.offcpu_network_ratio,
+        threshold::NETWORK_WAIT_SHARE,
+        evidence,
+    );
+    let mut detail = format!(
+        "{:.2}% of {} TCP events retransmitted, threshold {:.2}%",
+        ratio * 100.0,
+        evidence.net_samples,
+        threshold::RETRANS_RATIO * 100.0
+    );
+    if evidence.offcpu_samples > 0 {
+        detail.push_str(&format!(
+            ", {:.0}% of {} us off-CPU waiting on a socket",
+            evidence.offcpu_network_ratio.clamp(0.0, 1.0) * 100.0,
+            evidence.offcpu_total_us
+        ));
+    }
     Some(Severity {
         cause: "Network",
-        severity: ramp(ratio, 0.0, threshold::RETRANS_RATIO * 10.0),
-        evidence: format!(
-            "{:.2}% of {} TCP events retransmitted, threshold {:.2}%",
-            ratio * 100.0,
-            evidence.net_samples,
-            threshold::RETRANS_RATIO * 100.0
-        ),
+        severity: loss.max(wait),
+        evidence: detail,
     })
 }
 
@@ -272,8 +348,18 @@ fn score_other_wait(evidence: &Evidence) -> Option<Severity> {
     if evidence.offcpu_samples == 0 {
         return None;
     }
-    let futex = evidence.offcpu_futex_ratio.clamp(0.0, 1.0);
-    let unexplained = 1.0 - futex;
+    // Only the time no named cause explains counts here. I/O waits belong to
+    // the disk signal and page waits to the memory one, so counting them again
+    // as "other" would report a hundred percent of a cause that is already
+    // named, which is worse than saying nothing.
+    // The shares come from one total, so they sum to at most one; the clamp
+    // guards a caller that supplies a set that does not.
+    let unexplained = (1.0
+        - evidence.offcpu_futex_ratio.clamp(0.0, 1.0)
+        - evidence.offcpu_io_ratio.clamp(0.0, 1.0)
+        - evidence.offcpu_network_ratio.clamp(0.0, 1.0)
+        - evidence.offcpu_memory_ratio.clamp(0.0, 1.0))
+    .clamp(0.0, 1.0);
     if unexplained < threshold::FUTEX_SHARE {
         return None;
     }
@@ -281,7 +367,7 @@ fn score_other_wait(evidence: &Evidence) -> Option<Severity> {
         cause: "Other waiting",
         severity: unexplained * 0.4,
         evidence: format!(
-            "{:.0}% of {} us off-CPU is neither futex nor a named cause",
+            "{:.0}% of {} us off-CPU is a wait no named cause explains",
             unexplained * 100.0,
             evidence.offcpu_total_us
         ),
@@ -387,6 +473,65 @@ mod tests {
         };
         let ranked = score(&evidence);
         assert_eq!(ranked[0].cause, "Disk I/O");
+    }
+
+    #[test]
+    fn a_device_bound_process_ranks_io_even_with_a_low_p99() {
+        // Many small fast requests still make a process wait. The p99 is low
+        // and the wait share is high, and the process is still blocked on
+        // storage, which is what this case exists for.
+        let evidence = Evidence {
+            io_samples: 100_000,
+            io_p99_us: 60,
+            io_slow: 0,
+            offcpu_samples: 90_000,
+            offcpu_total_us: 3_000_000,
+            offcpu_io_ratio: 0.95,
+            ..idle()
+        };
+        let ranked = score(&evidence);
+        assert_eq!(ranked[0].cause, "Disk I/O");
+        assert!(
+            ranked[0].evidence[0].contains("waiting on I/O"),
+            "the wait must be part of the evidence: {:?}",
+            ranked[0]
+        );
+    }
+
+    #[test]
+    fn io_waits_are_not_also_reported_as_other_waiting() {
+        // Counting the same time twice would report a cause at a hundred
+        // percent that is already named, which is worse than silence.
+        let evidence = Evidence {
+            io_samples: 10_000,
+            offcpu_samples: 10_000,
+            offcpu_total_us: 1_000_000,
+            offcpu_io_ratio: 1.0,
+            ..idle()
+        };
+        let ranked = score(&evidence);
+        assert!(
+            !ranked.iter().any(|d| d.cause == "Other waiting"),
+            "{ranked:?}"
+        );
+        assert_eq!(ranked[0].cause, "Disk I/O");
+    }
+
+    #[test]
+    fn page_waits_belong_to_memory_not_to_other_waiting() {
+        let evidence = Evidence {
+            offcpu_samples: 5_000,
+            offcpu_total_us: 900_000,
+            offcpu_memory_ratio: 0.9,
+            major_faults_per_s: 10.0,
+            ..idle()
+        };
+        let ranked = score(&evidence);
+        assert!(
+            !ranked.iter().any(|d| d.cause == "Other waiting"),
+            "{ranked:?}"
+        );
+        assert_eq!(ranked[0].cause, "Memory pressure");
     }
 
     #[test]
@@ -643,6 +788,52 @@ mod tests {
     }
 
     #[test]
+    fn a_wait_share_from_too_few_samples_is_ignored() {
+        // One two-millisecond stall reads as a hundred percent of the time
+        // spent waiting, which would let a process that merely paused once
+        // outrank one that was demonstrably out of memory.
+        let evidence = Evidence {
+            offcpu_samples: 1,
+            offcpu_total_us: 1_926,
+            offcpu_io_ratio: 1.0,
+            ..idle()
+        };
+        let ranked = score(&evidence);
+        assert!(
+            !ranked.iter().any(|d| d.cause == "Disk I/O"),
+            "a single sample must not decide the disk signal: {ranked:?}"
+        );
+    }
+
+    #[test]
+    fn a_wait_share_with_enough_samples_is_used() {
+        let evidence = Evidence {
+            offcpu_samples: threshold::MIN_WAIT_SAMPLES,
+            offcpu_total_us: 1_000_000,
+            offcpu_io_ratio: 0.9,
+            ..idle()
+        };
+        assert_eq!(score(&evidence)[0].cause, "Disk I/O");
+    }
+
+    #[test]
+    fn the_futex_share_needs_samples_too() {
+        // The same guard applies to lock contention, which is also a ratio.
+        let one = Evidence {
+            offcpu_samples: 3,
+            offcpu_total_us: 1_000,
+            offcpu_futex_ratio: 1.0,
+            ..idle()
+        };
+        assert!(score(&one).is_empty(), "{:?}", score(&one));
+        let many = Evidence {
+            offcpu_samples: 10_000,
+            ..one
+        };
+        assert_eq!(score(&many)[0].cause, "Lock contention");
+    }
+
+    #[test]
     fn thresholds_are_ordered_from_loose_to_strict() {
         // Guards against a threshold edit that makes a signal impossible to
         // trigger or trivially triggered. The values go through locals so the
@@ -650,7 +841,9 @@ mod tests {
         let bounds: Vec<(f64, f64)> = vec![
             (threshold::FUTEX_SHARE, 1.0),
             (threshold::RETRANS_RATIO, 1.0),
-            (threshold::CPU_BUSY_PERCENT, 100.0),
+            (threshold::CPU_BUSY_SHARE, 1.0),
+            (threshold::NETWORK_WAIT_SHARE, 1.0),
+            (threshold::IO_WAIT_SHARE, 1.0),
         ];
         for (value, upper) in bounds {
             assert!(value > 0.0, "a threshold of {value} can never be crossed");

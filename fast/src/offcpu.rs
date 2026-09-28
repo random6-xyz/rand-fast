@@ -39,8 +39,14 @@ pub enum WaitReason {
     /// a futex wait and a timer sleep the same way.
     #[default]
     Futex,
-    /// Waiting on disk or network I/O.
+    /// Waiting on disk or the page cache.
+    ///
+    /// Socket waits are a separate reason: a process stalled on a full TCP
+    /// send buffer is a network problem, and folding it in here made
+    /// `fast diagnose` blame the disk for a slow link.
     Io,
+    /// Waiting on a socket: a full send buffer or an absent peer.
+    Network,
     /// Waiting for a page to come back from swap or the page cache.
     Memory,
     /// Sleeping, with no more specific cause found.
@@ -56,7 +62,8 @@ impl WaitReason {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Futex => "futex / lock",
-            Self::Io => "disk or network I/O",
+            Self::Io => "disk I/O",
+            Self::Network => "socket",
             Self::Memory => "page or swap",
             Self::Sleep => "sleep",
             Self::Wait => "wait",
@@ -95,6 +102,11 @@ impl WaitReason {
             if is_memory_frame(name) {
                 return Self::Memory;
             }
+            // Socket frames are checked before device frames, because the
+            // send path passes through both and the socket is the cause.
+            if is_socket_frame(name) {
+                return Self::Network;
+            }
             if is_io_frame(name) {
                 return Self::Io;
             }
@@ -127,7 +139,20 @@ fn is_io_frame(symbol: &str) -> bool {
         || symbol.contains("wait_for_completion")
         || symbol.contains("io_schedule")
         || symbol.contains("filemap_")
-        || symbol.contains("tcp_")
+        || symbol.contains("submit_bio")
+        || symbol.contains("wbt_wait")
+}
+
+/// Frames that mean the thread is waiting on a socket.
+///
+/// A full send buffer and an absent peer both park the task in an
+/// uninterruptible sleep, which the task state alone cannot tell apart from a
+/// disk request. The stack can.
+fn is_socket_frame(symbol: &str) -> bool {
+    symbol.contains("tcp_")
+        || symbol.contains("sock_")
+        || symbol.contains("inet_sendmsg")
+        || symbol.contains("sk_stream")
         || symbol.contains("netif_")
 }
 
@@ -615,6 +640,10 @@ mod tests {
         assert!(is_io_frame("wait_for_completion"));
         assert!(!is_futex_frame("schedule"));
         assert!(!is_io_frame("futex_wait"));
+        // A socket wait is a network problem, not a disk one.
+        assert!(is_socket_frame("tcp_sendmsg"));
+        assert!(is_socket_frame("sock_sendmsg"));
+        assert!(!is_io_frame("tcp_sendmsg"));
     }
 
     #[test]
@@ -633,6 +662,18 @@ mod tests {
 
         let memory = vec![frame("wait_on_page_bit_common")];
         assert_eq!(WaitReason::Wait.refine(&memory), WaitReason::Memory);
+
+        let socket = vec![frame("__schedule"), frame("tcp_sendmsg_locked")];
+        assert_eq!(WaitReason::Wait.refine(&socket), WaitReason::Network);
+
+        // The send path passes through both, so the socket has to win.
+        let send_path = vec![
+            frame("__schedule"),
+            frame("sock_sendmsg"),
+            frame("tcp_sendmsg_locked"),
+            frame("wait_for_completion"),
+        ];
+        assert_eq!(WaitReason::Wait.refine(&send_path), WaitReason::Network);
     }
 
     #[test]
@@ -674,6 +715,7 @@ mod tests {
         let labels = [
             WaitReason::Futex,
             WaitReason::Io,
+            WaitReason::Network,
             WaitReason::Memory,
             WaitReason::Sleep,
             WaitReason::Wait,

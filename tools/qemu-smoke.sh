@@ -861,6 +861,94 @@ check_json_document() {
     fi
 }
 
+# Proves the ranking puts the real bottleneck first.
+#
+# The unit tests in fast/src/scoring.rs prove the scoring against synthetic
+# measurements. This proves it against real workloads: five processes, each
+# with exactly one thing wrong, and each expected to be ranked on that thing.
+#
+# Every scenario runs `fast diagnose --format json` and reads the first entry of
+# the causes array, so what is checked is the number a consumer would act on
+# rather than the human report beside it.
+#
+# The document is a single compact line, so the first cause is extracted by
+# matching the array's opening entry rather than by any JSON parsing, which the
+# guest's awk cannot do.
+top_cause() {
+    sed -n 's/.*"causes":\[{"cause":"\([^"]*\)".*/\1/p' "$1" | head -1
+}
+
+# scenario <name> <expected cause> <expected cause prefix> <fixture...>
+scenario() {
+    local name="$1" expected="$2" prefix="$3"
+    shift 3
+    local duration="${SCENARIO_DURATION:-4s}"
+    local json="$OUT_DIR/scenario-$name.json"
+
+    # The remaining arguments are the fixture command. Arrays are not available
+    # in a POSIX shell, so the command is run through a small indirection.
+    "$@" >"$OUT_DIR/scenario-$name-fixture.log" 2>&1 &
+    local fixture_pid=$!
+    sleep 0.4
+    if ! "$FAST" diagnose --pid "$fixture_pid" --duration "$duration" --format json \
+        >"$json" 2>"$OUT_DIR/scenario-$name.err"; then
+        echo "diagnose scenario $name: FAIL (diagnose could not run; see $OUT_DIR/scenario-$name.err)"
+        head -3 "$OUT_DIR/scenario-$name.err" | sed 's/^/    /' >&2
+        FAILURES=$((FAILURES + 1))
+        kill "$fixture_pid" 2>/dev/null
+        wait "$fixture_pid" 2>/dev/null
+        return
+    fi
+    kill "$fixture_pid" 2>/dev/null
+    wait "$fixture_pid" 2>/dev/null
+
+    local actual
+    actual=$(top_cause "$json")
+    if [ -z "$actual" ]; then
+        echo "diagnose scenario $name: FAIL (no cause was ranked; the fixture produced no signal)"
+        head -c 300 "$json" | sed 's/^/    /' >&2
+        echo >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if [ "$actual" != "$prefix" ]; then
+        echo "diagnose scenario $name: FAIL (ranked '$actual' first, expected '$prefix')"
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "diagnose scenario $name: $actual first, as expected (expected $expected)"
+    fi
+}
+
+check_diagnose_scenarios() {
+    # One bottleneck at a time. The CPU case is a single busy-spinning worker,
+    # because two workers on eight vCPUs is not contention and the report
+    # should not claim otherwise.
+    scenario cpu "CPU contention" "CPU contention" \
+        "$SCHED_WORKLOAD" hog --duration 30s --workers 1
+
+    # A real block device, because reads served from tmpfs never reach the
+    # block tracepoints at all.
+    scenario io "Disk I/O" "Disk I/O" \
+        "$FAST_WORKLOAD" io-hog --duration 30s --workers 2 --path "$IO_HOG_PATH" --size-mib 256
+
+    scenario lock "Lock contention" "Lock contention" \
+        "$FAST_WORKLOAD" lock-hog --duration 30s --workers 16
+
+    # Large enough to make the process reclaim for itself, which is the only
+    # per-process memory signal available on a kernel built without PSI and with
+    # no swap device. Sized to stay under the guest's memory: an oversized
+    # fixture is OOM-killed in a fraction of a second, which produces a run too
+    # short to measure anything and would test the fixture rather than the
+    # ranking.
+    scenario memory "Memory pressure" "Memory pressure" \
+        "$FAST_WORKLOAD" mem-hog --duration 30s --workers 1 --size-mib 1024
+
+    # The cycling receive window, which is the only way to get real
+    # retransmissions out of a loopback link that never loses a packet.
+    scenario network "Network" "Network" \
+        "$FAST_WORKLOAD" net-hog --duration 30s --workers 2 --delay-ms 600
+}
+
 check_cpu_rate_scaling
 check_cpu_symbolization
 check_io_pairing
@@ -871,6 +959,7 @@ check_memory_verdict
 check_diagnose_parallel
 check_diagnose_ranking
 check_json_document
+check_diagnose_scenarios
 check_net_rtt_crosscheck
 check_net_field_crosscheck
 check_net_retransmit_attribution

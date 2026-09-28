@@ -77,8 +77,10 @@ gcc -static -O2 -o "$OUT_DIR/mount2" "$ROOT/tools/qemu-guest-mount.c" \
 # Reads served from tmpfs never reach the block_rq_* tracepoints, so the io
 # fixture needs a real block device.
 if [ ! -f "$IO_IMG" ]; then
-    log "creating the 256M ext4 scratch image"
-    truncate -s 256M "$IO_IMG" || die "truncate failed"
+    # 512 MiB, not 256: the io-hog fixture is asked for a 256 MiB file and a
+    # full filesystem makes the fixture fail before rand-fast sees anything.
+    log "creating the 512M ext4 scratch image"
+    truncate -s 512M "$IO_IMG" || die "truncate failed"
     mkfs.ext4 -q -F "$IO_IMG" || die "mkfs.ext4 failed"
 fi
 

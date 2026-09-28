@@ -93,6 +93,17 @@ impl CpuStats {
         Some((proc_delta as f64 / sys_delta as f64) * 100.0)
     }
 
+    /// Reads the end-of-window CPU counters.
+    ///
+    /// The usage percentage is a difference between two readings, so a
+    /// collector that is only primed at the start would report zero no matter
+    /// how busy the process was. Every caller has to call this once the
+    /// collection is over.
+    pub fn finalize(&mut self, pid: u32) {
+        self.end_usage = read_proc_cpu_usage(pid).ok();
+        self.end_system = read_system_ticks().ok();
+    }
+
     /// Number of on-CPU samples observed.
     pub fn sample_count(&self) -> usize {
         self.total
@@ -145,6 +156,77 @@ fn read_system_ticks() -> Result<u64> {
     Ok(total)
 }
 
+/// Detaches the on-CPU sampler.
+///
+/// Failures are best-effort: by the time this runs the report is already
+/// complete, and a handle the kernel has dropped needs no detaching.
+pub fn detach_sampler(bpf: &mut Ebpf, links: Vec<aya::programs::perf_event::PerfEventLinkId>) {
+    if links.is_empty() {
+        return;
+    }
+    let Some(program) = bpf.program_mut("cpu_sample") else {
+        return;
+    };
+    let Ok(program) = program.try_into() else {
+        return;
+    };
+    let program: &mut PerfEvent = program;
+    for link_id in links {
+        let _ = program.detach(link_id);
+    }
+}
+
+/// Loads and attaches the on-CPU sampler, returning the link handles and a
+/// primed collector.
+///
+/// The handles must be kept alive for the duration of the collection: dropping
+/// them detaches the sampler, so a caller that discards them would stop
+/// sampling immediately. The collector is primed with the process' current CPU
+/// time and the system total, which is what makes the usage percentage a
+/// measurement rather than a count of samples.
+pub fn attach_cpu_sampler(
+    bpf: &mut Ebpf,
+    pid: u32,
+    frequency: u64,
+) -> Result<(Vec<aya::programs::perf_event::PerfEventLinkId>, CpuStats)> {
+    let program = bpf
+        .program_mut("cpu_sample")
+        .context("eBPF program cpu_sample is missing")?;
+    let program: &mut PerfEvent = program
+        .try_into()
+        .context("cpu_sample is not a perf event program")?;
+    program
+        .load()
+        .context("failed to load eBPF program cpu_sample")?;
+
+    // Attach a cpu-clock sampler to every online CPU. The BPF program filters
+    // by TARGET_TIDS, so only the target's threads contribute samples, and the
+    // sample count scales with frequency times the CPU time they burn.
+    let config = PerfEventConfig::Software(SoftwareEvent::CpuClock);
+    let mut links = Vec::new();
+    for cpu in online_cpus()
+        .map_err(|(path, error)| anyhow!("failed to read online CPU list from {path}: {error}"))?
+    {
+        links.push(
+            program
+                .attach(
+                    config,
+                    PerfEventScope::AllProcessesOneCpu { cpu },
+                    SamplePolicy::Frequency(frequency),
+                    false,
+                )
+                .with_context(|| format!("failed to attach cpu_sample to CPU {cpu}"))?,
+        );
+    }
+
+    let stats = CpuStats {
+        start_usage: read_proc_cpu_usage(pid).ok(),
+        start_system: read_system_ticks().ok(),
+        ..CpuStats::default()
+    };
+    Ok((links, stats))
+}
+
 pub fn run(args: CpuArgs) -> Result<()> {
     let pid = args.pid;
     let process_name = process::read_name(pid)
@@ -158,46 +240,13 @@ pub fn run(args: CpuArgs) -> Result<()> {
     )))
     .context("failed to load the eBPF object; run as root or grant CAP_BPF and CAP_PERFMON")?;
 
-    let program = bpf
-        .program_mut("cpu_sample")
-        .context("eBPF program cpu_sample is missing")?;
-    let program: &mut PerfEvent = program
-        .try_into()
-        .context("cpu_sample is not a perf event program")?;
-    program
-        .load()
-        .context("failed to load eBPF program cpu_sample")?;
-
-    // Attach a cpu-clock sampler to every online CPU. The BPF program filters
-    // by TARGET_TIDS, so only the target's threads contribute samples, and the
-    // sample count scales with frequency times the CPU time they burn. The
-    // link ids are kept so the sampler can be stopped the moment collection
-    // ends.
-    let config = PerfEventConfig::Software(SoftwareEvent::CpuClock);
-    let mut links = Vec::new();
-    for cpu in online_cpus()
-        .map_err(|(path, error)| anyhow!("failed to read online CPU list from {path}: {error}"))?
-    {
-        links.push(
-            program
-                .attach(
-                    config,
-                    PerfEventScope::AllProcessesOneCpu { cpu },
-                    SamplePolicy::Frequency(args.frequency),
-                    false,
-                )
-                .with_context(|| format!("failed to attach cpu_sample to CPU {cpu}"))?,
-        );
-    }
+    // Attaching the sampler and priming the usage counters is shared with
+    // `fast diagnose`, which observes CPU in the same run as everything else.
+    let (links, mut stats) = attach_cpu_sampler(&mut bpf, pid, args.frequency)?;
 
     let mut target_tids = runtime::take_target_map(&mut bpf)?;
     let mut no_pending = runtime::NoPendingCleanup;
     let mut known_tids = BTreeSet::new();
-    let mut stats = CpuStats {
-        start_usage: read_proc_cpu_usage(pid).ok(),
-        start_system: read_system_ticks().ok(),
-        ..CpuStats::default()
-    };
     let summary = runtime::run_collection(
         &mut bpf,
         &mut target_tids,
@@ -217,18 +266,9 @@ pub fn run(args: CpuArgs) -> Result<()> {
     // Stop the sampler before reading the stack maps and building the report:
     // the perf readers are gone at this point, so continued sampling would
     // only churn the stack maps and burn CPU while the report is built.
-    // Detach failures are best-effort here; the report is already complete.
-    let program: &mut PerfEvent = bpf
-        .program_mut("cpu_sample")
-        .context("eBPF program cpu_sample is missing")?
-        .try_into()
-        .context("cpu_sample is not a perf event program")?;
-    for link_id in links {
-        let _ = program.detach(link_id);
-    }
+    detach_sampler(&mut bpf, links);
 
-    stats.end_usage = read_proc_cpu_usage(pid).ok();
-    stats.end_system = read_system_ticks().ok();
+    stats.finalize(pid);
 
     let stack_maps = StackMaps::take(&mut bpf)?;
 
