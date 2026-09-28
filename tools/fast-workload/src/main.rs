@@ -77,6 +77,26 @@ struct NetHogArgs {
     /// Number of client threads, each with its own loopback connection.
     #[arg(long, default_value_t = 2)]
     workers: usize,
+
+    /// Cycle the connection open and shut to force real retransmissions.
+    ///
+    /// A loopback link never loses packets, so a stalled reader alone is not
+    /// enough: data sitting in the receive buffer is still acknowledged the
+    /// moment it arrives. What does cause retransmission is a receive window
+    /// that closes while segments are still in flight. This stops the server
+    /// from reading, waits longer than the retransmission timeout for the
+    /// sender to give up and resend, then drains and repeats.
+    ///
+    /// The value is the per-cycle stall in milliseconds and must exceed the
+    /// kernel's 200ms initial RTO. 0 keeps the normal echo behaviour.
+    #[arg(long, default_value_t = 0, value_name = "MS")]
+    delay_ms: u64,
+
+    /// Server socket receive buffer in KiB, used only when cycling. A small
+    /// buffer makes the advertised window close quickly, so segments are
+    /// still in flight when it shuts and the sender has something to resend.
+    #[arg(long, default_value_t = 8, value_name = "KB")]
+    rcvbuf_kb: u64,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -277,26 +297,38 @@ fn run_net_hog(args: NetHogArgs) -> Result<(), String> {
         .port();
 
     println!(
-        "net-hog pid: {} endpoint: 127.0.0.1:{port} workers: {}",
+        "net-hog pid: {} endpoint: 127.0.0.1:{port} workers: {} delay: {}ms",
         std::process::id(),
         args.workers,
+        args.delay_ms,
     );
 
     let round_trips = Arc::new(AtomicU64::new(0));
+    let sent = Arc::new(AtomicU64::new(0));
     let deadline = Instant::now() + args.duration;
+    let stalling = args.delay_ms > 0;
+    let delay = Duration::from_millis(args.delay_ms);
+    let rcvbuf_kb = args.rcvbuf_kb;
 
     let server = thread::Builder::new()
         .name("net-hog-server".to_string())
-        .spawn(move || echo_server(listener, deadline))
+        .spawn(move || echo_server(listener, deadline, delay, stalling, rcvbuf_kb))
         .map_err(|error| format!("failed to spawn server: {error}"))?;
 
     let mut handles = Vec::with_capacity(args.workers);
     for worker in 0..args.workers {
         let round_trips = Arc::clone(&round_trips);
+        let sent = Arc::clone(&sent);
         handles.push(
             thread::Builder::new()
                 .name(format!("net-hog-client-{worker}"))
-                .spawn(move || net_client(port, deadline, &round_trips))
+                .spawn(move || {
+                    if stalling {
+                        net_client_stall(port, deadline, &sent)
+                    } else {
+                        net_client(port, deadline, &round_trips)
+                    }
+                })
                 .map_err(|error| format!("failed to spawn client: {error}"))?,
         );
     }
@@ -304,21 +336,35 @@ fn run_net_hog(args: NetHogArgs) -> Result<(), String> {
     join_workers(handles)?;
     // Give the server a moment to drain and exit.
     let _ = server.join();
-    println!(
-        "net-hog: {} round trips over {port}",
-        round_trips.load(Ordering::Relaxed),
-    );
+    if stalling {
+        println!(
+            "net-hog: {} bytes written with a {}ms server delay, expecting retransmissions",
+            sent.load(Ordering::Relaxed),
+            args.delay_ms,
+        );
+    } else {
+        println!(
+            "net-hog: {} round trips over {port}",
+            round_trips.load(Ordering::Relaxed),
+        );
+    }
     Ok(())
 }
 
-fn echo_server(listener: std::net::TcpListener, deadline: Instant) {
+fn echo_server(
+    listener: std::net::TcpListener,
+    deadline: Instant,
+    delay: Duration,
+    stalling: bool,
+    rcvbuf_kb: u64,
+) {
     let _ = listener.set_nonblocking(true);
     while Instant::now() < deadline + Duration::from_secs(1) {
         match listener.accept() {
             Ok((stream, _addr)) => {
                 let _ = thread::Builder::new()
                     .name("net-hog-echo".to_string())
-                    .spawn(move || echo_connection(stream));
+                    .spawn(move || echo_connection(stream, delay, stalling, rcvbuf_kb));
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
@@ -328,18 +374,100 @@ fn echo_server(listener: std::net::TcpListener, deadline: Instant) {
     }
 }
 
-fn echo_connection(mut stream: std::net::TcpStream) {
+/// Echoes until the peer goes away, or cycles the receive window shut and
+/// open again when a stall was requested.
+fn echo_connection(
+    mut stream: std::net::TcpStream,
+    delay: Duration,
+    stalling: bool,
+    rcvbuf_kb: u64,
+) {
     let mut buffer = [0u8; 1024];
-    loop {
-        match stream.read(&mut buffer) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if stream.write_all(&buffer[..n]).is_err() {
-                    break;
+    if !stalling {
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if stream.write_all(&buffer[..n]).is_err() {
+                        break;
+                    }
                 }
             }
         }
+        return;
     }
+
+    // A small receive buffer closes the advertised window quickly, so the
+    // sender still has segments in flight when the window shuts.
+    let size = (rcvbuf_kb as libc::c_int).saturating_mul(1024);
+    unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&size as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+
+    // Each pass drains what has arrived, then stops reading for long enough
+    // that the sender's retransmission timer expires. The drain reopens the
+    // window, so the cycle repeats for as long as the fixture runs and
+    // produces a fresh burst of retransmissions every pass.
+    let horizon = Instant::now() + Duration::from_secs(120);
+    while Instant::now() < horizon {
+        let mut reads = 0;
+        while reads < 16 {
+            match stream.read(&mut buffer) {
+                Ok(0) => return,
+                Ok(n) => {
+                    reads += 1;
+                    if stream.write_all(&buffer[..n]).is_err() {
+                        return;
+                    }
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    break;
+                }
+                Err(_) => return,
+            }
+        }
+        // The stall is the part that matters: no reads happen here, so the
+        // receive buffer fills, the advertised window shuts, and whatever the
+        // sender still has unacknowledged gets resent.
+        thread::sleep(delay);
+    }
+}
+
+/// Writes continuously without waiting for replies, so the peer's receive
+/// window closes and its retransmission timer fires.
+fn net_client_stall(port: u16, deadline: Instant, sent: &AtomicU64) -> Result<(), String> {
+    let stream = std::net::TcpStream::connect(("127.0.0.1", port))
+        .map_err(|error| format!("connect 127.0.0.1:{port}: {error}"))?;
+    let _ = stream.set_nodelay(true);
+    // A short write timeout makes each blocked write return periodically, so
+    // the deadline is still honoured and the fixture exits on its own instead
+    // of hanging until it is killed.
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+    let mut stream = stream;
+    let payload = [0x5Au8; 4096];
+    while Instant::now() < deadline {
+        // write_all blocks once the send buffer fills, which is exactly the
+        // backpressure needed for the unacknowledged data to accumulate. A
+        // timeout on the blocked socket is expected and not a failure.
+        if let Err(error) = stream.write_all(&payload)
+            && error.kind() != std::io::ErrorKind::WouldBlock
+            && error.kind() != std::io::ErrorKind::TimedOut
+        {
+            return Err(format!("write: {error}"));
+        }
+        sent.fetch_add(payload.len() as u64, Ordering::Relaxed);
+    }
+    Ok(())
 }
 
 fn net_client(port: u16, deadline: Instant, round_trips: &AtomicU64) -> Result<(), String> {

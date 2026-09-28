@@ -219,27 +219,48 @@ check_io_pairing() {
     wait "$hog_pid" 2>/dev/null
 }
 
-# Proves the RTT measurement is real, in two independent ways.
+# Proves the RTT distribution actually moves when the link degrades.
 #
-# 1. Absolute cross-check against the kernel: `ss -ti` prints the same
-#    smoothed RTT the `tcp_probe` tracepoint carries, in milliseconds. If
-#    rand-fast and the kernel agree, the payload offsets and the srtt scaling
-#    are both right. This needs no special kernel configuration, so it is the
-#    primary check.
-# 2. Relative separation: the same workload is run again behind a shaped link
-#    and must show a clearly higher RTT.
+# A qdisc would be the obvious way to degrade a link, but netem, HTB and TBF
+# are all optional kernel features and none of them are usable on loopback in
+# the verified kernel (netem and TBF are not built in, and HTB shapes the
+# link so hard the connection never gets going). The stalling fixture is used
+# instead: it closes the receive window in cycles, which stretches the round
+# trip into the tens of milliseconds while the baseline sits in the tens of
+# microseconds.
 #
-# The comparison uses the median of the per-endpoint values, because the
+# The comparison uses the median of the per-endpoint p50 values, because the
 # net-hog fixture opens several connections and the aggregate is what
-# matters.
-NETEM_DELAY=${NETEM_DELAY:-25ms}
-HTB_RATE=${HTB_RATE:-1mbit}
-RTT_MIN_RATIO=${RTT_MIN_RATIO:-2}
+# matters. The gap is measured in orders of magnitude, so a loose threshold
+# still catches a measurement that is stuck or scaled wrong. It reuses the
+# report the retransmission check already collected, since both need the same
+# cycling workload.
+RTT_MIN_RATIO=${RTT_MIN_RATIO:-20}
 
 # rand-fast reports microseconds, ss reports milliseconds. The two must agree
 # within a factor of two: wide enough for the run-to-run drift of a smoothed
 # RTT, tight enough to catch a wrong scale factor or a misread offset.
 RTT_CROSSCHECK_TOLERANCE=${RTT_CROSSCHECK_TOLERANCE:-2}
+
+check_net_rtt_separation() {
+    local base stalled ratio_ok=1
+    base=$(median_p50_us "$OUT_DIR/net-rtt-base.txt")
+    # The cycling run that check_net_retransmit_attribution collected: its
+    # round trips are stretched by the shut receive window.
+    stalled=$(median_p50_us "$OUT_DIR/net-retrans.txt")
+    if [ "${base:-0}" -le 0 ] || [ "${stalled:-0}" -le 0 ]; then
+        echo "net RTT separation: FAIL (no RTT samples; plain loopback=$base window cycling=$stalled)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if ! awk -v b="$base" -v d="$stalled" -v need="$RTT_MIN_RATIO" \
+            'BEGIN { r = (b + 0) == 0 ? 0 : d / b
+                     printf "net RTT separation: median endpoint p50 %d us on plain loopback vs %d us with the receive window cycling shut (%.0fx)\n", b, d, r
+                     exit (r >= need) ? 0 : 1 }'; then
+        ratio_ok=0
+    fi
+    [ "$ratio_ok" -eq 1 ] || FAILURES=$((FAILURES + 1))
+}
 
 # Locates ss, which busybox does not provide at all.
 SS_BIN=""
@@ -317,6 +338,90 @@ collect_net_rtt() {
     return 0
 }
 
+# Proves the retransmission path attributes events to endpoints.
+#
+# A loopback link never loses packets, so the fixture has to create the
+# condition retransmission needs: a receive window that shuts while segments
+# are still in flight. net-hog cycles the server between draining and stalling
+# for longer than the initial RTO, which produces a burst of real
+# retransmissions at the start of every cycle.
+#
+# The report must then name the endpoints carrying the retransmissions, and
+# the kernel's own counters are printed alongside so a miss is
+# distinguishable from a workload that simply did not retransmit.
+RETRANS_DELAY_MS=${RETRANS_DELAY_MS:-600}
+RETRANS_RCVBUF_KB=${RETRANS_RCVBUF_KB:-8}
+
+check_net_retransmit_attribution() {
+    "$FAST_WORKLOAD" net-hog --duration 20s --workers 2 \
+        --delay-ms "$RETRANS_DELAY_MS" --rcvbuf-kb "$RETRANS_RCVBUF_KB" \
+        >"$OUT_DIR/net-retrans-fixture.log" 2>&1 &
+    local fixture_pid=$!
+    # The fixture prints its listening port, which is used to filter the ss
+    # snapshot. Without the filter a socket left over from an earlier case
+    # could be mistaken for evidence that this fixture retransmitted.
+    sleep 0.5
+    local port
+    port=$(grep -m1 -oE 'endpoint: 127\.0\.0\.1:[0-9]+' "$OUT_DIR/net-retrans-fixture.log" \
+        | grep -oE '[0-9]+$')
+    : >"$OUT_DIR/net-retrans-ss.txt"
+    if [ -n "$SS_BIN" ]; then
+        ( i=0
+          while [ "$i" -lt 12 ]; do
+              if [ -n "$port" ]; then
+                  # Filtering on the port keeps sockets from other cases out
+                  # of the evidence.
+                  "$SS_BIN" -ti 2>/dev/null | grep -A1 ":$port" \
+                      >>"$OUT_DIR/net-retrans-ss.txt" || true
+              else
+                  "$SS_BIN" -ti 2>/dev/null >>"$OUT_DIR/net-retrans-ss.txt" || true
+              fi
+              echo >>"$OUT_DIR/net-retrans-ss.txt"
+              i=$((i + 1))
+              sleep 0.5
+          done ) &
+        local ss_pid=$!
+    else
+        ss_pid=""
+    fi
+    if ! "$FAST" net --pid "$fixture_pid" --duration 8s >"$OUT_DIR/net-retrans.txt" 2>&1; then
+        echo "net retransmit attribution: FAIL (collection failed)"
+        FAILURES=$((FAILURES + 1))
+        kill "$fixture_pid" 2>/dev/null
+        wait "$fixture_pid" 2>/dev/null
+        return
+    fi
+    [ -n "$ss_pid" ] && { kill "$ss_pid" 2>/dev/null; wait "$ss_pid" 2>/dev/null; }
+    kill "$fixture_pid" 2>/dev/null
+    wait "$fixture_pid" 2>/dev/null
+
+    # What the kernel itself counted. bytes_retrans is cumulative per socket,
+    # so the largest single value seen is the total, not the sum.
+    if [ -n "$SS_BIN" ] && [ -s "$OUT_DIR/net-retrans-ss.txt" ]; then
+        local kernel_bytes kernel_segs
+        kernel_bytes=$(awk '/bytes_retrans:/ {for(i=1;i<=NF;i++) if($i ~ /^bytes_retrans:/){split($i,p,":"); if(p[2]+0>m) m=p[2]}} END{print m+0}' "$OUT_DIR/net-retrans-ss.txt")
+        kernel_segs=$(awk '/retrans:/ {for(i=1;i<=NF;i++) if($i ~ /^retrans:/){split($i,p,"/"); if(p[2]+0>m) m=p[2]}} END{print m+0}' "$OUT_DIR/net-retrans-ss.txt")
+        echo "    kernel ss on port ${port:-?}: $kernel_bytes bytes_retrans, $kernel_segs retrans segs"
+    fi
+
+    local total endpoints
+    total=$(awk '/^Retransmissions:/ {print $2}' "$OUT_DIR/net-retrans.txt")
+    # Endpoints whose retrans column is not zero.
+    endpoints=$(awk '/RTT p50/ { for (i = 1; i <= NF; i++) if ($i == "retrans" && $(i+1) + 0 > 0) n++ }
+                    END { print n + 0 }' "$OUT_DIR/net-retrans.txt")
+    if [ "${total:-0}" -le 0 ]; then
+        echo "net retransmit attribution: FAIL (rand-fast saw no retransmissions; see the kernel counter above for whether the workload produced any)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if [ "${endpoints:-0}" -le 0 ]; then
+        echo "net retransmit attribution: FAIL ($total retransmissions were not attributed to any endpoint)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    echo "net retransmit attribution: $total retransmissions across $endpoints endpoints"
+}
+
 # Cross-checks rand-fast's RTT against the kernel's own estimate.
 check_net_rtt_crosscheck() {
     if [ -z "$SS_BIN" ]; then
@@ -382,77 +487,8 @@ check_net_field_crosscheck() {
     fi
 }
 
-# Installs a link shaper on lo, echoing a description of what it applied.
-apply_link_shaper() {
-    local tc_bin="$1"
-    if "$tc_bin" qdisc add dev lo root netem delay "$NETEM_DELAY" 2>>"$OUT_DIR/shaper.err"; then
-        SHAPER_KIND=netem
-        SHAPER_DESC="$NETEM_DELAY netem delay"
-        return 0
-    fi
-    if "$tc_bin" qdisc add dev lo root htb default 1 2>>"$OUT_DIR/shaper.err" \
-        && "$tc_bin" class add dev lo parent 1: classid 1:1 htb rate "$HTB_RATE" 2>>"$OUT_DIR/shaper.err"; then
-        SHAPER_KIND=htb
-        SHAPER_DESC="$HTB_RATE HTB rate limit"
-        return 0
-    fi
-    return 1
-}
 
-check_net_rtt_separation() {
-    local tc_bin=""
-    for candidate in /sbin/tc /bin/tc; do
-        [ -x "$candidate" ] && { tc_bin=$candidate; break; }
-    done
-    if [ -z "$tc_bin" ]; then
-        echo "net RTT separation: SKIP (no tc binary in the guest)"
-        return
-    fi
-
-    # The unthrottled baseline was collected before any shaper existed.
-    local base
-    base=$(median_p50_us "$OUT_DIR/net-rtt-base.txt")
-    if [ "${base:-0}" -le 0 ]; then
-        echo "net RTT separation: FAIL (no RTT samples in the baseline)"
-        FAILURES=$((FAILURES + 1))
-        return
-    fi
-
-    # Now the same workload behind a shaped link.
-    : >"$OUT_DIR/shaper.err"
-    if ! apply_link_shaper "$tc_bin"; then
-        echo "net RTT separation: SKIP (no usable qdisc on this kernel)"
-        sed 's/^/    /' "$OUT_DIR/shaper.err"
-        return
-    fi
-
-    "$FAST_WORKLOAD" net-hog --duration 20s --workers 2 >/dev/null 2>&1 &
-    local shaped_pid=$!
-    sleep 0.3
-    if ! "$FAST" net --pid "$shaped_pid" --duration 8s >"$OUT_DIR/net-rtt-shaped.txt" 2>&1; then
-        echo "net RTT separation: FAIL (shaped collection failed)"
-        FAILURES=$((FAILURES + 1))
-    fi
-    kill "$shaped_pid" 2>/dev/null
-    wait "$shaped_pid" 2>/dev/null
-    "$tc_bin" qdisc del dev lo root 2>/dev/null
-
-    local shaped ratio_ok=1
-    shaped=$(median_p50_us "$OUT_DIR/net-rtt-shaped.txt")
-    if [ "${shaped:-0}" -le 0 ]; then
-        echo "net RTT separation: FAIL (no RTT samples; baseline=$base shaped=$shaped)"
-        ratio_ok=0
-    elif ! awk -v b="$base" -v d="$shaped" -v need="$RTT_MIN_RATIO" -v desc="$SHAPER_DESC" \
-            'BEGIN { r = (b + 0) == 0 ? 0 : d / b
-                     printf "net RTT separation: median endpoint p50 %d us baseline vs %d us with %s (%.1fx)\n", b, d, desc, r
-                     exit (r >= need) ? 0 : 1 }'; then
-        ratio_ok=0
-    fi
-    [ "$ratio_ok" -eq 1 ] || FAILURES=$((FAILURES + 1))
-}
-
-# The unthrottled baseline both net checks compare against, taken before any
-# qdisc is installed.
+# The unthrottled baseline both net checks compare against.
 if collect_net_rtt "$OUT_DIR/net-rtt-base.txt" "$OUT_DIR/net-ss-base.txt"; then
     :
 else
@@ -465,6 +501,7 @@ check_cpu_symbolization
 check_io_pairing
 check_net_rtt_crosscheck
 check_net_field_crosscheck
+check_net_retransmit_attribution
 check_net_rtt_separation
 
 echo "=== key metrics ==="

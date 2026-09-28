@@ -75,6 +75,15 @@ const TCP_PROBE_SRTT_OFFSET: usize = 100;
 const TCP_PROBE_RCV_WND_OFFSET: usize = 104;
 const TCP_PROBE_SKADDR_OFFSET: usize = 128;
 
+const TCP_RETRANS_SKADDR_OFFSET: usize = 16;
+const TCP_RETRANS_SPORT_OFFSET: usize = 28;
+const TCP_RETRANS_DPORT_OFFSET: usize = 30;
+const TCP_RETRANS_FAMILY_OFFSET: usize = 32;
+const TCP_RETRANS_SADDR_OFFSET: usize = 34;
+const TCP_RETRANS_DADDR_OFFSET: usize = 38;
+const TCP_RETRANS_SADDR_V6_OFFSET: usize = 42;
+const TCP_RETRANS_DADDR_V6_OFFSET: usize = 58;
+
 #[cfg(not(target_arch = "bpf"))]
 fn main() {}
 
@@ -426,8 +435,12 @@ fn read_socket_addr(
 /// Returns `None` when the event cannot be attributed to a target thread,
 /// which is the common case: these tracepoints fire for every TCP connection
 /// on the host, not just for the observed process.
-fn attribute_tcp_socket(ctx: &TracePointContext) -> Option<u32> {
-    let skaddr = unsafe { ctx.read_at::<u64>(TCP_PROBE_SKADDR_OFFSET) }.ok()?;
+///
+/// The `skaddr_offset` argument selects where the event keeps its
+/// `struct sock *`. Both `tcp_probe` and `tcp_retransmit_skb` record the
+/// same pointer, so a socket learned from one is recognised by the other.
+fn attribute_tcp_socket(ctx: &TracePointContext, skaddr_offset: usize) -> Option<u32> {
+    let skaddr = unsafe { ctx.read_at::<u64>(skaddr_offset) }.ok()?;
     if skaddr == 0 {
         return None;
     }
@@ -439,6 +452,8 @@ fn attribute_tcp_socket(ctx: &TracePointContext) -> Option<u32> {
         return Some(tid);
     }
     // Not in a target thread: fall back to a socket a target was seen using.
+    // This is the path retransmissions take, since the kernel raises them
+    // from softirq context where the current TID is unrelated to the owner.
     let owner = unsafe { TCP_SOCKETS.get(skaddr) }?;
     Some(*owner)
 }
@@ -456,7 +471,7 @@ fn try_tcp_probe(ctx: TracePointContext) -> Result<u32, u32> {
         return Ok(0);
     }
 
-    let tid = match attribute_tcp_socket(&ctx) {
+    let tid = match attribute_tcp_socket(&ctx, TCP_PROBE_SKADDR_OFFSET) {
         Some(tid) => tid,
         None => return Ok(0),
     };
@@ -527,9 +542,75 @@ pub fn tcp_retransmit_skb(ctx: TracePointContext) -> u32 {
     }
 }
 
-fn try_tcp_retransmit_skb(_ctx: TracePointContext) -> Result<u32, u32> {
-    // Filled in by the follow-up commit that attributes retransmissions to
-    // the socket 5-tuple.
+fn try_tcp_retransmit_skb(ctx: TracePointContext) -> Result<u32, u32> {
+    if unsafe { MODE.get(0) }.copied().unwrap_or(0) & COLLECT_NET == 0 {
+        return Ok(0);
+    }
+
+    // The kernel raises retransmissions from softirq context, so the current
+    // TID is never the socket owner. Attribution goes through the socket
+    // pointer, which both TCP tracepoints share.
+    let tid = match attribute_tcp_socket(&ctx, TCP_RETRANS_SKADDR_OFFSET) {
+        Some(tid) => tid,
+        None => return Ok(0),
+    };
+
+    let family = match unsafe { ctx.read_at::<u16>(TCP_RETRANS_FAMILY_OFFSET) }.ok() {
+        Some(value) => value,
+        None => return Ok(0),
+    };
+
+    // saddr/daddr always hold the IPv4 addresses; saddr_v6/daddr_v6 hold
+    // either the IPv6 address or a v4-mapped form of the IPv4 one. Reading
+    // the pair that matches the family keeps the layout identical to what
+    // tcp_probe produces, so both events land on the same endpoint.
+    let (saddr, daddr) = if family == AF_INET6 {
+        let s: [u8; 16] = match unsafe { ctx.read_at(TCP_RETRANS_SADDR_V6_OFFSET) } {
+            Ok(value) => value,
+            Err(_) => return Ok(0),
+        };
+        let d: [u8; 16] = match unsafe { ctx.read_at(TCP_RETRANS_DADDR_V6_OFFSET) } {
+            Ok(value) => value,
+            Err(_) => return Ok(0),
+        };
+        (s, d)
+    } else if family == AF_INET {
+        let s: [u8; 4] = match unsafe { ctx.read_at(TCP_RETRANS_SADDR_OFFSET) } {
+            Ok(value) => value,
+            Err(_) => return Ok(0),
+        };
+        let d: [u8; 4] = match unsafe { ctx.read_at(TCP_RETRANS_DADDR_OFFSET) } {
+            Ok(value) => value,
+            Err(_) => return Ok(0),
+        };
+        let mut wide_s = [0u8; 16];
+        let mut wide_d = [0u8; 16];
+        wide_s[..4].copy_from_slice(&s);
+        wide_d[..4].copy_from_slice(&d);
+        (wide_s, wide_d)
+    } else {
+        // Neither AF_INET nor AF_INET6, for example a Unix socket.
+        return Ok(0);
+    };
+
+    let sport = unsafe { ctx.read_at::<u16>(TCP_RETRANS_SPORT_OFFSET) }.unwrap_or(0);
+    let dport = unsafe { ctx.read_at::<u16>(TCP_RETRANS_DPORT_OFFSET) }.unwrap_or(0);
+
+    let event = TcpEvent {
+        tid,
+        family,
+        retrans: 1,
+        _pad: 0,
+        sport,
+        dport,
+        // A retransmission has no smoothed RTT or window to report.
+        rtt_us: 0,
+        snd_cwnd: 0,
+        rcv_wnd: 0,
+        saddr,
+        daddr,
+    };
+    NET_EVENTS.output(&ctx, event, BPF_ANY);
     Ok(0)
 }
 

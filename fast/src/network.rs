@@ -182,7 +182,12 @@ pub fn run(args: NetArgs) -> Result<()> {
         "/fast-ebpf"
     )))
     .context("failed to load eBPF object; run as root or grant CAP_BPF and CAP_PERFMON")?;
+    // Both programs share the NET_EVENTS map and the TCP_SOCKETS map, so the
+    // retransmission program can attribute an event to a socket the RTT
+    // program first saw. tcp_probe must be attached as well: it is what
+    // populates TCP_SOCKETS.
     runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_probe")?;
+    runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_retransmit_skb")?;
 
     let mut target_tids = runtime::take_target_map(&mut bpf)?;
 
