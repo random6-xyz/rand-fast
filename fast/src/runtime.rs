@@ -365,6 +365,93 @@ where
     }
 }
 
+/// Options for [`run_map_collection`].
+#[derive(Debug, Clone, Copy)]
+pub struct MapCollectionOptions {
+    /// Process (TGID) whose threads are observed.
+    pub pid: u32,
+    /// Bounded collection duration.
+    pub duration: Duration,
+    /// How often the collector callback is invoked.
+    pub interval: Duration,
+    /// Collector mode bits (`fast_common::COLLECT_*`) written into the eBPF
+    /// `MODE` map.
+    pub mode: u32,
+}
+
+/// Runs a collection that polls eBPF maps instead of consuming perf events.
+///
+/// Used by collectors whose kernel side is too hot to stream as events, such
+/// as the page fault counter. The callback is invoked once per `interval`,
+/// with the wall time since collection started, and the loop ends when the
+/// duration elapses, Ctrl-C arrives, or the process exits.
+///
+/// The final call happens after the loop regardless, so a duration shorter
+/// than one interval still produces one sample.
+pub fn run_map_collection<F>(
+    bpf: &mut Ebpf,
+    target_tids: &mut AyaHashMap<MapData, u32, u8>,
+    pending: &mut dyn PendingCleanup,
+    known_tids: &mut BTreeSet<u32>,
+    initial_tids: &BTreeSet<u32>,
+    options: MapCollectionOptions,
+    mut sample: F,
+) -> Result<CollectionSummary>
+where
+    F: FnMut(Duration),
+{
+    let mode_map = bpf.take_map("MODE").context("eBPF map MODE is missing")?;
+    let mut mode_map: AyaHashMap<MapData, u32, u32> = mode_map
+        .try_into()
+        .context("MODE has an unexpected map type or layout")?;
+    mode_map
+        .insert(0, options.mode, 0)
+        .context("failed to write the collector mode")?;
+
+    sync_target_tids(target_tids, pending, known_tids, initial_tids)?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let interrupted = Arc::new(AtomicBool::new(false));
+    install_signal_handler(&stop, &interrupted)?;
+
+    let started = Instant::now();
+    let mut next_sample = started;
+    let mut next_refresh = started + THREAD_REFRESH_INTERVAL;
+    let mut process_exited = false;
+
+    while started.elapsed() < options.duration {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        if Instant::now() >= next_sample {
+            sample(started.elapsed());
+            next_sample = Instant::now() + options.interval;
+        }
+        if Instant::now() >= next_refresh {
+            match refresh_target_threads(options.pid, target_tids, pending, known_tids) {
+                Ok(true) => {}
+                Ok(false) => {
+                    process_exited = true;
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+            next_refresh = Instant::now() + THREAD_REFRESH_INTERVAL;
+        }
+        thread::sleep(RECV_WAIT.min(options.interval));
+    }
+
+    // One last sample, so a run shorter than the interval is not empty.
+    sample(started.elapsed());
+
+    Ok(CollectionSummary {
+        elapsed: started.elapsed().min(options.duration),
+        interrupted: interrupted.load(Ordering::Relaxed),
+        process_exited,
+    })
+}
+
 fn install_signal_handler(stop: &Arc<AtomicBool>, interrupted: &Arc<AtomicBool>) -> Result<()> {
     let stop = Arc::clone(stop);
     let interrupted = Arc::clone(interrupted);

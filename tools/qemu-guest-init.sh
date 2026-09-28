@@ -85,6 +85,30 @@ for event in tcp_probe tcp_retransmit_skb; do
     fi
 done
 
+# Record the memory tracepoint payload layouts the eBPF memory programs rely
+# on: user page faults, and direct reclaim, which is where a task stalls when
+# memory runs short.
+for spec in exceptions/page_fault_user vmscan/mm_vmscan_direct_reclaim_begin; do
+    event=$(basename "$spec")
+    category=$(dirname "$spec")
+    if [ -e "/sys/kernel/tracing/events/$category/$event/format" ]; then
+        echo "=== $event format ==="
+        cat "/sys/kernel/tracing/events/$category/$event/format"
+    else
+        echo "=== $event format MISSING ==="
+    fi
+done
+
+# PSI is the other half of the memory picture. The verified kernel is built
+# without it, which the memory report has to say out loud rather than quietly
+# reporting zeroes.
+if [ -r /proc/pressure/memory ]; then
+    echo "=== pressure/memory ==="
+    cat /proc/pressure/memory
+else
+    echo "=== pressure/memory MISSING (kernel built without CONFIG_PSI) ==="
+fi
+
 export FAST=/bin/fast
 export SCHED_WORKLOAD=/bin/sched-workload
 export FAST_WORKLOAD=/bin/fast-workload

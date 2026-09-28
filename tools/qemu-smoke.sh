@@ -131,6 +131,7 @@ run_case cpu "$SCHED_WORKLOAD" hog --duration 30s --workers 8
 run_case io "$FAST_WORKLOAD" io-hog --duration 30s --workers 2 --path "$IO_HOG_PATH"
 run_case net "$FAST_WORKLOAD" net-hog --duration 30s --workers 4
 run_case off-cpu "$FAST_WORKLOAD" lock-hog --duration 30s --workers 16
+run_case memory "$FAST_WORKLOAD" mem-hog --duration 30s --workers 2
 
 # --- v1.0 accuracy checks ---
 check_cpu_rate_scaling() {
@@ -647,11 +648,50 @@ check_offcpu_ranking() {
     echo "off-CPU ranking: futex is the top reason, $total total off-CPU, leading stack $stack_line"
 }
 
+# Proves the kernel-side page fault counter keeps up.
+#
+# The counter exists because the old per-fault perf event could not: at a high
+# fault rate the buffer fills and records are lost. The independent source is
+# the process accounting counters, so the two rates over the same window are
+# compared. They are not identical by construction, because the tracepoint
+# only sees user-mode faults and only from the moment the program is attached,
+# so the check is that the eBPF rate keeps up rather than that it matches
+# exactly. A counter that had dropped events would fall far short.
+MEMORY_RATE_MIN_PERCENT=${MEMORY_RATE_MIN_PERCENT:-95}
+
+check_memory_fault_counter() {
+    local report="$OUT_DIR/memory-load.txt"
+    if [ ! -f "$report" ]; then
+        echo "memory fault counter: SKIP (no memory report from the matrix)"
+        return
+    fi
+
+    # Both lines end their first figure with "(NNN/s)". The guest awk is
+    # busybox's, which has no capture-group match(), so the value is cut out
+    # with sub() on a single field instead.
+    local ebpf_rate minor_rate
+    ebpf_rate=$(awk '/eBPF user faults:/ { v = $5; gsub(/[^0-9]/, "", v); print v; exit }' "$report")
+    minor_rate=$(awk '/^ *minor / { v = $3; gsub(/[^0-9]/, "", v); print v; exit }' "$report")
+    if [ -z "${ebpf_rate:-}" ] || [ -z "${minor_rate:-}" ] || [ "$minor_rate" -eq 0 ]; then
+        echo "memory fault counter: FAIL (no fault rates in the report; eBPF=$ebpf_rate /proc=$minor_rate)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if ! awk -v a="$ebpf_rate" -v b="$minor_rate" -v need="$MEMORY_RATE_MIN_PERCENT" \
+            'BEGIN { pct = (b + 0) == 0 ? 0 : a * 100.0 / b
+                     printf "memory fault counter: %d user faults/s from eBPF against %d minor faults/s from /proc (%.2f%%)\n", a, b, pct
+                     exit (pct >= need) ? 0 : 1 }'; then
+        echo "    the kernel-side counter is falling behind, so events are being lost"
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
 check_cpu_rate_scaling
 check_cpu_symbolization
 check_io_pairing
 check_offcpu_shape
 check_offcpu_ranking
+check_memory_fault_counter
 check_net_rtt_crosscheck
 check_net_field_crosscheck
 check_net_retransmit_attribution
@@ -675,6 +715,7 @@ print_metrics cpu 'Samples:|CPU usage:'
 print_metrics io 'Samples:|rchar:'
 print_metrics net 'Retransmissions:|RTT p50'
 print_metrics off-cpu 'Samples:'
+print_metrics memory 'eBPF user faults|minor |direct reclaim'
 echo
 echo "Raw reports saved under $OUT_DIR"
 

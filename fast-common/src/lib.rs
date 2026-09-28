@@ -10,6 +10,7 @@ mod aya_pod {
     unsafe impl aya::Pod for crate::PendingIo {}
     unsafe impl aya::Pod for crate::IoRequestKey {}
     unsafe impl aya::Pod for crate::OffCpuPending {}
+    unsafe impl aya::Pod for crate::MemoryCounters {}
 }
 
 pub const MAX_TARGET_TIDS: u32 = 4096;
@@ -21,6 +22,9 @@ pub const MAX_PENDING_IO: u32 = 8192;
 /// a target thread is seen using, so this is generous headroom over the
 /// number of connections a process keeps open.
 pub const MAX_TCP_SOCKETS: u32 = 8192;
+/// Upper bound for per-thread memory counters. Only target threads get an
+/// entry, so this matches the target thread limit.
+pub const MAX_MEMORY_THREADS: u32 = MAX_TARGET_TIDS;
 /// Stack trace map capacity. Sized for periodic on-CPU sampling where many
 /// distinct user/kernel stacks accumulate over a run; entries are allocated
 /// lazily (~1 KiB each at the default 127-frame depth).
@@ -38,6 +42,7 @@ pub const COLLECT_SCHEDULER_LATENCY: u32 = 1;
 pub const COLLECT_CPU_SAMPLE: u32 = 2;
 pub const COLLECT_OFFCPU: u32 = 4;
 pub const COLLECT_NET: u32 = 8;
+pub const COLLECT_MEMORY: u32 = 16;
 
 /// Address family of an IPv4 socket, as stored in [`TcpEvent::family`].
 pub const AF_INET: u16 = 2;
@@ -224,17 +229,22 @@ pub struct OffCpuEvent {
     pub _pad2: u32,
 }
 
-/// Memory pressure snapshot.
+/// Per-thread memory activity, accumulated in the kernel and read by
+/// userspace.
+///
+/// A process can take hundreds of thousands of page faults a second, and
+/// emitting a perf event for each one drowns the buffer and loses records.
+/// Counting in a map instead costs a map update per fault and produces no
+/// events at all, so userspace polls the map and differences two snapshots to
+/// get a rate. The counts are cumulative from the start of collection.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
-pub struct MemoryEvent {
-    pub minflt: u64,
-    pub majflt: u64,
-    pub swap_kb: u64,
-    pub tid: u32,
-    pub psi_some_pct: u32,
-    pub psi_full_pct: u32,
-    pub _pad: u32,
+pub struct MemoryCounters {
+    /// User page faults seen on this thread.
+    pub faults: u64,
+    /// Direct reclaim attempts this thread entered, which is where a task
+    /// stalls when memory runs short.
+    pub reclaims: u64,
 }
 
 #[cfg(test)]
@@ -369,8 +379,19 @@ mod tests {
     }
 
     #[test]
-    fn memory_event_layout_is_stable() {
-        assert_eq!(size_of::<MemoryEvent>(), 40);
-        assert_eq!(align_of::<MemoryEvent>(), 8);
+    fn memory_counters_layout_is_stable() {
+        assert_eq!(size_of::<MemoryCounters>(), 16);
+        assert_eq!(align_of::<MemoryCounters>(), 8);
+    }
+
+    #[test]
+    fn memory_counters_round_trip_through_bytes() {
+        let counters = MemoryCounters {
+            faults: 12_345,
+            reclaims: 7,
+        };
+        let decoded: MemoryCounters = bytemuck::pod_read_unaligned(bytemuck::bytes_of(&counters));
+        assert_eq!(decoded.faults, 12_345);
+        assert_eq!(decoded.reclaims, 7);
     }
 }

@@ -15,10 +15,11 @@ use aya_ebpf::{
     programs::{PerfEventContext, TracePointContext},
 };
 use fast_common::{
-    AF_INET, AF_INET6, COLLECT_CPU_SAMPLE, COLLECT_NET, COLLECT_OFFCPU, COLLECT_SCHEDULER_LATENCY,
-    CpuSampleEvent, IoEvent, IoRequestKey, MAX_PENDING_IO, MAX_STACKS, MAX_TARGET_TIDS,
-    MAX_TCP_SOCKETS, MemoryEvent, OFFCPU_REASON_IO, OFFCPU_REASON_UNKNOWN, OFFCPU_REASON_WAIT,
-    OffCpuEvent, OffCpuPending, PendingIo, PendingWakeup, SchedulerLatencyEvent, TcpEvent,
+    AF_INET, AF_INET6, COLLECT_CPU_SAMPLE, COLLECT_MEMORY, COLLECT_NET, COLLECT_OFFCPU,
+    COLLECT_SCHEDULER_LATENCY, CpuSampleEvent, IoEvent, IoRequestKey, MAX_MEMORY_THREADS,
+    MAX_PENDING_IO, MAX_STACKS, MAX_TARGET_TIDS, MAX_TCP_SOCKETS, MemoryCounters, OFFCPU_REASON_IO,
+    OFFCPU_REASON_UNKNOWN, OFFCPU_REASON_WAIT, OffCpuEvent, OffCpuPending, PendingIo,
+    PendingWakeup, SchedulerLatencyEvent, TcpEvent,
 };
 
 // The offsets are the stable payload offsets of the Linux scheduler tracepoints:
@@ -27,6 +28,17 @@ const SCHED_WAKEUP_PID_OFFSET: usize = 24;
 const SCHED_SWITCH_PREV_PID_OFFSET: usize = 24;
 const SCHED_SWITCH_PREV_STATE_OFFSET: usize = 32;
 const SCHED_SWITCH_NEXT_PID_OFFSET: usize = 56;
+
+// Payload offsets of the memory tracepoints, verified against the format
+// files that tools/qemu-guest-init.sh dumps on the target kernel
+// (7.2.0-rc6):
+//   page_fault_user:                address=8 ip=16 error_code=24
+//   mm_vmscan_direct_reclaim_begin: gfp_flags=8 memcg_id=16 order=24
+//
+// Neither payload is read. A fault's address says nothing about whether it
+// was minor or major, and the reclaim order says nothing a user acts on, so
+// the programs only need the fact that the event happened. The offsets are
+// recorded here so the layout stays documented if a future report needs one.
 
 // Payload offsets of the block request tracepoints, verified against the
 // format files that tools/qemu-guest-init.sh dumps on the target kernel
@@ -148,7 +160,8 @@ static OFFCPU_START: LruHashMap<u32, OffCpuPending> =
     LruHashMap::with_max_entries(MAX_TARGET_TIDS, 0);
 
 #[map]
-static MEMORY_EVENTS: PerfEventArray<MemoryEvent> = PerfEventArray::new(0);
+static MEMORY_COUNTERS: LruHashMap<u32, MemoryCounters> =
+    LruHashMap::with_max_entries(MAX_MEMORY_THREADS, 0);
 
 #[tracepoint(name = "sched_wakeup", category = "sched")]
 pub fn sched_wakeup(ctx: TracePointContext) -> u32 {
@@ -660,23 +673,67 @@ fn try_tcp_retransmit_skb(ctx: TracePointContext) -> Result<u32, u32> {
     Ok(0)
 }
 
-// --- Memory: page_fault ---
+// --- Memory: page faults and direct reclaim, counted rather than streamed ---
+/// Adds one to a per-thread counter, creating the entry on first use.
+///
+/// The increment goes through a raw pointer because the map has to be updated
+/// in place. That is safe here even though the kernel does not make map writes
+/// atomic: only the thread that owns a key ever writes it, and a thread runs
+/// on one CPU at a time, so there is no second writer to race with.
+fn bump_counter(tid: u32, bump: fn(&mut MemoryCounters)) {
+    match MEMORY_COUNTERS.get_ptr_mut(tid) {
+        Some(ptr) => {
+            let counters = unsafe { &mut *ptr };
+            bump(counters);
+        }
+        None => {
+            // The thread set can grow past what the map already holds, so the
+            // entry has to be created. The first event of that thread is
+            // counted as the seed rather than dropped.
+            let mut counters = MemoryCounters {
+                faults: 0,
+                reclaims: 0,
+            };
+            bump(&mut counters);
+            let _ = MEMORY_COUNTERS.insert(tid, counters, BPF_ANY as u64);
+        }
+    }
+}
+
+fn count_fault(counters: &mut MemoryCounters) {
+    counters.faults = counters.faults.saturating_add(1);
+}
+
+fn count_reclaim(counters: &mut MemoryCounters) {
+    counters.reclaims = counters.reclaims.saturating_add(1);
+}
+
 #[tracepoint(name = "page_fault_user", category = "exceptions")]
-pub fn page_fault_user(ctx: TracePointContext) -> u32 {
+pub fn page_fault_user(_ctx: TracePointContext) -> u32 {
+    if unsafe { MODE.get(0) }.copied().unwrap_or(0) & COLLECT_MEMORY == 0 {
+        return 0;
+    }
     let tid = bpf_get_current_pid_tgid() as u32;
     if unsafe { TARGET_TIDS.get(tid) }.is_none() {
         return 0;
     }
-    let event = MemoryEvent {
-        minflt: 1,
-        majflt: 0,
-        swap_kb: 0,
-        tid,
-        psi_some_pct: 0,
-        psi_full_pct: 0,
-        _pad: 0,
-    };
-    MEMORY_EVENTS.output(&ctx, event, BPF_ANY);
+    bump_counter(tid, count_fault);
+    0
+}
+
+/// Counts the moments a thread had to reclaim memory itself, which is what
+/// memory pressure looks like from inside a process: the task cannot proceed
+/// until pages come back.
+#[tracepoint(name = "mm_vmscan_direct_reclaim_begin", category = "vmscan")]
+pub fn mm_vmscan_direct_reclaim_begin(_ctx: TracePointContext) -> u32 {
+    if unsafe { MODE.get(0) }.copied().unwrap_or(0) & COLLECT_MEMORY == 0 {
+        return 0;
+    }
+    let tid = bpf_get_current_pid_tgid() as u32;
+    if unsafe { TARGET_TIDS.get(tid) }.is_none() {
+        return 0;
+    }
+    bump_counter(tid, count_reclaim);
     0
 }
 
