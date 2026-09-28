@@ -16,6 +16,7 @@ use fast_common::{COLLECT_CPU_SAMPLE, CpuSampleEvent};
 
 use crate::{
     cli::CpuArgs,
+    json::{self, Envelope, Format},
     process, runtime,
     symbolize::{StackMaps, StackSymbolizer},
 };
@@ -29,6 +30,10 @@ const MAX_REPORT_FRAMES: usize = 24;
 
 /// Highest hot-stack count shown in the report.
 const HOT_STACKS_SHOWN: usize = 5;
+
+/// How many hot stacks a JSON document carries. The document is meant to be read
+/// by a program, so it stays smaller than the human table.
+pub const HOT_STACKS_JSON: usize = 10;
 
 /// A stack id pair recorded per sample: kernel and user stack entries in the
 /// shared `STACK_TRACES` map (`-1` when that half was not captured).
@@ -66,7 +71,7 @@ impl CpuStats {
         self.lost = self.lost.saturating_add(count);
     }
 
-    fn hot_stacks(&self, n: usize) -> Vec<(StackId, usize)> {
+    pub fn hot_stacks(&self, n: usize) -> Vec<(StackId, usize)> {
         let mut v: Vec<_> = self.stack_counts.iter().map(|(k, c)| (*k, *c)).collect();
         // Deterministic order: count descending, then stack id ascending.
         v.sort_by_key(|(id, count)| (std::cmp::Reverse(*count), *id));
@@ -227,15 +232,30 @@ pub fn run(args: CpuArgs) -> Result<()> {
 
     let stack_maps = StackMaps::take(&mut bpf)?;
 
-    print_cpu_report(
-        pid,
-        &process_name,
-        summary.elapsed,
-        &stats,
-        summary.interrupted,
-        summary.process_exited,
-        &stack_maps,
-    );
+    if args.format.format == Format::Json {
+        json::emit(
+            args.format.format,
+            &Envelope::new(
+                "cpu",
+                pid,
+                Some(process_name),
+                summary.elapsed,
+                summary.interrupted,
+                summary.process_exited,
+                crate::json_payloads::cpu_json(&stats),
+            ),
+        );
+    } else {
+        print_cpu_report(
+            pid,
+            &process_name,
+            summary.elapsed,
+            &stats,
+            summary.interrupted,
+            summary.process_exited,
+            &stack_maps,
+        );
+    }
     Ok(())
 }
 

@@ -7,7 +7,12 @@ use fast_common::{
     CpuSampleEvent, IoEvent, OffCpuEvent, SchedulerLatencyEvent, TcpEvent,
 };
 
-use crate::{cli::DiagnoseArgs, cpu, io, memory, network, offcpu, process, runtime, stats};
+use crate::{
+    cli::DiagnoseArgs,
+    cpu, io,
+    json::{self, Envelope, Format},
+    memory, network, offcpu, process, runtime, stats,
+};
 
 /// Perf pages per CPU, per stream.
 ///
@@ -20,8 +25,10 @@ const PERF_PAGE_COUNT: usize = 16;
 /// Everything the collectors measured during one run.
 ///
 /// The ranking consumes exactly this struct and nothing else, which is what
-/// makes the ranking testable without an eBPF program, a kernel or root.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// makes the ranking testable without an eBPF program, a kernel or root. It
+/// also serializes straight into the diagnose document, so what a consumer
+/// reads is exactly what the ranking used.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct Evidence {
     /// Scheduler samples collected.
     pub sched_samples: usize,
@@ -218,7 +225,22 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
         swap_kb,
         lost,
     );
-    print_report(&process_name, pid, &summary, &evidence);
+    if args.format.format == Format::Json {
+        json::emit(
+            args.format.format,
+            &Envelope::new(
+                "diagnose",
+                pid,
+                Some(process_name),
+                summary.elapsed,
+                summary.interrupted,
+                summary.process_exited,
+                crate::json_payloads::diagnose_json(&evidence),
+            ),
+        );
+    } else {
+        print_report(&process_name, pid, &summary, &evidence);
+    }
     Ok(())
 }
 

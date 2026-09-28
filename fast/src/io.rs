@@ -8,7 +8,11 @@ use anyhow::{Context, Result};
 use aya::{Ebpf, include_bytes_aligned};
 use fast_common::{IoEvent, io_op_name};
 
-use crate::{cli::IoArgs, process, runtime};
+use crate::{
+    cli::IoArgs,
+    json::{self, Envelope, Format},
+    process, runtime,
+};
 
 /// `block_rq_*` can be bursty on busy devices; 64 pages (256 KiB) per CPU
 /// keeps event loss low.
@@ -20,8 +24,10 @@ const SLOW_TABLE_ROWS: usize = 16;
 /// Aggregate counters for one operation kind.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OpStats {
-    count: u64,
-    sectors: u64,
+    /// Completions of this operation.
+    pub count: u64,
+    /// Sectors transferred by this operation.
+    pub sectors: u64,
 }
 
 impl OpStats {
@@ -34,10 +40,14 @@ impl OpStats {
 /// Per-device statistics: latency samples, operation split, and sectors moved.
 #[derive(Debug, Default)]
 pub struct DeviceStats {
-    latencies: Vec<u64>,
-    read: OpStats,
-    write: OpStats,
-    other: OpStats,
+    /// Latencies observed on this device.
+    pub latencies: Vec<u64>,
+    /// Read completions on this device.
+    pub read: OpStats,
+    /// Write completions on this device.
+    pub write: OpStats,
+    /// Completions of any other operation.
+    pub other: OpStats,
 }
 
 impl DeviceStats {
@@ -159,6 +169,31 @@ impl IoStats {
     /// Number of completions above the slow threshold.
     pub fn slow_count(&self) -> u64 {
         self.slow
+    }
+
+    /// The slow threshold this collector was built with, in nanoseconds.
+    pub fn threshold_ns(&self) -> u64 {
+        self.threshold_ns
+    }
+
+    /// Per-device rows, ordered by device id.
+    pub fn devices(&self) -> Vec<(u32, &DeviceStats)> {
+        self.by_device
+            .iter()
+            .map(|(dev, stats)| (*dev, stats))
+            .collect()
+    }
+
+    /// The `SLOW_TABLE_ROWS` slowest completions over the threshold, longest
+    /// first, as (thread, sectors, latency in nanoseconds).
+    pub fn slow_top(&self) -> Vec<(u32, u32, u64)> {
+        self.slow_top
+            .iter()
+            .map(|entry| {
+                let entry = &entry.0;
+                (entry.event.tid, entry.event.sectors, entry.latency_ns)
+            })
+            .collect()
     }
 
     /// Slow-I/O table rows, slowest first.
@@ -355,91 +390,106 @@ pub fn run(args: IoArgs) -> Result<()> {
     let rchar_delta = rchar_end.saturating_sub(rchar_start);
     let wchar_delta = wchar_end.saturating_sub(wchar_start);
 
-    println!("PID: {process_name} ({pid})");
-    println!(
-        "Duration: {}",
-        humantime::format_duration(collection.elapsed)
-    );
-    if collection.interrupted {
-        println!("Status: interrupted");
-    }
-    println!("Samples: {}", stats.latencies.len());
-    println!("Lost events: {}", stats.lost);
-    println!(
-        "Slow > {}: {}",
-        humantime::format_duration(threshold),
-        stats.slow
-    );
-    println!("rchar: {rchar_delta} bytes, wchar: {wchar_delta} bytes");
-    println!();
-
-    println!("I/O latency");
-    match stats.summary() {
-        Some(s) => {
-            println!("{:<8}{:>10}", "samples", s.count);
-            println!("{:<8}{:>10}", "p50", format_ns(s.p50_ns));
-            println!("{:<8}{:>10}", "p95", format_ns(s.p95_ns));
-            println!("{:<8}{:>10}", "p99", format_ns(s.p99_ns));
-            println!("{:<8}{:>10}", "max", format_ns(s.max_ns));
-            let (read, write, other) = stats.op_summary();
-            print_op_split(read, write, other);
+    if args.format.format == Format::Text {
+        println!("PID: {process_name} ({pid})");
+        println!(
+            "Duration: {}",
+            humantime::format_duration(collection.elapsed)
+        );
+        if collection.interrupted {
+            println!("Status: interrupted");
         }
-        None => println!("No I/O samples were collected."),
-    }
-    println!();
+        println!("Samples: {}", stats.latencies.len());
+        println!("Lost events: {}", stats.lost);
+        println!(
+            "Slow > {}: {}",
+            humantime::format_duration(threshold),
+            stats.slow
+        );
+        println!("rchar: {rchar_delta} bytes, wchar: {wchar_delta} bytes");
+        println!();
 
-    println!("Per-device latency");
-    let devices: Vec<(&u32, &DeviceStats)> = stats.by_device.iter().collect();
-    if devices.is_empty() {
-        println!("No per-device samples were collected.");
-    } else {
-        for (dev, device) in devices {
-            println!(
-                "dev {:<12} samples {:<6} sectors {}",
-                device_label(*dev),
-                device.count(),
-                device.sectors()
-            );
-            let (read, write, other) = (device.read, device.write, device.other);
-            print_op_split(read, write, other);
-            if let Some(s) = summary(&device.latencies) {
+        println!("I/O latency");
+        match stats.summary() {
+            Some(s) => {
+                println!("{:<8}{:>10}", "samples", s.count);
+                println!("{:<8}{:>10}", "p50", format_ns(s.p50_ns));
+                println!("{:<8}{:>10}", "p95", format_ns(s.p95_ns));
+                println!("{:<8}{:>10}", "p99", format_ns(s.p99_ns));
+                println!("{:<8}{:>10}", "max", format_ns(s.max_ns));
+                let (read, write, other) = stats.op_summary();
+                print_op_split(read, write, other);
+            }
+            None => println!("No I/O samples were collected."),
+        }
+        println!();
+
+        println!("Per-device latency");
+        let devices: Vec<(&u32, &DeviceStats)> = stats.by_device.iter().collect();
+        if devices.is_empty() {
+            println!("No per-device samples were collected.");
+        } else {
+            for (dev, device) in devices {
                 println!(
-                    "  p50 {:>10} p95 {:>10} p99 {:>10} max {:>10}",
-                    format_ns(s.p50_ns),
-                    format_ns(s.p95_ns),
-                    format_ns(s.p99_ns),
-                    format_ns(s.max_ns)
+                    "dev {:<12} samples {:<6} sectors {}",
+                    device_label(*dev),
+                    device.count(),
+                    device.sectors()
+                );
+                let (read, write, other) = (device.read, device.write, device.other);
+                print_op_split(read, write, other);
+                if let Some(s) = summary(&device.latencies) {
+                    println!(
+                        "  p50 {:>10} p95 {:>10} p99 {:>10} max {:>10}",
+                        format_ns(s.p50_ns),
+                        format_ns(s.p95_ns),
+                        format_ns(s.p99_ns),
+                        format_ns(s.max_ns)
+                    );
+                }
+            }
+        }
+        println!();
+
+        let slow_rows = stats.slow_table();
+        println!(
+            "Slow I/O > {} (top {} of {})",
+            humantime::format_duration(threshold),
+            slow_rows.len(),
+            stats.slow
+        );
+        if slow_rows.is_empty() {
+            println!("(none)");
+        } else {
+            println!(
+                "{:>10}  {:<12}  {:<5}  {:>8}  {:>9}  {:>7}",
+                "latency", "device", "op", "sectors", "bytes", "tid"
+            );
+            for row in slow_rows {
+                println!(
+                    "{:>10}  {:<12}  {:<5}  {:>8}  {:>9}  {:>7}",
+                    format_ns(row.latency_ns),
+                    device_label(row.event.dev),
+                    io_op_name(row.event.op),
+                    row.event.sectors,
+                    format_bytes(u64::from(row.event.sectors) * 512),
+                    row.event.tid
                 );
             }
         }
-    }
-    println!();
-
-    let slow_rows = stats.slow_table();
-    println!(
-        "Slow I/O > {} (top {} of {})",
-        humantime::format_duration(threshold),
-        slow_rows.len(),
-        stats.slow
-    );
-    if slow_rows.is_empty() {
-        println!("(none)");
     } else {
-        println!(
-            "{:>10}  {:<12}  {:<5}  {:>8}  {:>9}  {:>7}",
-            "latency", "device", "op", "sectors", "bytes", "tid"
+        json::emit(
+            args.format.format,
+            &Envelope::new(
+                "io",
+                pid,
+                Some(process_name),
+                collection.elapsed,
+                collection.interrupted,
+                collection.process_exited,
+                crate::json_payloads::io_json(&stats, rchar_delta, wchar_delta),
+            ),
         );
-        for row in slow_rows {
-            println!(
-                "{:>10}  {:<12}  {:<5}  {:>8}  {:>9}  {:>7}",
-                format_ns(row.latency_ns),
-                device_label(row.event.dev),
-                io_op_name(row.event.op),
-                row.event.sectors,
-                format_bytes(u64::from(row.event.sectors) * 512),
-                row.event.tid
-            );
-        }
     }
     Ok(())
 }

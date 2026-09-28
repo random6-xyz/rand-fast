@@ -7,7 +7,11 @@ use aya::{
 };
 use fast_common::{COLLECT_MEMORY, MemoryCounters};
 
-use crate::{cli::MemoryArgs, process, runtime};
+use crate::{
+    cli::MemoryArgs,
+    json::{self, Envelope, Format},
+    process, runtime,
+};
 
 /// How often the kernel-side counters are sampled. Short enough that a
 /// transient spike still shows up in a rate, long enough that reading one
@@ -190,11 +194,16 @@ pub fn format_faults(count: u64) -> String {
 /// One poll of every memory signal.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Sample {
-    at: Duration,
-    kernel: Totals,
-    faults: ProcFaults,
-    psi: Psi,
-    swap_kb: u64,
+    /// Wall time since collection started.
+    pub at: Duration,
+    /// Kernel-side counters, summed over the target threads.
+    pub kernel: Totals,
+    /// Process accounting fault counters.
+    pub faults: ProcFaults,
+    /// Memory PSI at this sample.
+    pub psi: Psi,
+    /// Swap in use at this sample, in KiB.
+    pub swap_kb: u64,
 }
 
 /// A rate derived from two samples.
@@ -298,7 +307,27 @@ pub fn run(args: MemoryArgs) -> Result<()> {
         },
     )?;
 
-    print_report(&process_name, pid, &summary, first.as_ref(), &last);
+    // Both output formats need the same derived numbers, so they are computed
+    // once here rather than inside whichever printer happens to run.
+    let rates = first.as_ref().map(|first| Rates::between(first, &last));
+    let psi_available = last.psi.available;
+
+    if args.format.format == Format::Json {
+        json::emit(
+            args.format.format,
+            &Envelope::new(
+                "memory",
+                pid,
+                Some(process_name),
+                summary.elapsed,
+                summary.interrupted,
+                summary.process_exited,
+                crate::json_payloads::memory_json(rates.as_ref(), psi_available, &last),
+            ),
+        );
+    } else {
+        print_report(&process_name, pid, &summary, first.as_ref(), &last);
+    }
     Ok(())
 }
 

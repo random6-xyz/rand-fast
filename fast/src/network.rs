@@ -4,7 +4,11 @@ use anyhow::{Context, Result};
 use aya::{Ebpf, include_bytes_aligned};
 use fast_common::{AF_INET, COLLECT_NET, TcpEvent};
 
-use crate::{cli::NetArgs, process, runtime};
+use crate::{
+    cli::NetArgs,
+    json::{self, Envelope, Format},
+    process, runtime,
+};
 
 /// RTT samples arrive at roughly the rate the socket sends and receives data.
 /// 64 pages (256 KiB) per CPU keeps event loss low.
@@ -253,75 +257,90 @@ pub fn run(args: NetArgs) -> Result<()> {
         },
     )?;
 
-    println!("PID: {process_name} ({pid})");
-    println!("Duration: {}", humantime::format_duration(summary.elapsed));
-    if summary.interrupted {
-        println!("Status: interrupted");
-    }
-    println!("Samples: {}", stats.samples());
-    println!("Retransmissions: {}", stats.retrans());
-    println!("Lost events: {}", stats.lost());
-    println!();
+    if args.format.format == Format::Text {
+        println!("PID: {process_name} ({pid})");
+        println!("Duration: {}", humantime::format_duration(summary.elapsed));
+        if summary.interrupted {
+            println!("Status: interrupted");
+        }
+        println!("Samples: {}", stats.samples());
+        println!("Retransmissions: {}", stats.retrans());
+        println!("Lost events: {}", stats.lost());
+        println!();
 
-    let ranked = stats.slowest_endpoints();
-    if ranked.is_empty() {
-        println!("Endpoints");
-        println!("No TCP samples collected.");
-        println!("Test with: fast-workload net-hog --duration 30s   (then observe its PID)");
-        return Ok(());
-    }
+        let ranked = stats.slowest_endpoints();
+        if ranked.is_empty() {
+            println!("Endpoints");
+            println!("No TCP samples collected.");
+            println!("Test with: fast-workload net-hog --duration 30s   (then observe its PID)");
+            return Ok(());
+        }
 
-    // The table leads with the slowest endpoint so the connection worth
-    // looking at is the first thing on screen. All latencies are in
-    // microseconds, and the ratio is retransmissions over observed segments.
-    println!(
-        "Slow endpoints by RTT p95 ({} of {} shown)",
-        ranked.len().min(MAX_REPORTED_ENDPOINTS),
-        ranked.len()
-    );
-    println!(
-        "  {:>8} {:>8} {:>8} {:>8} {:>8} {:>7}  endpoint",
-        "p95", "p50", "p99", "samples", "retrans", "ratio"
-    );
-    for endpoint in ranked.iter().take(MAX_REPORTED_ENDPOINTS) {
-        let (p50, p95, p99) = endpoint.rtt_percentiles();
+        // The table leads with the slowest endpoint so the connection worth
+        // looking at is the first thing on screen. All latencies are in
+        // microseconds, and the ratio is retransmissions over observed segments.
         println!(
-            "  {p95:>8} {p50:>8} {p99:>8} {:>8} {:>8} {:>6.1}%  {}",
-            endpoint.rtts.len(),
-            endpoint.retrans,
-            endpoint.retrans_ratio() * 100.0,
-            format_endpoint(endpoint),
+            "Slow endpoints by RTT p95 ({} of {} shown)",
+            ranked.len().min(MAX_REPORTED_ENDPOINTS),
+            ranked.len()
+        );
+        println!(
+            "  {:>8} {:>8} {:>8} {:>8} {:>8} {:>7}  endpoint",
+            "p95", "p50", "p99", "samples", "retrans", "ratio"
+        );
+        for endpoint in ranked.iter().take(MAX_REPORTED_ENDPOINTS) {
+            let (p50, p95, p99) = endpoint.rtt_percentiles();
+            println!(
+                "  {p95:>8} {p50:>8} {p99:>8} {:>8} {:>8} {:>6.1}%  {}",
+                endpoint.rtts.len(),
+                endpoint.retrans,
+                endpoint.retrans_ratio() * 100.0,
+                format_endpoint(endpoint),
+            );
+        }
+        if ranked.len() > MAX_REPORTED_ENDPOINTS {
+            println!(
+                "  ... {} more endpoint(s) not shown",
+                ranked.len() - MAX_REPORTED_ENDPOINTS
+            );
+        }
+
+        // The worst offender is called out on its own, because a table row is
+        // easy to skim past and this is the answer to "which remote is slow".
+        let worst = ranked[0];
+        let (_, worst_p95, _) = worst.rtt_percentiles();
+        println!();
+        println!("Slowest endpoint");
+        println!("  {} us p95", worst_p95);
+        println!("  {}", format_endpoint(worst));
+        if worst.retrans > 0 {
+            println!(
+                "  {} retransmissions, {:.1}% of {} observed segments",
+                worst.retrans,
+                worst.retrans_ratio() * 100.0,
+                worst.segments()
+            );
+        }
+        // A closed congestion window with retransmissions on top is what a
+        // struggling path looks like, so both are always named here.
+        println!(
+            "  congestion window {} segments, receive window {} bytes",
+            worst.max_cwnd, worst.max_rcv_wnd
+        );
+    } else {
+        json::emit(
+            args.format.format,
+            &Envelope::new(
+                "net",
+                pid,
+                Some(process_name),
+                summary.elapsed,
+                summary.interrupted,
+                false,
+                crate::json_payloads::network_json(&stats),
+            ),
         );
     }
-    if ranked.len() > MAX_REPORTED_ENDPOINTS {
-        println!(
-            "  ... {} more endpoint(s) not shown",
-            ranked.len() - MAX_REPORTED_ENDPOINTS
-        );
-    }
-
-    // The worst offender is called out on its own, because a table row is
-    // easy to skim past and this is the answer to "which remote is slow".
-    let worst = ranked[0];
-    let (_, worst_p95, _) = worst.rtt_percentiles();
-    println!();
-    println!("Slowest endpoint");
-    println!("  {} us p95", worst_p95);
-    println!("  {}", format_endpoint(worst));
-    if worst.retrans > 0 {
-        println!(
-            "  {} retransmissions, {:.1}% of {} observed segments",
-            worst.retrans,
-            worst.retrans_ratio() * 100.0,
-            worst.segments()
-        );
-    }
-    // A closed congestion window with retransmissions on top is what a
-    // struggling path looks like, so both are always named here.
-    println!(
-        "  congestion window {} segments, receive window {} bytes",
-        worst.max_cwnd, worst.max_rcv_wnd
-    );
     Ok(())
 }
 

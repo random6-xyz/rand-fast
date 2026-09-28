@@ -11,6 +11,7 @@ use fast_common::{
 
 use crate::{
     cli::OffCpuArgs,
+    json::{self, Envelope, Format},
     process, runtime,
     symbolize::{Frame, StackMaps, StackSymbolizer},
 };
@@ -24,6 +25,10 @@ const MAX_STACKS_SHOWN: usize = 5;
 
 /// How many frames of each stack are printed.
 const MAX_FRAMES_SHOWN: usize = 8;
+
+/// How many wait stacks a JSON document carries. The document is meant to be
+/// read by a program, so it stays smaller than the human table.
+pub const MAX_STACKS_JSON: usize = 20;
 
 /// A wait reason, either the coarse one the kernel task state gives or the
 /// finer one recovered from the symbolized blocking stack.
@@ -130,16 +135,16 @@ fn is_io_frame(symbol: &str) -> bool {
 #[derive(Debug, Default, Clone)]
 pub struct WaitStack {
     /// Number of waits that ended here.
-    samples: usize,
+    pub samples: usize,
     /// Summed wait time, in nanoseconds. This is the ranking signal: a stack
     /// hit rarely but for a long time matters more than one hit constantly
     /// for microseconds.
-    total_ns: u64,
+    pub total_ns: u64,
     /// Longest single wait, in nanoseconds.
-    max_ns: u64,
+    pub max_ns: u64,
     /// The reason the last event for this stack resolved to. A stack is one
     /// blocking path, so it has one reason.
-    reason: WaitReason,
+    pub reason: WaitReason,
 }
 
 /// Aggregated off-CPU statistics for one run.
@@ -166,7 +171,7 @@ impl OffCpuStats {
     }
 
     /// Records a wait whose reason has already been resolved.
-    fn record_with(&mut self, event: OffCpuEvent, reason: WaitReason) {
+    pub(crate) fn record_with(&mut self, event: OffCpuEvent, reason: WaitReason) {
         self.waits.push(event.wait_ns);
 
         let entry = self.by_stack.entry(event.stack_id).or_default();
@@ -369,15 +374,29 @@ pub fn run(args: OffCpuArgs) -> Result<()> {
 
     refine_reasons(&mut stats, &stack_maps, &mut symbolizer);
 
-    print_report(
-        &process_name,
-        pid,
-        summary.elapsed,
-        &stats,
-        summary.interrupted,
-    );
-
-    print_stacks(&mut symbolizer, &stats, &stack_maps);
+    if args.format.format == Format::Json {
+        json::emit(
+            args.format.format,
+            &Envelope::new(
+                "off-cpu",
+                pid,
+                Some(process_name),
+                summary.elapsed,
+                summary.interrupted,
+                summary.process_exited,
+                crate::json_payloads::offcpu_json(&stats),
+            ),
+        );
+    } else {
+        print_report(
+            &process_name,
+            pid,
+            summary.elapsed,
+            &stats,
+            summary.interrupted,
+        );
+        print_stacks(&mut symbolizer, &stats, &stack_maps);
+    }
     Ok(())
 }
 

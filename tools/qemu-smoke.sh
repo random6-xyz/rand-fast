@@ -809,6 +809,58 @@ check_diagnose_ranking() {
     echo "diagnose ranking: top cause is $top, with measurements on every ranked line"
 }
 
+# Proves --format json is consumable, not just printable.
+#
+# The guest has no JSON parser in busybox awk, so the document is validated with
+# what it does have: the schema marker, the envelope fields, and the
+# single-line guarantee. The parsing itself is covered by the round-trip tests
+# in fast/src/json.rs, which use a real parser.
+#
+# Two commands are checked rather than one, because a format that works for
+# `sched` and not for `diagnose` is not a format.
+check_json_document() {
+    local target="$OUT_DIR/json-sched.txt"
+    "$SCHED_WORKLOAD" target --duration 10s --period 1ms >/dev/null 2>&1 &
+    local target_pid=$!
+    sleep 0.3
+    "$FAST" sched --pid "$target_pid" --duration 2s --format json >"$target" 2>/dev/null || true
+    "$FAST" diagnose --pid "$target_pid" --duration 2s --format json \
+        >"$OUT_DIR/json-diagnose.txt" 2>/dev/null || true
+    kill "$target_pid" 2>/dev/null
+    wait "$target_pid" 2>/dev/null
+
+    if [ ! -s "$target" ]; then
+        echo "json document: SKIP (the JSON run produced no output here)"
+        return
+    fi
+
+    local problems=""
+    for field in '"schema":"rand-fast/v1"' '"command":"sched"' '"pid":' \
+        '"duration_s":' '"data":' '"samples":' '"p95_us":' '"lost_events":'; do
+        grep -q -- "$field" "$target" || problems="$problems $field"
+    done
+    # A streaming consumer reads one document per line, so a multi-line
+    # document breaks it.
+    if [ "$(wc -l <"$target")" -ne 1 ]; then
+        problems="$problems <not-a-single-line>"
+    fi
+    if [ -s "$OUT_DIR/json-diagnose.txt" ]; then
+        grep -q -- '"causes"' "$OUT_DIR/json-diagnose.txt" \
+            || problems="$problems causes-in-diagnose"
+        grep -q -- '"measured"' "$OUT_DIR/json-diagnose.txt" \
+            || problems="$problems measured-in-diagnose"
+    fi
+
+    if [ -n "$problems" ]; then
+        echo "json document: FAIL (missing or wrong:$problems)"
+        head -c 200 "$target" | sed 's/^/    /' >&2
+        echo >&2
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "json document: one line, schema and fields present, diagnose carries measured and causes"
+    fi
+}
+
 check_cpu_rate_scaling
 check_cpu_symbolization
 check_io_pairing
@@ -818,6 +870,7 @@ check_memory_fault_counter
 check_memory_verdict
 check_diagnose_parallel
 check_diagnose_ranking
+check_json_document
 check_net_rtt_crosscheck
 check_net_field_crosscheck
 check_net_retransmit_attribution

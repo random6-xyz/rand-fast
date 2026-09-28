@@ -103,18 +103,49 @@ mod chrono {
     }
 }
 
-pub fn run_daemon(pid: u32, duration: Duration, trigger: Duration, output: PathBuf) -> Result<()> {
+/// The `daemon` command's `data` object.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DaemonJson {
+    /// The scheduler p95 above which an incident is preserved.
+    pub trigger_p95_us: u64,
+    /// Rolling window the ring covers, in seconds.
+    pub ring_seconds: u64,
+    /// Entries the ring holds at most.
+    pub ring_entries: u64,
+    /// Documented overhead budget, CPU percent.
+    pub budget_cpu_pct: f64,
+    /// Documented overhead budget, memory in bytes.
+    pub budget_memory_bytes: u64,
+    /// Where incidents are written.
+    pub output_dir: String,
+    /// Incidents preserved during this run.
+    pub incidents: u64,
+    /// Wall time the recorder ran.
+    pub ran_s: f64,
+}
+
+/// Runs the flight recorder.
+#[allow(clippy::too_many_arguments)]
+pub fn run_daemon(
+    pid: u32,
+    duration: Duration,
+    trigger: Duration,
+    output: PathBuf,
+    format: crate::json::Format,
+) -> Result<()> {
     let process_name = process::read_name(pid).with_context(|| format!("read {pid}"))?;
-    println!("Flight recorder for {process_name} ({pid})");
-    println!(
-        "Budget: CPU <2%, mem <{}MB, rolling {}s",
-        DEFAULT_BUDGET_MB, DEFAULT_RING_SECS
-    );
-    println!(
-        "Trigger: scheduler p95 > {}",
-        humantime::format_duration(trigger)
-    );
-    println!("Output: {}", output.display());
+    if format == crate::json::Format::Text {
+        println!("Flight recorder for {process_name} ({pid})");
+        println!(
+            "Budget: CPU <2%, mem <{}MB, rolling {}s",
+            DEFAULT_BUDGET_MB, DEFAULT_RING_SECS
+        );
+        println!(
+            "Trigger: scheduler p95 > {}",
+            humantime::format_duration(trigger)
+        );
+        println!("Output: {}", output.display());
+    }
 
     let trigger_us = trigger.as_micros() as u64;
     let mut recorder = FlightRecorder::new(trigger_us, output.clone());
@@ -163,16 +194,40 @@ pub fn run_daemon(pid: u32, duration: Duration, trigger: Duration, output: PathB
         }
     }
 
-    println!(
-        "Flight recorder stopped after {}",
-        humantime::format_duration(started.elapsed())
-    );
-    println!("Incidents preserved: {}", incident_count);
-    println!("Resource budget: {}", recorder.resource_budget());
-    println!(
-        "Restart behavior: ring persists to {} and reloads on start",
-        output.display()
-    );
+    if format == crate::json::Format::Json {
+        crate::json::emit(
+            format,
+            &crate::json::Envelope::new(
+                "daemon",
+                pid,
+                Some(process_name),
+                started.elapsed(),
+                false,
+                false,
+                DaemonJson {
+                    trigger_p95_us: trigger_us,
+                    ring_seconds: DEFAULT_RING_SECS,
+                    ring_entries: recorder.max_entries as u64,
+                    budget_cpu_pct: 2.0,
+                    budget_memory_bytes: (DEFAULT_BUDGET_MB as u64) * 1024 * 1024,
+                    output_dir: output.display().to_string(),
+                    incidents: incident_count,
+                    ran_s: started.elapsed().as_secs_f64(),
+                },
+            ),
+        );
+    } else {
+        println!(
+            "Flight recorder stopped after {}",
+            humantime::format_duration(started.elapsed())
+        );
+        println!("Incidents preserved: {}", incident_count);
+        println!("Resource budget: {}", recorder.resource_budget());
+        println!(
+            "Restart behavior: ring persists to {} and reloads on start",
+            output.display()
+        );
+    }
     Ok(())
 }
 

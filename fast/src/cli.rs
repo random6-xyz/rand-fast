@@ -2,11 +2,21 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::json::Format;
+
 #[derive(Debug, Parser)]
 #[command(name = "fast", version, about = "Linux performance diagnostics")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// Adds the shared `--format` flag to a subcommand's arguments.
+#[derive(Debug, Clone, Args)]
+pub struct FormatArg {
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = Format::Text)]
+    pub format: Format,
 }
 
 #[derive(Debug, Subcommand)]
@@ -38,6 +48,9 @@ pub struct SchedArgs {
     /// Collection duration, for example 10s or 500ms.
     #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
     pub duration: Duration,
+
+    #[command(flatten)]
+    pub format: FormatArg,
 }
 
 fn parse_pid(value: &str) -> Result<u32, String> {
@@ -88,6 +101,9 @@ pub struct CpuArgs {
     /// On-CPU sampling frequency in Hz (default 99).
     #[arg(long, value_name = "HZ", default_value_t = 99, value_parser = parse_frequency)]
     pub frequency: u64,
+
+    #[command(flatten)]
+    pub format: FormatArg,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -103,6 +119,9 @@ pub struct IoArgs {
     /// Slow I/O threshold (default 10ms).
     #[arg(long, default_value = "10ms", value_parser = parse_duration)]
     pub threshold: Duration,
+
+    #[command(flatten)]
+    pub format: FormatArg,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -114,6 +133,9 @@ pub struct NetArgs {
     /// Collection duration, for example 10s or 500ms.
     #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
     pub duration: Duration,
+
+    #[command(flatten)]
+    pub format: FormatArg,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -125,6 +147,9 @@ pub struct OffCpuArgs {
     /// Collection duration, for example 10s or 500ms.
     #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
     pub duration: Duration,
+
+    #[command(flatten)]
+    pub format: FormatArg,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -136,6 +161,9 @@ pub struct MemoryArgs {
     /// Collection duration, for example 10s or 500ms.
     #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
     pub duration: Duration,
+
+    #[command(flatten)]
+    pub format: FormatArg,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -147,6 +175,9 @@ pub struct DiagnoseArgs {
     /// Collection duration, for example 10s or 500ms.
     #[arg(long, default_value = "10s", value_parser = parse_duration)]
     pub duration: Duration,
+
+    #[command(flatten)]
+    pub format: FormatArg,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -166,6 +197,9 @@ pub struct DaemonArgs {
     /// Output directory for incidents.
     #[arg(long, default_value = "./incidents")]
     pub output: std::path::PathBuf,
+
+    #[command(flatten)]
+    pub format: FormatArg,
 }
 
 #[cfg(test)]
