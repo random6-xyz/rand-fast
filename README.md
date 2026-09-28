@@ -234,18 +234,18 @@ TCP events: 412
 Retransmitted: 4 (1.0% of segments seen)
 
 Endpoints, ranked by p95 round trip
-  127.0.0.1:41882 -> 127.0.0.1:8080   p95  31484us  median     1199us  retrans 2
-  127.0.0.1:41884 -> 127.0.0.1:8080   p95  31002us  median     1197us  retrans 2
+  127.0.0.1:41882 -> 127.0.0.1:8080   p95  31476us  median     1198us  retrans 2
+  127.0.0.1:41884 -> 127.0.0.1:8080   p95  31011us  median     1196us  retrans 2
 ```
 
 Verification, from the recorded QEMU run:
 
 - `net field cross-check`: the tool reports `snd_cwnd` 10 where the kernel's own
   `ss -ti` reports 10, so the fields are read from the right offsets.
-- `net rtt cross-check`: 43 µs measured against `ss -ti` at 45 µs.
+- `net rtt cross-check`: 43 µs measured against `ss -ti` at 44 µs.
 - `net retransmit attribution`: 24 retransmissions across 2 endpoints.
 - `net endpoint ranking`: a degraded link separates cleanly from a healthy one,
-  50 µs on plain loopback against 31484 µs p95 under the fixture.
+  51 µs on plain loopback against 31476 µs p95 under the fixture (617x).
 
 To produce real retransmissions, the fixture cycles the receive window. The
 alternative, `tc qdisc add dev lo root netem loss 1%`, needs `netem`, which the
@@ -295,10 +295,10 @@ stack 210    samples 294700
 
 Verification, from the recorded run:
 
-- off-CPU shape: 0 waits for a CPU-bound process against 225356 for
+- off-CPU shape: 0 waits for a CPU-bound process against 235937 for
   lock-hog. A process that never blocks is not reported as blocked.
-- off-CPU ranking: futex is the top reason for lock-hog, 1.13 s of total
-  off-CPU time, leading stack 2.4 ms max over 161007 waits.
+- off-CPU ranking: futex is the top reason for lock-hog, 1.40 s of total
+  off-CPU time, leading stack 3.0 ms max over 217371 waits.
 
 Use more workers than CPUs so waiters actually park instead of spinning.
 
@@ -322,9 +322,9 @@ PID: fast-workload (18800)
 Duration: 5s
 
 Verdict: heavy allocation, but nothing under pressure
-  1026921 minor faults/s, at or above the 100000/s threshold
-eBPF user faults: 4,119,497 (1026914/s)
-minor 4,707,528 (1026921/s)  major 0 (0/s)
+  1020244 minor faults/s, at or above the 100000/s threshold
+eBPF user faults: 4,080,977 (1020244/s)
+minor 4,081,000 (1020244/s)  major 0 (0/s)
 direct reclaim: 0 (0.0/s)
 memory psi: unavailable (kernel built without CONFIG_PSI)
 swap used: 0 KiB
@@ -338,10 +338,10 @@ making a claim it has no evidence for.
 
 Verification, from the recorded run:
 
-- memory fault counter: 1026914 user faults/s from eBPF against 1026921
+- memory fault counter: 1020240 user faults/s from eBPF against 1020244
   minor faults/s from `/proc` — 100.00% agreement between two independent
   sources, which is the check that the map counters are not drifting.
-- memory verdict: `page` at 1026921 faults/s against `idle` at 0/s, so the
+- memory verdict: `page` at 1020244 faults/s against `idle` at 0/s, so the
   verdict moves with the measurement.
 
 ### `fast diagnose`
@@ -627,35 +627,38 @@ Recorded results (QEMU KVM guest, 8 vCPUs, kernel 7.2.3-arch1-3 with BTF,
 2026-09-08, v1.0 code; the `sched` 7.2.0-rc6 row keeps the earlier record):
 
 Recorded on the kernel-server `bpf-next` image (7.2.0-rc6, 8 vCPUs, BTF
-present, no `CONFIG_PSI`), 4 s per case, `tools/qemu-run.sh`:
+present, no `CONFIG_PSI`), 4 s per case, `tools/qemu-run.sh`, matrix `rc=0`:
 
 | Command   | Verifier | Idle                                   | Load                                            |
 | --------- | -------- | -------------------------------------- | ----------------------------------------------- |
 | `sched`   | pass     | p95 7µs                                | p95 1µs on the busiest core, 3 samples over 1ms |
 | `cpu`     | pass     | 2 samples, usage 0.1%                  | 3167 samples, usage 99.8%                       |
 | `io`      | pass     | 0 samples                              | 193858 samples, 758.8 MiB read                  |
-| `net`     | pass     | 0 retransmissions                      | 24 retransmissions across 2 endpoints           |
-| `off-cpu` | pass     | 3693 samples                           | 161301 samples                                  |
-| `memory`  | pass     | 0 faults/s                             | 1026921 faults/s, 100.00% agreement with `/proc` |
-| `diagnose`| pass     | 135790 scheduler + 134956 off-CPU samples from one run | all five scenarios ranked the intended cause first |
-| `daemon`  | pass     | 4% of one core, 572 KiB                | three trigger cases, one per fixture            |
+| `net`     | pass     | 0 retransmissions                      | 24 retransmissions across 2 endpoints, p95 31476µs |
+| `off-cpu` | pass     | 3693 samples                           | 235937 samples                                  |
+| `memory`  | pass     | 0 faults/s                             | 1020244 faults/s, 100.00% agreement with `/proc` |
+| `diagnose`| pass     | 168713 scheduler + 167740 off-CPU samples from one run | all five scenarios ranked the intended cause first |
+| `daemon`  | pass     | 3.99% of one core, within both budgets  | three trigger cases and a storage case           |
 
 Accuracy checks from the same run (`tools/qemu-smoke.sh` prints each one):
 
-- cpu rate scaling: 3174 samples at 99 Hz → 12573 samples at 396 Hz against
-  the same hog (3.96x, expected ~4x) — sample count tracks frequency × CPU
+- cpu rate scaling: 3965 samples at 99 Hz → 15803 samples at 396 Hz against
+  the same hog (3.99x, expected ~4x) — sample count tracks frequency × CPU
   time, not wakeups.
 - cpu symbolization: the lock-hog futex wait path appears symbolized
   (`futex_wait` / `do_futex` kernel frames plus user frames).
-- io per-request pairing: completions match issues within a few percent.
-- off-CPU shape: 0 waits for the CPU-bound hog against 225356 for lock-hog, so
+- io per-request pairing: 384198 completions for 394688 reads (97.3%).
+- off-CPU shape: 0 waits for the CPU-bound hog against 235937 for lock-hog, so
   a process that never blocks is not reported as blocked.
-- off-CPU ranking: futex is the top reason for lock-hog, 1.13 s of total
-  off-CPU time, leading stack 2.4 ms max over 161007 waits.
-- memory fault counter: 1026914 user faults/s from eBPF against 1026921
+- off-CPU ranking: futex is the top reason for lock-hog, 1.40 s of total
+  off-CPU time, leading stack 3.0 ms max over 217371 waits.
+- memory fault counter: 1020240 user faults/s from eBPF against 1020244
   minor faults/s from `/proc` (100.00% agreement).
+- net RTT cross-check: 43 µs against `ss -ti` at 44 µs (1.02x, inside a 2x
+  tolerance).
 - net field cross-check: `snd_cwnd` 10 against the kernel's own `ss` at 10.
-- net RTT cross-check: 43 µs against `ss -ti` at 45 µs.
+- net RTT separation: 51 µs on plain loopback against 31476 µs with the receive
+  window cycling shut (617x).
 - json document: one line, schema and fields present.
 
 All seven eBPF-backed programs load and attach in the guest, and every load
