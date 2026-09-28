@@ -686,12 +686,58 @@ check_memory_fault_counter() {
     fi
 }
 
+# Proves the memory verdict tells idle from pressure.
+#
+# The two runs differ only in the workload, and both are read through the same
+# report, so a verdict that cannot separate them is not usable. mem-hog
+# allocates and touches memory continuously, which drives the fault rate up;
+# the scheduled target is a periodic sleeper, which is the idle case.
+#
+# The pressure half is asserted on the fault rate rather than on reclaim,
+# because the guest has no swap device and its root filesystem is an initramfs
+# in RAM, so there are no disk-backed pages to fault in, and reclaim only
+# appears once the guest runs out of memory. The unit tests cover the reclaim
+# and swap branches of the verdict, which this environment cannot reach.
+check_memory_verdict() {
+    local load="$OUT_DIR/memory-load.txt" idle="$OUT_DIR/memory.txt"
+    if [ ! -f "$load" ] || [ ! -f "$idle" ]; then
+        echo "memory verdict: SKIP (no memory reports from the matrix)"
+        return
+    fi
+
+    local load_verdict idle_verdict load_rate idle_rate
+    load_verdict=$(awk '/^Verdict:/ { print $2; exit }' "$load")
+    idle_verdict=$(awk '/^Verdict:/ { print $2; exit }' "$idle")
+    load_rate=$(awk '/^ *minor / { v = $3; gsub(/[^0-9]/, "", v); print v; exit }' "$load")
+    idle_rate=$(awk '/^ *minor / { v = $3; gsub(/[^0-9]/, "", v); print v; exit }' "$idle")
+
+    if [ -z "${load_rate:-}" ] || [ -z "${idle_rate:-}" ] || [ "$load_rate" -eq 0 ]; then
+        echo "memory verdict: FAIL (no fault rates in the reports)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if [ "$load_rate" -le "$idle_rate" ]; then
+        echo "memory verdict: FAIL (mem-hog faulted $load_rate/s, no more than the idle target's $idle_rate/s)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    # The load run must be named as more than idle: either real churn or real
+    # pressure. Anything else means the thresholds never engage.
+    if [ "$load_verdict" = "idle" ]; then
+        echo "memory verdict: FAIL (mem-hog at $load_rate minor faults/s was still called idle)"
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "memory verdict: $load_verdict at $load_rate minor faults/s against $idle_verdict at $idle_rate/s"
+    fi
+}
+
 check_cpu_rate_scaling
 check_cpu_symbolization
 check_io_pairing
 check_offcpu_shape
 check_offcpu_ranking
 check_memory_fault_counter
+check_memory_verdict
 check_net_rtt_crosscheck
 check_net_field_crosscheck
 check_net_retransmit_attribution

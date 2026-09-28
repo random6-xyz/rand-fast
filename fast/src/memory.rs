@@ -216,9 +216,20 @@ pub struct Rates {
     pub psi_full_pct: f32,
     /// Highest swap usage in the window, in KiB.
     pub swap_kb: u64,
+    /// Swap usage at the start of the window, in KiB.
+    pub swap_start_kb: u64,
 }
 
 impl Rates {
+    /// Swap that appeared during the window, in KiB.
+    ///
+    /// Swap already resident says something about how the machine is
+    /// configured; swap that appeared during the window says something about
+    /// what this process did.
+    pub fn swap_delta_kb(&self) -> u64 {
+        self.swap_kb.saturating_sub(self.swap_start_kb)
+    }
+
     /// Derives rates from two consecutive samples.
     pub fn between(first: &Sample, last: &Sample) -> Self {
         let window = last
@@ -237,13 +248,8 @@ impl Rates {
             psi_some_pct: last.psi.some_pct.max(first.psi.some_pct),
             psi_full_pct: last.psi.full_pct.max(first.psi.full_pct),
             swap_kb: last.swap_kb.max(first.swap_kb),
+            swap_start_kb: first.swap_kb,
         }
-    }
-
-    /// True when the kernel exposes PSI at all, which decides whether a zero
-    /// means "no pressure" or "cannot tell".
-    pub fn psi_available(&self) -> bool {
-        self.psi_some_pct > 0.0 || self.psi_full_pct > 0.0
     }
 }
 
@@ -317,7 +323,16 @@ fn print_report(
         return;
     };
     let rates = Rates::between(first, last);
+    // Whether PSI is readable decides if a zero means "no pressure" or
+    // "cannot tell", so it is carried separately from the values.
+    let psi_available = last.psi.available;
+    let (verdict, reasons) = Verdict::assess(&rates, psi_available);
+
     println!("Window: {}", humantime::format_duration(rates.window));
+    println!("Verdict: {}", verdict.label());
+    for reason in &reasons {
+        println!("  - {reason}");
+    }
     println!();
     println!("Page faults");
     println!(
@@ -341,16 +356,149 @@ fn print_report(
     println!("Pressure");
     println!(
         "  PSI memory: {}",
-        if rates.psi_available() {
+        if psi_available {
             format!(
                 "some {:.1}%  full {:.1}%",
                 rates.psi_some_pct, rates.psi_full_pct
             )
         } else {
+            // Naming the absence matters: a zero here would otherwise read as
+            // "no pressure" when it really means "cannot tell".
             "unavailable (kernel built without CONFIG_PSI)".to_string()
         }
     );
-    println!("  swap used: {} KiB", rates.swap_kb);
+    println!(
+        "  swap used: {} KiB ({} KiB new over the window)",
+        rates.swap_kb,
+        rates.swap_delta_kb()
+    );
+}
+
+/// Documented thresholds for the memory verdict.
+///
+/// They are collected here rather than inlined so the diagnosis report can
+/// rank memory against the same numbers, and so a change to what counts as
+/// pressure is a single reviewable edit.
+pub mod threshold {
+    /// Major faults per second above which the process is fetching pages from
+    /// storage. One per second is well above background noise and low enough
+    /// to catch a genuinely disk-bound process.
+    pub const MAJOR_FAULTS_PER_S: f64 = 1.0;
+
+    /// Direct reclaim attempts per second above which the process is stalling
+    /// on memory itself. This is the strongest per-process signal there is:
+    /// the task has nowhere to run until pages come back. A tenth of a
+    /// reclaim per second is already sustained, not a one-off.
+    pub const RECLAIMS_PER_S: f64 = 0.1;
+
+    /// PSI memory some above which the system is spending real time stalled.
+    pub const PSI_SOME_PCT: f32 = 1.0;
+
+    /// PSI memory full above which every non-idle task is stalled at once,
+    /// which stops being a local problem.
+    pub const PSI_FULL_PCT: f32 = 5.0;
+
+    /// Minor faults per second above which the process is doing enough
+    /// allocation churn to be worth naming even when nothing is under
+    /// pressure. It is a hint, not a diagnosis.
+    pub const MINOR_FAULTS_PER_S_CHURN: f64 = 100_000.0;
+
+    /// Swap growth in KiB over the window that counts as the system leaning on
+    /// swap rather than merely having some resident.
+    pub const SWAP_DELTA_KB: u64 = 1024;
+}
+
+/// What the measurements say about a process' memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Nothing worth naming: no faults, no reclaim, no pressure.
+    Idle,
+    /// The process is allocating hard but nothing is wrong: a high minor fault
+    /// rate with no storage, reclaim or PSI cost behind it.
+    PageChurn,
+    /// The process is fetching pages from storage or reclaiming for itself.
+    Pressure,
+    /// Every non-idle task is stalled at once, so the pressure is system wide.
+    Severe,
+}
+
+impl Verdict {
+    /// The headline word in the report.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::PageChurn => "page churn",
+            Self::Pressure => "memory pressure",
+            Self::Severe => "severe memory pressure",
+        }
+    }
+
+    /// Derives the verdict and the reasons behind it from one window.
+    ///
+    /// The reasons come back alongside the label because a verdict a user
+    /// cannot check is one they will not trust: each string names the
+    /// measurement and the threshold it crossed. `psi_available` is passed
+    /// separately so an absent PSI cannot be mistaken for a zero reading.
+    pub fn assess(rates: &Rates, psi_available: bool) -> (Self, Vec<String>) {
+        use threshold::*;
+
+        let mut reasons = Vec::new();
+        let mut pressure = false;
+
+        if rates.major_per_s >= MAJOR_FAULTS_PER_S {
+            reasons.push(format!(
+                "{:.1} major faults/s, at or above the {MAJOR_FAULTS_PER_S:.1}/s threshold: pages are coming from storage",
+                rates.major_per_s
+            ));
+            pressure = true;
+        }
+        if rates.reclaims_per_s >= RECLAIMS_PER_S {
+            reasons.push(format!(
+                "{:.1} direct reclaims/s, at or above the {RECLAIMS_PER_S:.1}/s threshold: the process stalled waiting for memory",
+                rates.reclaims_per_s
+            ));
+            pressure = true;
+        }
+        if rates.swap_delta_kb() >= SWAP_DELTA_KB {
+            reasons.push(format!(
+                "{} KiB of new swap over the window, at or above the {SWAP_DELTA_KB} KiB threshold: the system leaned on swap",
+                rates.swap_delta_kb()
+            ));
+            pressure = true;
+        }
+        if psi_available {
+            if rates.psi_full_pct >= PSI_FULL_PCT {
+                reasons.push(format!(
+                    "memory PSI {:.1}% full, at or above the {PSI_FULL_PCT:.1}% threshold: all non-idle tasks are stalled",
+                    rates.psi_full_pct
+                ));
+                return (Self::Severe, reasons);
+            }
+            if rates.psi_some_pct >= PSI_SOME_PCT {
+                reasons.push(format!(
+                    "memory PSI {:.1}% some, at or above the {PSI_SOME_PCT:.1}% threshold: tasks are spending time stalled",
+                    rates.psi_some_pct
+                ));
+                pressure = true;
+            }
+        }
+
+        if pressure {
+            return (Self::Pressure, reasons);
+        }
+        if rates.minor_per_s >= MINOR_FAULTS_PER_S_CHURN {
+            reasons.push(format!(
+                "{:.0} minor faults/s, at or above the {MINOR_FAULTS_PER_S_CHURN:.0}/s threshold: heavy allocation, but nothing under pressure",
+                rates.minor_per_s
+            ));
+            return (Self::PageChurn, reasons);
+        }
+        reasons.push(format!(
+            "{:.0} minor faults/s, {:.1} major faults/s and {:.1} reclaims/s, all under their thresholds",
+            rates.minor_per_s, rates.major_per_s, rates.reclaims_per_s
+        ));
+        (Self::Idle, reasons)
+    }
 }
 
 #[cfg(test)]
@@ -464,5 +612,187 @@ mod tests {
         let pid = std::process::id();
         let faults = read_proc_faults(pid).expect("read own fault counters");
         assert!(faults.minor > 0, "a running process has taken minor faults");
+    }
+}
+
+#[cfg(test)]
+mod verdict_tests {
+    use super::*;
+
+    /// A window where nothing is happening.
+    fn idle() -> Rates {
+        Rates {
+            window: Duration::from_secs(10),
+            faults_per_s: 12.0,
+            minor_per_s: 12.0,
+            major_per_s: 0.0,
+            reclaims_per_s: 0.0,
+            psi_some_pct: 0.0,
+            psi_full_pct: 0.0,
+            swap_kb: 0,
+            swap_start_kb: 0,
+        }
+    }
+
+    #[test]
+    fn an_uneventful_process_is_idle() {
+        let (verdict, reasons) = Verdict::assess(&idle(), true);
+        assert_eq!(verdict, Verdict::Idle);
+        assert_eq!(verdict.label(), "idle");
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("under their thresholds"));
+    }
+
+    #[test]
+    fn heavy_allocation_without_cost_is_churn_not_pressure() {
+        // The distinction that matters: a million faults a second is only
+        // worth naming as churn while nothing is actually stalling.
+        let rates = Rates {
+            minor_per_s: 1_000_000.0,
+            ..idle()
+        };
+        let (verdict, reasons) = Verdict::assess(&rates, true);
+        assert_eq!(verdict, Verdict::PageChurn);
+        assert!(reasons[0].contains("heavy allocation"));
+    }
+
+    #[test]
+    fn major_faults_mean_pressure() {
+        let rates = Rates {
+            major_per_s: 12.5,
+            ..idle()
+        };
+        let (verdict, reasons) = Verdict::assess(&rates, true);
+        assert_eq!(verdict, Verdict::Pressure);
+        assert!(reasons[0].contains("coming from storage"));
+    }
+
+    #[test]
+    fn direct_reclaim_means_pressure_even_with_no_major_faults() {
+        // This is the signal that survives on a machine with no disk-backed
+        // pages, which is exactly the case the QEMU guest is in.
+        let rates = Rates {
+            reclaims_per_s: 3.0,
+            ..idle()
+        };
+        let (verdict, reasons) = Verdict::assess(&rates, true);
+        assert_eq!(verdict, Verdict::Pressure);
+        assert!(reasons[0].contains("stalled waiting for memory"));
+    }
+
+    #[test]
+    fn swap_growth_means_pressure() {
+        let rates = Rates {
+            swap_start_kb: 0,
+            swap_kb: 8 * 1024,
+            ..idle()
+        };
+        let (verdict, reasons) = Verdict::assess(&rates, true);
+        assert_eq!(verdict, Verdict::Pressure);
+        assert!(reasons[0].contains("leaned on swap"));
+    }
+
+    #[test]
+    fn resident_swap_alone_is_not_pressure() {
+        // Swap that was already in use says how the machine is configured, not
+        // what this process just did, so it must not raise the verdict.
+        let rates = Rates {
+            swap_start_kb: 8 * 1024,
+            swap_kb: 8 * 1024,
+            ..idle()
+        };
+        let (verdict, _) = Verdict::assess(&rates, true);
+        assert_eq!(verdict, Verdict::Idle);
+    }
+
+    #[test]
+    fn psi_some_means_pressure() {
+        let rates = Rates {
+            psi_some_pct: 3.0,
+            ..idle()
+        };
+        let (verdict, reasons) = Verdict::assess(&rates, true);
+        assert_eq!(verdict, Verdict::Pressure);
+        assert!(reasons[0].contains("spending time stalled"));
+    }
+
+    #[test]
+    fn psi_full_means_severe_and_outranks_everything_else() {
+        let rates = Rates {
+            psi_some_pct: 90.0,
+            psi_full_pct: 40.0,
+            major_per_s: 500.0,
+            ..idle()
+        };
+        let (verdict, reasons) = Verdict::assess(&rates, true);
+        assert_eq!(verdict, Verdict::Severe);
+        assert!(reasons.last().unwrap().contains("all non-idle tasks"));
+    }
+
+    #[test]
+    fn a_missing_psi_never_raises_the_verdict_on_its_own() {
+        // Same measurements, PSI absent. The verdict must be unchanged, and no
+        // PSI reason may appear, so a kernel without CONFIG_PSI cannot invent
+        // pressure out of an absent file.
+        let rates = Rates {
+            psi_some_pct: 50.0,
+            psi_full_pct: 20.0,
+            ..idle()
+        };
+        let (verdict, reasons) = Verdict::assess(&rates, false);
+        assert_eq!(verdict, Verdict::Idle);
+        assert!(!reasons.iter().any(|reason| reason.contains("PSI")));
+    }
+
+    #[test]
+    fn a_missing_psi_does_not_hide_other_evidence() {
+        let rates = Rates {
+            major_per_s: 40.0,
+            psi_some_pct: 50.0,
+            psi_full_pct: 20.0,
+            ..idle()
+        };
+        let (verdict, reasons) = Verdict::assess(&rates, false);
+        assert_eq!(verdict, Verdict::Pressure);
+        assert!(reasons[0].contains("coming from storage"));
+    }
+
+    #[test]
+    fn reasons_accumulate_across_signals() {
+        let rates = Rates {
+            major_per_s: 5.0,
+            reclaims_per_s: 2.0,
+            psi_some_pct: 4.0,
+            swap_start_kb: 0,
+            swap_kb: 4 * 1024,
+            ..idle()
+        };
+        let (verdict, reasons) = Verdict::assess(&rates, true);
+        assert_eq!(verdict, Verdict::Pressure);
+        assert_eq!(
+            reasons.len(),
+            4,
+            "every crossed signal is named: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn swap_delta_is_relative_to_the_window_start() {
+        let rates = Rates {
+            swap_start_kb: 4096,
+            swap_kb: 6144,
+            ..idle()
+        };
+        assert_eq!(rates.swap_delta_kb(), 2048);
+    }
+
+    #[test]
+    fn swap_delta_never_goes_negative() {
+        let rates = Rates {
+            swap_start_kb: 8192,
+            swap_kb: 0,
+            ..idle()
+        };
+        assert_eq!(rates.swap_delta_kb(), 0);
     }
 }
