@@ -174,6 +174,24 @@ impl std::str::FromStr for PercentThreshold {
     }
 }
 
+/// Parses a byte size, with the usual `k`, `m` and `g` suffixes.
+fn parse_bytes(value: &str) -> Result<u64, String> {
+    let digits: String = value.chars().take_while(char::is_ascii_digit).collect();
+    let (number, suffix) = value.split_at(digits.len());
+    let scale: u64 = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        other => return Err(format!("unknown size suffix `{other}` in `{value}`")),
+    };
+    let base: u64 = number
+        .parse()
+        .map_err(|_| format!("invalid size `{value}`"))?;
+    base.checked_mul(scale)
+        .ok_or_else(|| format!("size `{value}` is too large"))
+}
+
 fn parse_frequency(value: &str) -> Result<u64, String> {
     let frequency = value
         .parse::<u64>()
@@ -334,6 +352,25 @@ pub struct DaemonArgs {
     /// Output directory for incidents.
     #[arg(long, default_value = "./incidents")]
     pub output: std::path::PathBuf,
+
+    /// Total size the incident directory is allowed to reach.
+    ///
+    /// Checked after every incident, and the oldest bundles are removed to get
+    /// back under it. A recorder that runs for days on a machine that keeps
+    /// having bad minutes will otherwise fill the disk it is trying to
+    /// diagnose, which is the one failure mode a background process must not
+    /// have.
+    #[arg(long, default_value = "512m", value_name = "BYTES", value_parser = parse_bytes)]
+    pub max_disk_bytes: u64,
+
+    /// Keep the rolling window from the previous run instead of starting empty.
+    ///
+    /// A recorder restarted after a crash or a deploy is least useful exactly
+    /// when it is most needed, which is immediately after whatever made it
+    /// restart. Reading the last bundle back means the window still covers the
+    /// minutes before the restart.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub restore: bool,
 
     #[command(flatten)]
     pub format: FormatArg,

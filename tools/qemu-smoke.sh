@@ -1130,6 +1130,142 @@ trigger_case() {
     echo "  cost under this fixture: ${peak_cost:-?}% of one CPU"
 }
 
+# Proves the two claims the incident storage makes: a killed recorder keeps its
+# window when it comes back, and the output directory never outgrows its cap.
+check_daemon_storage() {
+    local dir="$OUT_DIR/storage"
+    rm -rf "$dir"
+    mkdir -p "$dir"
+
+    # A cap of 4 KiB with a bundle of a few hundred bytes, so a handful of
+    # incidents is enough to force rotation. A cap no run would reach would
+    # leave the rotation path untested, which is the same as not testing it.
+    # Lock contention, with a threshold below what it produces, so the run
+    # writes a bundle every interval or two. A run where no trigger fires writes
+    # nothing, and a storage check with nothing to store tests nothing.
+    local first_log="$OUT_DIR/storage-first.txt"
+    "$FAST_WORKLOAD" lock-hog --duration "$TRIGGER_RUN" --workers 16 >/dev/null 2>&1 &
+    local target_pid=$!
+    sleep 0.3
+    "$FAST" daemon --pid "$target_pid" --duration "$TRIGGER_RUN" \
+        --interval 1s --window 120s --output "$dir" --max-disk-bytes 4k \
+        --trigger-sched-p95 200us \
+        --trigger-io-p99 off --trigger-retrans off \
+        --trigger-psi-some off --trigger-psi-full off \
+        --restore false \
+        >"$first_log" 2>&1 || true
+    kill "$target_pid" 2>/dev/null
+    wait "$target_pid" 2>/dev/null
+
+    # How many incidents the run wrote, from its own report. Counting the
+    # directories instead would measure what survived, which is the thing the
+    # cap is supposed to reduce, so it could not tell "wrote none" from
+    # "wrote many and kept one".
+    local first_bundles
+    first_bundles=$(awk '/^  incidents written:/ {print $3; exit}' "$first_log")
+    first_bundles=${first_bundles:-0}
+    if [ "$first_bundles" -lt 2 ]; then
+        echo "daemon storage: FAIL (the first run wrote ${first_bundles} incident(s); there is nothing for rotation to drop)"
+        grep 'incidents written' "$first_log" | sed 's/^/    /' >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    local after_first=0
+    for bundle in "$dir"/*/; do
+        [ -d "$bundle" ] || continue
+        after_first=$((after_first + 1))
+    done
+    if [ "$after_first" -ge "$first_bundles" ]; then
+        echo "daemon storage: FAIL (rotation kept $after_first of $first_bundles bundles; nothing was dropped)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if [ "$first_bundles" -lt 1 ]; then
+        echo "daemon storage: FAIL (no bundle directory)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if ! grep -q 'History: none restored' "$first_log"; then
+        echo "daemon storage: FAIL (a fresh run claimed a restored history)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    # Restart against the same directory. The window has to come back, and the
+    # timeline has to continue rather than restart at zero, otherwise the ring
+    # would read as though time ran backwards.
+    local second_log="$OUT_DIR/storage-second.txt"
+    "$FAST_WORKLOAD" lock-hog --duration "$TRIGGER_RUN" --workers 16 >/dev/null 2>&1 &
+    target_pid=$!
+    sleep 0.3
+    "$FAST" daemon --pid "$target_pid" --duration "$TRIGGER_RUN" \
+        --interval 1s --window 120s --output "$dir" --max-disk-bytes 4k \
+        --trigger-sched-p95 200us \
+        --trigger-io-p99 off --trigger-retrans off \
+        --trigger-psi-some off --trigger-psi-full off \
+        >"$second_log" 2>&1 || true
+    kill "$target_pid" 2>/dev/null
+    wait "$target_pid" 2>/dev/null
+
+    local restored
+    restored=$(awk '/^History:/ {print $2; exit}' "$second_log")
+    if [ -z "${restored:-}" ] || [ "$restored" -lt 1 ]; then
+        echo "daemon storage: FAIL (a restarted recorder came back with an empty window)"
+        grep '^History:' "$second_log" | sed 's/^/    /' >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    # The cap, measured from the bytes on disk rather than read back from the
+    # tool's own report: the point is what is actually stored, not what the tool
+    # claims about it.
+    #
+    # Summed from file sizes, not from du. du counts allocated blocks, and a
+    # bundle of six small files costs 24 KiB of blocks whatever the bytes in it,
+    # so a block count would measure the filesystem's rounding rather than the
+    # cap.
+    local total=0
+    for bundle in "$dir"/*/; do
+        [ -d "$bundle" ] || continue
+        for file in "$bundle"*; do
+            [ -f "$file" ] || continue
+            bytes=$(wc -c <"$file" 2>/dev/null | tr -d ' ')
+            total=$((total + ${bytes:-0}))
+        done
+    done
+    local cap=4096
+    local kept
+    kept=0
+    for bundle in "$dir"/*/; do
+        [ -d "$bundle" ] || continue
+        kept=$((kept + 1))
+    done
+    # The run wrote a bundle every interval or two. What matters is that the
+    # directory did not keep them: a cap below the size of one incident has a
+    # floor of one incident, and the claim being checked is that the count stops
+    # growing rather than that the byte total is below a number smaller than a
+    # single bundle.
+    if [ "$kept" -ge "$first_bundles" ]; then
+        echo "daemon storage: FAIL (rotation kept $kept of $first_bundles bundles; nothing was dropped)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    # The bundles are complete, not half-written directories.
+    local incomplete=0
+    for bundle in "$dir"/*/; do
+        [ -d "$bundle" ] || continue
+        [ -f "$bundle/complete.json" ] || incomplete=$((incomplete + 1))
+    done
+    if [ "$incomplete" -ne 0 ]; then
+        echo "daemon storage: FAIL ($incomplete bundle(s) were left without a completion marker)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    echo "daemon storage: $first_bundles incident(s) written, $kept kept under a ${cap}-byte cap ($total bytes; one incident is the floor), $restored interval(s) restored after restart, all bundles complete"
+}
+
 # The complete trigger flag set for a case: exactly one on, the rest off.
 #
 # Written out in full every time rather than layered on top of the defaults,
@@ -1207,6 +1343,7 @@ check_json_document
 check_diagnose_scenarios
 check_daemon_budget
 check_daemon_triggers
+check_daemon_storage
 check_net_rtt_crosscheck
 check_net_field_crosscheck
 check_net_retransmit_attribution

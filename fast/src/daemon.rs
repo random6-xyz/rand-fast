@@ -149,6 +149,7 @@ fn write_incident(
     entry: RingEntry,
     triggers: &Triggers,
     args: &DaemonArgs,
+    slow: &SlowSamples,
 ) -> Result<()> {
     let directory = incident_dir(&args.output, entry.at)?;
     fs::create_dir_all(&directory)
@@ -196,11 +197,307 @@ fn write_incident(
 
     let intervals: Vec<Value> = ring.entries().map(RingEntry::to_json).collect();
     write_json(&directory.join("intervals.json"), &Value::Array(intervals))?;
+    write_json(&directory.join("slow-samples.json"), &slow.to_json())?;
+
+    // The diagnosis is the same ranking `fast diagnose` prints, fed with what
+    // the recorder has measured. It is not a second, weaker copy of that
+    // command: the signals a background recorder does not collect are named as
+    // uncollected, so "no lock contention found" cannot be read as "lock
+    // contention was looked for and not found".
+    let diagnosis = diagnose_from(&entry, args.pid, slow);
+    write_json(&directory.join("diagnosis.json"), &diagnosis)?;
     write_text(
         &directory.join("summary.txt"),
-        &incident_text(&entry, triggers),
+        &incident_text(&entry, triggers, &diagnosis),
     )?;
+
+    // Written last, and on its own, so a bundle is either complete or absent
+    // rather than a directory that looks finished and is not.
+    write_json(
+        &directory.join("complete.json"),
+        &serde_json::json!({
+            "schema": crate::json::SCHEMA,
+            "files": [
+                "manifest.json",
+                "intervals.json",
+                "slow-samples.json",
+                "diagnosis.json",
+                "summary.txt",
+            ],
+        }),
+    )?;
+    rotate(&args.output, args.max_disk_bytes, &directory)?;
     Ok(())
+}
+
+/// The slowest latencies the streams have seen, in microseconds.
+struct SlowSamples {
+    sched_us: Vec<u64>,
+    io_us: Vec<u64>,
+}
+
+impl SlowSamples {
+    fn to_json(&self) -> Value {
+        serde_json::json!({
+            "sched_us": self.sched_us,
+            "io_us": self.io_us,
+            "note": "the slowest latencies seen so far, longest first, not the events that tripped the trigger alone",
+        })
+    }
+}
+
+/// Deletes the oldest bundles until the output directory fits its budget.
+///
+/// Called after every incident rather than on a timer, because the thing that
+/// fills a directory is incidents, and a recorder that is not firing is not
+/// filling anything. Oldest first, because the newest bundle is the one being
+/// written and the least likely to be superseded.
+///
+/// A partial bundle is removed along with a complete one: a directory left
+/// behind by a recorder that was killed mid-write is dead weight, and the
+/// `complete.json` marker is what tells the two apart.
+///
+/// A single incident is never deleted to satisfy the cap, so the cap is a soft
+/// ceiling with a floor of one incident's size.
+///
+/// Removal failures are ignored rather than propagated. A recorder that cannot
+/// delete an old bundle is still recording, and ending the run over it would
+/// trade a working diagnosis for a tidy directory.
+fn rotate(output: &std::path::Path, max_bytes: u64, just_written: &std::path::Path) -> Result<()> {
+    let entries = match std::fs::read_dir(output) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()),
+    };
+    // Oldest first, by name, which is why bundle directories are stamped.
+    let mut bundles: Vec<std::path::PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    bundles.sort();
+
+    let mut total: u64 = bundles.iter().filter_map(|path| directory_size(path)).sum();
+    for bundle in bundles {
+        if total <= max_bytes {
+            break;
+        }
+        // The bundle that was just written is never removed. A cap exists to
+        // keep a recorder from filling a disk; a version that deletes the
+        // incident it was called to save is worse than a directory slightly over
+        // its budget, because it leaves a recorder that reports incidents and
+        // stores none. The check that found this was a run whose single bundle
+        // was larger than the whole cap. The floor is therefore one incident's
+        // size, and it is a floor rather than a violation.
+        if bundle == just_written {
+            continue;
+        }
+        if let Some(size) = directory_size(&bundle) {
+            total = total.saturating_sub(size);
+        }
+        let _ = fs::remove_dir_all(&bundle);
+    }
+    Ok(())
+}
+
+/// Sum of the regular files under every bundle in the output directory.
+#[cfg(test)]
+fn directory_total(dir: &std::path::Path) -> Option<u64> {
+    let mut total = 0;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        total += directory_size(&entry.path())?;
+    }
+    Some(total)
+}
+
+/// A byte count in the largest unit that leaves the number readable.
+fn human_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Total size of the regular files under a directory.
+fn directory_size(path: &std::path::Path) -> Option<u64> {
+    let mut total = 0;
+    for entry in std::fs::read_dir(path).ok()?.flatten() {
+        if let Ok(metadata) = entry.metadata()
+            && metadata.is_file()
+        {
+            total += metadata.len();
+        }
+    }
+    Some(total)
+}
+
+/// Reads the rolling window back from the most recent bundle on disk.
+///
+/// A recorder that restarts is least useful immediately after whatever made it
+/// restart, which is exactly when the minutes before the restart matter most.
+/// The newest complete bundle holds that window, so a restarted recorder
+/// starts with the history it would otherwise have thrown away.
+///
+/// Only the newest bundle is read. Older ones are there to be rotated away, and
+/// stitching several together would produce a window with gaps in it that look
+/// exactly like a quiet machine.
+///
+/// A bundle that cannot be read is skipped rather than fatal: a recorder must
+/// start even when the disk it is about to write to is in a strange state, and
+/// a missing history is a far smaller problem than a recorder that will not
+/// run.
+fn restore_ring(output: &std::path::Path, window: Duration) -> Restored {
+    let newest = match std::fs::read_dir(output) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir() && path.join("complete.json").is_file())
+            .max(),
+        Err(_) => None,
+    };
+    let Some(newest) = newest else {
+        return Restored::default();
+    };
+    let Ok(text) = fs::read_to_string(newest.join("intervals.json")) else {
+        return Restored::default();
+    };
+    let Ok(Value::Array(entries)) = serde_json::from_str::<Value>(&text) else {
+        return Restored::default();
+    };
+
+    let mut restored = Restored::default();
+    for entry in entries {
+        let Some(entry) = ring_entry_from_json(&entry) else {
+            continue;
+        };
+        // Older than the window being kept, so it cannot be what a reader of the
+        // window expects to find in it.
+        if restored.previous_at.is_zero() || entry.at >= restored.previous_at {
+            restored.previous_at = entry.at;
+        }
+        restored.entries.push(entry);
+    }
+    // Keep only what fits: the window is about how far back the recorder looks,
+    // and carrying more would make the first tick report a span it claims to
+    // cover but does not.
+    let oldest = restored.previous_at.checked_sub(window).unwrap_or_default();
+    restored.entries.retain(|entry| entry.at >= oldest);
+    restored
+}
+
+/// Rebuilds a ring entry from a bundle's JSON.
+///
+/// Returns `None` for an entry it cannot understand, so a bundle written by a
+/// different version degrades to the intervals that still parse rather than
+/// being discarded whole.
+fn ring_entry_from_json(value: &Value) -> Option<RingEntry> {
+    let number = |key: &str| value.get(key).and_then(Value::as_u64);
+    Some(RingEntry {
+        at: Duration::from_secs_f64(value.get("at_s")?.as_f64()?),
+        sched_p95_us: number("sched_p95_us").unwrap_or(0),
+        sched_samples: number("sched_samples").unwrap_or(0),
+        cpu_percent: value
+            .get("cpu_percent")
+            .and_then(Value::as_f64)
+            .unwrap_or_default(),
+        io_p99_us: number("io_p99_us").unwrap_or(0),
+        io_samples: number("io_samples").unwrap_or(0),
+        retrans: number("retrans").unwrap_or(0),
+        psi_some_pct: value
+            .get("psi_some_pct")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32),
+        psi_full_pct: value
+            .get("psi_full_pct")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32),
+        lost: number("lost_events").unwrap_or(0),
+        cpu_cost_pct: value
+            .get("recorder_cpu_pct")
+            .and_then(Value::as_f64)
+            .unwrap_or_default(),
+        memory_bytes: number("recorder_memory_bytes").unwrap_or(0),
+        // A restored entry keeps no record of having tripped anything: that
+        // incident has already been written, and counting it again on the
+        // restart would report a bundle that does not exist.
+        fired: Vec::new(),
+    })
+}
+
+/// Ranks causes from the recorder's own measurements, naming what it did not
+/// collect.
+///
+/// Reuses the scoring `fast diagnose` uses rather than a second, weaker copy,
+/// so a bundle and a diagnosis report cannot drift apart. The limits are
+/// stated in the output: a background recorder does not gather off-CPU wait
+/// reasons, page fault rates or transmitted segment counts, and saying so is
+/// the difference between "nothing found" and "not looked for".
+fn diagnose_from(entry: &RingEntry, pid: u32, slow: &SlowSamples) -> Value {
+    let evidence = crate::diagnose::Evidence {
+        sched_samples: entry.sched_samples as usize,
+        sched_p95_us: entry.sched_p95_us,
+        io_samples: entry.io_samples as usize,
+        io_p99_us: entry.io_p99_us,
+        // The recorder knows the p99 but not how many requests crossed the
+        // slow threshold, so this signal is left out rather than guessed at.
+        io_slow: 0,
+        net_samples: 0,
+        // Retransmissions are counted but segments are not, so there is no
+        // ratio to score. Zero here would read as a perfect link rather than
+        // as an absent measurement.
+        retrans_ratio: 0.0,
+        offcpu_samples: 0,
+        offcpu_p95_us: 0,
+        offcpu_total_us: 0,
+        offcpu_futex_ratio: 0.0,
+        offcpu_io_ratio: 0.0,
+        offcpu_network_ratio: 0.0,
+        offcpu_memory_ratio: 0.0,
+        minor_faults_per_s: 0.0,
+        major_faults_per_s: 0.0,
+        reclaims_per_s: 0.0,
+        psi_some_pct: entry.psi_some_pct.unwrap_or(0.0),
+        psi_full_pct: entry.psi_full_pct.unwrap_or(0.0),
+        cpu_samples: 0,
+        cpu_percent: entry.cpu_percent,
+        // The recorder knows the streams' dropped-event count for the interval
+        // but not for the whole run, so this is the interval's figure.
+        lost: vec![("interval", entry.lost)],
+        // A kernel without PSI must be scored as having no pressure data rather
+        // than as having none of the pressure, or the memory cause is ruled out
+        // by a reading that was never taken.
+        psi_available: entry.psi_some_pct.is_some(),
+        swap_kb: 0,
+    };
+    let causes = crate::scoring::score(&evidence);
+    serde_json::json!({
+        "schema": crate::json::SCHEMA,
+        "command": "daemon.incident.diagnosis",
+        "pid": pid,
+        "scored_by": "the ranking fast diagnose uses, fed with the recorder's own measurements",
+        "causes": causes
+            .iter()
+            .map(|diagnosis| serde_json::json!({
+                "cause": diagnosis.cause,
+                "confidence_pct": diagnosis.confidence,
+                "evidence": diagnosis.evidence,
+            }))
+            .collect::<Vec<_>>(),
+        "not_collected": [
+            "off-CPU wait reasons and stacks",
+            "page fault and direct reclaim rates",
+            "transmitted segment count, so no retransmission ratio",
+            "on-CPU samples; usage is read from the target's accounting counters",
+        ],
+        "slowest_samples": slow.to_json(),
+    })
 }
 
 /// The directory an incident at `at` goes in.
@@ -247,7 +544,7 @@ impl RingEntry {
 ///
 /// Written next to the JSON rather than instead of it, because the first thing
 /// anyone does with a bundle is read it.
-fn incident_text(entry: &RingEntry, triggers: &Triggers) -> String {
+fn incident_text(entry: &RingEntry, triggers: &Triggers, diagnosis: &Value) -> String {
     let mut text = String::new();
     text.push_str(&format!(
         "Incident at {}s into the recording\n\n",
@@ -280,6 +577,26 @@ fn incident_text(entry: &RingEntry, triggers: &Triggers) -> String {
         _ => text.push_str("  memory PSI     unavailable, this kernel reports none\n"),
     }
     text.push_str(&format!("  events lost    {}\n", entry.lost));
+    text.push_str("\nLikely cause, from the recorder's own measurements\n");
+    match diagnosis["causes"].as_array() {
+        Some(causes) if !causes.is_empty() => {
+            for (rank, cause) in causes.iter().enumerate() {
+                let name = cause["cause"].as_str().unwrap_or("unknown");
+                let confidence = cause["confidence_pct"].as_f64().unwrap_or_default();
+                text.push_str(&format!("  {}. {name} ({confidence:.1}%)\n", rank + 1));
+            }
+        }
+        _ => text.push_str("  no cause scored above the reporting threshold\n"),
+    }
+    if let Some(missing) = diagnosis["not_collected"].as_array() {
+        text.push_str("  not measured by this recorder:");
+        for signal in missing {
+            if let Some(name) = signal.as_str() {
+                text.push_str(&format!("\n    {name}"));
+            }
+        }
+        text.push('\n');
+    }
     text.push_str("\nWhat it cost to measure\n");
     // Rounded, because a bundle is read by a person at three in the morning
     // and sixteen significant figures of recorder overhead is not information.
@@ -480,13 +797,32 @@ pub fn run(args: DaemonArgs) -> Result<()> {
     // report needs it afterwards. A cell rather than a lock: the collection
     // loop is the only thread that ever touches it, and a background recorder
     // cannot afford to pay for a mutex on every interval.
+    // History from before the last restart, if the caller wants it. Read
+    // before the collection starts so the first tick already has a window that
+    // reaches back into the previous run.
+    let restored = if args.restore {
+        restore_ring(&args.output, args.window)
+    } else {
+        Restored::default()
+    };
+    // Seeded before the state is built, so the first tick already sees a
+    // window that reaches back into the previous run rather than one that
+    // starts empty and fills up over the next minute.
+    let mut ring = Ring::new(args.window, interval);
+    for entry in &restored.entries {
+        ring.push(entry.clone());
+    }
     let state = std::rc::Rc::new(std::cell::RefCell::new(RecorderState {
-        ring: Ring::new(args.window, interval),
+        ring,
         previous: PreviousTick::default(),
         peak_cpu_pct: 0.0,
         peak_memory_bytes: 0,
         ticks: 0,
         incidents: Incidents::default(),
+        slow_sched: Vec::new(),
+        slow_io: Vec::new(),
+        restored: restored.clone(),
+        time_offset: restored.previous_at,
     }));
     let tick_state = std::rc::Rc::clone(&state);
     // The tick callback needs the thresholds and the output directory, both of
@@ -526,6 +862,14 @@ pub fn run(args: DaemonArgs) -> Result<()> {
                             "p95_us": summary.map_or(0, |s| s.p95_ns / 1_000),
                             "samples": stats.sample_count(),
                             "lost": stats.lost_events(),
+                            // The slowest latencies themselves, not just where
+                            // they fell in the distribution. A bundle is read by
+                            // someone who wants the number.
+                            "slowest_us": stats
+                                .slowest_samples(SLOW_SAMPLE_COUNT)
+                                .iter()
+                                .map(|nanoseconds| nanoseconds / 1_000)
+                                .collect::<Vec<_>>(),
                         })
                     },
                 ),
@@ -540,6 +884,11 @@ pub fn run(args: DaemonArgs) -> Result<()> {
                             "p99_us": summary.map_or(0, |s| s.p99_ns / 1_000),
                             "samples": stats.sample_count(),
                             "lost": stats.lost(),
+                            "slowest_us": stats
+                                .slowest_samples(SLOW_SAMPLE_COUNT)
+                                .iter()
+                                .map(|nanoseconds| nanoseconds / 1_000)
+                                .collect::<Vec<_>>(),
                         })
                     },
                 ),
@@ -601,6 +950,8 @@ pub fn run(args: DaemonArgs) -> Result<()> {
             after_attach_rss,
             &triggers,
             &state.incidents,
+            &state.restored,
+            args.max_disk_bytes,
         );
     }
     Ok(())
@@ -621,6 +972,30 @@ struct RecorderState {
     ticks: u64,
     /// Incidents written, and how many each trigger produced.
     incidents: Incidents,
+    /// The slowest latencies each stream has seen, for the incident bundle.
+    slow_sched: Vec<u64>,
+    slow_io: Vec<u64>,
+    /// Ring entries carried over from a previous run, and where they came
+    /// from, so a restarted recorder does not silently start with no history.
+    restored: Restored,
+    /// How far into the previous run's timeline this run starts.
+    ///
+    /// Without it a restarted recorder would push an entry at one second after a
+    /// restored entry at eighteen seconds, and the window would read as though
+    /// time ran backwards.
+    time_offset: Duration,
+}
+
+/// How many of the slowest samples an incident bundle keeps.
+const SLOW_SAMPLE_COUNT: usize = 16;
+
+/// What a restarted recorder picked up from disk.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Restored {
+    entries: Vec<RingEntry>,
+    /// Wall time the previous run had reached, so the timeline stays monotonic
+    /// across a restart instead of going backwards.
+    previous_at: Duration,
 }
 
 /// How often each trigger fired over a run.
@@ -678,18 +1053,36 @@ fn tick(
         peak_memory_bytes,
         ticks,
         incidents,
+        slow_sched,
+        slow_io,
+        restored: _,
+        time_offset,
     } = state;
     let triggers = Triggers::from_args(args);
     let mut current = Cumulative::default();
+    // Slowest samples, replaced rather than merged: the stream reports its own
+    // running slowest, so an interval's list is the whole run's tail and
+    // keeping the longest is the same thing without holding two lists.
+    slow_sched.clear();
+    slow_io.clear();
     for (name, value) in &summary {
         let number = |key: &str| value.get(key).and_then(Value::as_u64).unwrap_or(0);
+        let slowest = |key: &str| -> Vec<u64> {
+            value
+                .get(key)
+                .and_then(Value::as_array)
+                .map(|values| values.iter().filter_map(Value::as_u64).collect())
+                .unwrap_or_default()
+        };
         match *name {
             "sched" => {
+                *slow_sched = slowest("slowest_us");
                 current.sched_p95_us = number("p95_us");
                 current.sched_samples = number("samples");
                 current.sched_lost = number("lost");
             }
             "io" => {
+                *slow_io = slowest("slowest_us");
                 current.io_p99_us = number("p99_us");
                 current.io_samples = number("samples");
                 current.io_lost = number("lost");
@@ -704,6 +1097,10 @@ fn tick(
     // Cumulative on-CPU usage of the observed process, as a percentage of one
     // CPU since the recorder started. Differencing it gives the interval.
     let target_cpu_pct = target_cpu_pct(pid, started);
+
+    // Carried on from the previous run's timeline, so a restart extends the
+    // window rather than starting a second, overlapping one at zero.
+    let at = at + *time_offset;
 
     // The first tick has nothing to difference against, so it only records the
     // baseline. Reporting a difference against zero would make the very first
@@ -720,6 +1117,7 @@ fn tick(
         return Ok(());
     }
 
+    // Both sides carry the same offset, so the interval is unaffected by it.
     let window = at.saturating_sub(previous.at);
     let cpu_ticks = usage.ticks.saturating_sub(previous.usage.ticks);
     let cost = cpu_cost_pct(cpu_ticks, window);
@@ -772,7 +1170,11 @@ fn tick(
     // The incident file is written before the entry goes into the ring, so a
     // bundle that exists always has its triggering interval in it.
     if !fired.is_empty() {
-        write_incident(ring, entry.clone(), &triggers, args)?;
+        let slow = SlowSamples {
+            sched_us: slow_sched.clone(),
+            io_us: slow_io.clone(),
+        };
+        write_incident(ring, entry.clone(), &triggers, args, &slow)?;
     }
     ring.push(entry);
 
@@ -812,6 +1214,8 @@ fn print_summary(
     after_attach_rss: u64,
     triggers: &Triggers,
     incidents: &Incidents,
+    restored: &Restored,
+    max_disk_bytes: u64,
 ) {
     println!("Flight recorder for {name} ({pid})");
     println!("Ran for {}", humantime::format_duration(summary.elapsed));
@@ -821,8 +1225,24 @@ fn print_summary(
         humantime::format_duration(args.interval),
         ring.max_entries()
     );
+    if restored.entries.is_empty() {
+        println!("History: none restored from a previous run");
+    } else {
+        println!(
+            "History: {} interval(s) restored, reaching back to {}s of the previous run",
+            restored.entries.len(),
+            restored
+                .entries
+                .first()
+                .map_or(0, |entry| entry.at.as_secs())
+        );
+    }
     println!("Intervals recorded: {ticks}");
-    println!("Output: {}", args.output.display());
+    println!(
+        "Output: {} (kept under {} by dropping the oldest bundles)",
+        args.output.display(),
+        human_bytes(max_disk_bytes)
+    );
     println!();
     println!("Overhead budget");
     println!(
@@ -963,6 +1383,10 @@ mod tests {
             peak_memory_bytes: 0,
             ticks: 0,
             incidents: Incidents::default(),
+            slow_sched: Vec::new(),
+            slow_io: Vec::new(),
+            restored: Restored::default(),
+            time_offset: Duration::ZERO,
         };
         assert_eq!(state.peak_cpu_pct, 0.0);
         assert_eq!(state.peak_memory_bytes, 0);
@@ -983,6 +1407,8 @@ mod tests {
             trigger_psi_full: "5".parse().expect("threshold"),
             trigger_cpu: "off".parse().expect("threshold"),
             output: output.to_path_buf(),
+            max_disk_bytes: 512 * 1024 * 1024,
+            restore: true,
             format: crate::cli::FormatArg {
                 format: Format::Text,
             },
@@ -1014,7 +1440,11 @@ mod tests {
             sched_p95_us: 40,
             ..RingEntry::default()
         });
-        write_incident(&ring, slow_io_entry(), &triggers, &args).expect("write bundle");
+        let slow = SlowSamples {
+            sched_us: vec![],
+            io_us: vec![],
+        };
+        write_incident(&ring, slow_io_entry(), &triggers, &args, &slow).expect("write bundle");
 
         let bundle = std::fs::read_dir(&dir)
             .expect("read output dir")
@@ -1059,8 +1489,12 @@ mod tests {
         let args = default_args(&dir);
         let triggers = Triggers::from_args(&args);
         let ring = Ring::new(Duration::from_secs(60), Duration::from_secs(1));
-        write_incident(&ring, slow_io_entry(), &triggers, &args).expect("first");
-        write_incident(&ring, slow_io_entry(), &triggers, &args).expect("second");
+        let slow = SlowSamples {
+            sched_us: vec![],
+            io_us: vec![],
+        };
+        write_incident(&ring, slow_io_entry(), &triggers, &args, &slow).expect("first");
+        write_incident(&ring, slow_io_entry(), &triggers, &args, &slow).expect("second");
 
         let count = std::fs::read_dir(&dir).expect("read output dir").count();
         assert_eq!(count, 2, "both bundles survive");
@@ -1073,6 +1507,264 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create scratch dir");
         dir
+    }
+
+    #[test]
+    fn a_bundle_holds_the_window_the_samples_and_a_diagnosis() {
+        // The three things the issue asks a bundle to contain, checked in the
+        // files rather than in the code that writes them.
+        let dir = temp_dir("bundle_contents");
+        let args = default_args(&dir);
+        let triggers = Triggers::from_args(&args);
+        let mut ring = Ring::new(Duration::from_secs(60), Duration::from_secs(1));
+        for second in 1..=3 {
+            ring.push(RingEntry {
+                at: Duration::from_secs(second),
+                sched_p95_us: 40 * second,
+                ..RingEntry::default()
+            });
+        }
+        let slow = SlowSamples {
+            sched_us: vec![9_000, 5_000, 120],
+            io_us: vec![40_000],
+        };
+        write_incident(&ring, slow_io_entry(), &triggers, &args, &slow).expect("write bundle");
+
+        let bundle = std::fs::read_dir(&dir)
+            .expect("read output dir")
+            .next()
+            .expect("one bundle")
+            .expect("entry")
+            .path();
+
+        // The window: the intervals that led up to the trigger, not just the one
+        // that tripped it.
+        let intervals: Value = serde_json::from_slice(
+            &std::fs::read(bundle.join("intervals.json")).expect("read intervals"),
+        )
+        .expect("parse");
+        assert_eq!(intervals.as_array().map(Vec::len), Some(3));
+
+        // The slow samples, longest first, as measured rather than as a
+        // percentile.
+        let samples: Value = serde_json::from_slice(
+            &std::fs::read(bundle.join("slow-samples.json")).expect("read samples"),
+        )
+        .expect("parse");
+        assert_eq!(samples["sched_us"], serde_json::json!([9_000, 5_000, 120]));
+
+        // The diagnosis, which must also say what it did not measure.
+        let diagnosis: Value = serde_json::from_slice(
+            &std::fs::read(bundle.join("diagnosis.json")).expect("read diagnosis"),
+        )
+        .expect("parse");
+        assert!(diagnosis["causes"].is_array());
+        let missing = diagnosis["not_collected"]
+            .as_array()
+            .expect("not_collected");
+        assert!(
+            !missing.is_empty(),
+            "the limits of the diagnosis are stated"
+        );
+
+        // The marker that distinguishes a finished bundle from a directory a
+        // recorder was killed while writing.
+        let complete: Value = serde_json::from_slice(
+            &std::fs::read(bundle.join("complete.json")).expect("read marker"),
+        )
+        .expect("parse");
+        assert!(complete["files"].is_array());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restart_keeps_the_window_from_the_previous_run() {
+        // Kill and restart: the acceptance criterion. The new run must not
+        // start with an empty window, and must not pretend its first interval
+        // is the first thing that ever happened.
+        let dir = temp_dir("restart_keeps_window");
+        let args = default_args(&dir);
+        let triggers = Triggers::from_args(&args);
+        let slow = SlowSamples {
+            sched_us: vec![],
+            io_us: vec![],
+        };
+        let mut ring = Ring::new(Duration::from_secs(60), Duration::from_secs(1));
+        for second in 1..=3 {
+            ring.push(RingEntry {
+                at: Duration::from_secs(second),
+                sched_p95_us: 40 * second,
+                ..RingEntry::default()
+            });
+        }
+        write_incident(&ring, slow_io_entry(), &triggers, &args, &slow).expect("write bundle");
+
+        let restored = restore_ring(&dir, Duration::from_secs(60));
+        assert_eq!(restored.entries.len(), 3, "the window survived the restart");
+        assert_eq!(restored.previous_at, Duration::from_secs(3));
+        // Nothing is re-counted as a fresh incident: that bundle already exists.
+        assert!(restored.entries.iter().all(|entry| entry.fired.is_empty()));
+
+        // The next run continues the same timeline, so the window does not read
+        // as though time ran backwards.
+        let next_tick = Duration::from_secs(1) + restored.previous_at;
+        assert_eq!(next_tick, Duration::from_secs(4));
+        assert!(next_tick > restored.entries.last().expect("last").at);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_partial_bundle_is_not_restored_from() {
+        // A recorder killed mid-write leaves a directory with no marker. Reading
+        // it would restore a window that stops short of the end with no way to
+        // tell that it does.
+        let dir = temp_dir("partial_not_restored");
+        let bundle = dir.join("incident-9s");
+        std::fs::create_dir_all(&bundle).expect("create partial bundle");
+        std::fs::write(bundle.join("intervals.json"), "[]").expect("write intervals");
+        assert_eq!(
+            restore_ring(&dir, Duration::from_secs(60)),
+            Restored::default()
+        );
+
+        // A complete marker makes it readable again.
+        std::fs::write(bundle.join("complete.json"), "{}").expect("write marker");
+        assert!(
+            restore_ring(&dir, Duration::from_secs(60))
+                .entries
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotation_drops_the_oldest_bundles_until_the_directory_fits() {
+        // The acceptance criterion: the directory is brought back under its cap
+        // by dropping the oldest bundles. The cap is set here rather than left
+        // at the roomy default, where nothing would ever be rotated and the
+        // check would pass without testing anything.
+        let dir = temp_dir("rotation_caps_disk");
+        let mut args = default_args(&dir);
+        let triggers = Triggers::from_args(&args);
+        let slow = SlowSamples {
+            sched_us: vec![],
+            io_us: vec![],
+        };
+        let ring = Ring::new(Duration::from_secs(60), Duration::from_secs(1));
+
+        // A cap of one bundle plus a little, so each new incident evicts
+        // exactly the oldest one.
+        let one_bundle = directory_size_of_bundle(&dir, &ring, &triggers, &args, &slow);
+        let cap = one_bundle * 3 / 2;
+        args.max_disk_bytes = cap;
+
+        let mut totals = Vec::new();
+        for second in 1..=4 {
+            let mut entry = slow_io_entry();
+            entry.at = Duration::from_secs(second);
+            write_incident(&ring, entry, &triggers, &args, &slow).expect("write bundle");
+            let total = directory_total(&dir).expect("size");
+            assert!(
+                total <= cap,
+                "the directory went over its cap after interval {second}: {total} > {cap}"
+            );
+            totals.push(total);
+        }
+        // It fills up and then stays put, instead of growing with every incident
+        // for the life of the recorder.
+        assert_eq!(
+            totals[3], totals[2],
+            "the total stops growing rather than tracking the incident count: {totals:?}"
+        );
+        let names = bundle_names(&dir);
+        assert!(
+            names.iter().any(|name| name.contains("4s")),
+            "kept: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.contains("1s")),
+            "dropped: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotation_never_deletes_the_incident_it_was_called_for() {
+        // A cap smaller than one incident is a configuration mistake, not a
+        // licence to throw away the evidence. Deleting the bundle that was just
+        // written leaves a recorder that reports incidents and stores none,
+        // which is the failure mode a cap is supposed to prevent.
+        let dir = temp_dir("rotation_keeps_current");
+        let mut args = default_args(&dir);
+        args.max_disk_bytes = 64;
+        let triggers = Triggers::from_args(&args);
+        let slow = SlowSamples {
+            sched_us: vec![],
+            io_us: vec![],
+        };
+        let ring = Ring::new(Duration::from_secs(60), Duration::from_secs(1));
+        let mut entry = slow_io_entry();
+        entry.at = Duration::from_secs(2);
+        write_incident(&ring, entry, &triggers, &args, &slow).expect("write bundle");
+
+        let names = bundle_names(&dir);
+        assert_eq!(names.len(), 1, "the incident survives: {names:?}");
+        assert!(
+            names[0].contains("2s"),
+            "and it is the one just written: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Writes one bundle into a scratch directory and returns its size.
+    fn directory_size_of_bundle(
+        dir: &std::path::Path,
+        ring: &Ring,
+        triggers: &Triggers,
+        args: &DaemonArgs,
+        slow: &SlowSamples,
+    ) -> u64 {
+        let mut entry = slow_io_entry();
+        entry.at = Duration::from_secs(99);
+        write_incident(ring, entry, triggers, args, slow).expect("write bundle");
+        let size = directory_total(dir).expect("size");
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).expect("recreate scratch dir");
+        size
+    }
+
+    /// The bundle directory names under an output directory, sorted.
+    fn bundle_names(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_restored_entry_survives_a_round_trip_through_json() {
+        // A bundle that cannot be read back is a bundle that is only useful at
+        // the moment it was written.
+        let original = RingEntry {
+            at: Duration::from_millis(1_500),
+            sched_p95_us: 900,
+            sched_samples: 12,
+            cpu_percent: 87.5,
+            io_p99_us: 40,
+            io_samples: 7,
+            retrans: 3,
+            psi_some_pct: Some(2.5),
+            psi_full_pct: None,
+            lost: 1,
+            cpu_cost_pct: 0.5,
+            memory_bytes: 4096,
+            fired: vec![],
+        };
+        let restored = ring_entry_from_json(&original.to_json()).expect("round trip");
+        assert_eq!(restored, original);
     }
 
     #[test]
@@ -1106,6 +1798,10 @@ mod tests {
             peak_memory_bytes: 0,
             ticks: 0,
             incidents: Incidents::default(),
+            slow_sched: Vec::new(),
+            slow_io: Vec::new(),
+            restored: Restored::default(),
+            time_offset: Duration::ZERO,
         };
         for (cost, rss) in [(1.5, 8_000_000u64), (0.2, 9_500_000), (0.1, 1_000_000)] {
             state.peak_cpu_pct = state.peak_cpu_pct.max(cost);

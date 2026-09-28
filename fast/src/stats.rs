@@ -68,6 +68,27 @@ impl Statistics {
         self.latencies.len()
     }
 
+    /// The `limit` slowest latencies seen, in nanoseconds, longest first.
+    ///
+    /// A percentile says how big the tail was; this says what the tail was.
+    /// An incident bundle is opened by someone who wants the actual number,
+    /// not the position it occupied in a distribution.
+    pub fn slowest_samples(&self, limit: usize) -> Vec<u64> {
+        let mut worst: Vec<u64> = self.latencies.clone();
+        if limit == 0 || worst.is_empty() {
+            return Vec::new();
+        }
+        // A full sort of a whole run's worth of latencies on every tick would
+        // cost more than the recording itself, and only the tail matters, so
+        // this is a bounded partial selection followed by a sort of just the
+        // part that is kept.
+        let depth = limit.saturating_mul(8).max(limit).min(worst.len() - 1);
+        worst.select_nth_unstable_by(depth, |a, b| b.cmp(a));
+        worst.truncate(limit);
+        worst.sort_unstable_by(|a, b| b.cmp(a));
+        worst
+    }
+
     pub fn lost_events(&self) -> u64 {
         self.lost_events
     }

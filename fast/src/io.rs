@@ -161,6 +161,25 @@ impl IoStats {
         self.latencies.len()
     }
 
+    /// The `limit` slowest I/O latencies seen, in nanoseconds, longest first.
+    ///
+    /// The same reason as the scheduler's: a p99 is a position, and an incident
+    /// bundle wants the latency itself.
+    pub fn slowest_samples(&self, limit: usize) -> Vec<u64> {
+        let mut worst: Vec<u64> = self.latencies.clone();
+        if limit == 0 || worst.is_empty() {
+            return Vec::new();
+        }
+        // Bounded partial selection, then a sort of only the part kept: a full
+        // sort of a whole run's latencies on every tick would cost more than
+        // the recording itself, and only the tail matters.
+        let depth = limit.saturating_mul(8).max(limit).min(worst.len() - 1);
+        worst.select_nth_unstable_by(depth, |a, b| b.cmp(a));
+        worst.truncate(limit);
+        worst.sort_unstable_by(|a, b| b.cmp(a));
+        worst
+    }
+
     /// Records the kernel's dropped-event count.
     pub fn lost(&self) -> u64 {
         self.lost
