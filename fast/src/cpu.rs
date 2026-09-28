@@ -125,6 +125,29 @@ impl runtime::EventHandler<CpuSampleEvent> for CpuStats {
     }
 }
 
+/// CPU time a process has consumed, in clock ticks.
+///
+/// Read from `/proc/<pid>/stat`, which is the same place the usage percentage
+/// comes from, so a caller that needs both gets two readings of one number
+/// rather than two different definitions of it.
+pub fn read_process_ticks(pid: u32) -> Result<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))
+        .with_context(|| format!("read /proc/{pid}/stat"))?;
+    let end = stat
+        .rfind(')')
+        .with_context(|| format!("malformed /proc/{pid}/stat"))?;
+    let fields: Vec<&str> = stat[end + 2..].split_whitespace().collect();
+    let utime: u64 = fields
+        .get(11)
+        .and_then(|v| v.parse().ok())
+        .context("missing utime in /proc/<pid>/stat")?;
+    let stime: u64 = fields
+        .get(12)
+        .and_then(|v| v.parse().ok())
+        .context("missing stime in /proc/<pid>/stat")?;
+    Ok(utime + stime)
+}
+
 fn read_proc_cpu_usage(pid: u32) -> Result<CpuUsage> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat"))
         .with_context(|| format!("failed to read /proc/{pid}/stat"))?;

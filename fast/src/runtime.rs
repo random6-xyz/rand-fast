@@ -43,6 +43,12 @@ pub const THREAD_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 /// stop flag.
 const POLL_INTERVAL_MS: i32 = 100;
 
+/// The default `poll(2)` interval for a collection that reports at the end.
+///
+/// Long enough that reader threads are not the dominant cost, short enough
+/// that a Ctrl-C is acted on promptly.
+pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(POLL_INTERVAL_MS as u64);
+
 /// How long the collector main loop waits for the next perf message before
 /// re-checking the stop flag and the thread refresh deadline.
 const RECV_WAIT: Duration = Duration::from_millis(50);
@@ -398,7 +404,24 @@ pub trait EventSink {
 
     /// Called when the kernel reports records dropped on this stream.
     fn on_lost(&mut self, count: u64);
+
+    /// Reports everything accumulated so far, as a document.
+    ///
+    /// A collector that only reports at the end of a collection does not need
+    /// this. A long-running one does: it has to summarise the last interval
+    /// while the collection stays open, and the only way to reach the
+    /// accumulators from outside is through the stream that owns them.
+    ///
+    /// The values are cumulative, not per-interval. The caller differences
+    /// consecutive snapshots, which is what makes the interval length cancel
+    /// out.
+    fn snapshot(&mut self) -> Option<serde_json::Value> {
+        None
+    }
 }
+
+/// A function that renders a collector's accumulated state as a document.
+pub type SnapshotFn<H> = fn(&H) -> serde_json::Value;
 
 /// Adapts a typed [`EventHandler`] to the type-erased [`EventSink`].
 ///
@@ -408,6 +431,7 @@ pub trait EventSink {
 pub struct TypedSink<E, H> {
     handler: H,
     event_size: usize,
+    snapshot: Option<SnapshotFn<H>>,
     marker: PhantomData<E>,
 }
 
@@ -416,11 +440,22 @@ where
     E: Pod,
     H: EventHandler<E>,
 {
-    /// Wraps a typed handler.
+    /// Wraps a typed handler that reports only at the end of a collection.
     pub fn new(handler: H) -> Self {
         Self {
             handler,
             event_size: size_of::<E>(),
+            snapshot: None,
+            marker: PhantomData,
+        }
+    }
+
+    /// Wraps a typed handler that can also report what it has accumulated.
+    pub fn with_snapshot(handler: H, snapshot: SnapshotFn<H>) -> Self {
+        Self {
+            handler,
+            event_size: size_of::<E>(),
+            snapshot: Some(snapshot),
             marker: PhantomData,
         }
     }
@@ -451,12 +486,20 @@ where
     fn on_lost(&mut self, count: u64) {
         self.handler.on_lost(count);
     }
+
+    fn snapshot(&mut self) -> Option<serde_json::Value> {
+        let snapshot = self.snapshot?;
+        Some(snapshot(&self.handler))
+    }
 }
 
 /// One perf event array to consume during a multi-stream collection.
 pub struct EventStream<'a> {
     /// Name of the `PerfEventArray` map.
     pub map_name: &'static str,
+    /// Name a periodic summary reports this stream under, which is the command
+    /// it belongs to rather than the map that carries it.
+    pub name: &'static str,
     /// Perf buffer page count per CPU for this stream.
     pub perf_page_count: usize,
     /// Byte size of this stream's event type.
@@ -474,9 +517,32 @@ impl<'a> EventStream<'a> {
     {
         Self {
             map_name,
+            name: map_name,
             perf_page_count,
             event_size: size_of::<E>(),
             sink: Box::new(TypedSink::<E, H>::new(handler)),
+        }
+    }
+
+    /// Builds a named stream whose collector can also report what it has
+    /// accumulated, for a caller that samples while the collection stays open.
+    pub fn sampled<E, H>(
+        name: &'static str,
+        map_name: &'static str,
+        perf_page_count: usize,
+        handler: H,
+        snapshot: SnapshotFn<H>,
+    ) -> Self
+    where
+        E: Pod + 'a,
+        H: EventHandler<E> + 'a,
+    {
+        Self {
+            map_name,
+            name,
+            perf_page_count,
+            event_size: size_of::<E>(),
+            sink: Box::new(TypedSink::<E, H>::with_snapshot(handler, snapshot)),
         }
     }
 }
@@ -490,6 +556,39 @@ pub struct MultiCollectionOptions {
     pub duration: Duration,
     /// Collector mode bits written into the eBPF `MODE` map.
     pub mode: u32,
+    /// How often the tick callback runs, when one is given. Ignored without a
+    /// callback.
+    pub tick_interval: Duration,
+    /// How long each perf reader waits inside `poll(2)` before checking the
+    /// stop flag.
+    ///
+    /// A short interval makes events reach the collector sooner. A long one
+    /// makes each reader thread wake less often, which is the dominant cost of
+    /// a long-running collection: a background recorder has nothing to gain
+    /// from dispatching events faster than it summarises them.
+    pub poll_interval: Duration,
+}
+
+/// A periodic summary of every stream, taken while the collection stays open.
+///
+/// The values are cumulative. A caller that wants the numbers for one interval
+/// differences two consecutive summaries, which is also what makes the summary
+/// independent of when the collection happened to start.
+pub type TickSummary<'a> = Vec<(&'static str, serde_json::Value)>;
+
+/// The callback a long-running collection uses to summarise each interval.
+///
+/// Named because the type is long enough to be worth not writing twice.
+pub type TickCallback<'a> = Box<dyn FnMut(Duration, TickSummary<'_>) + 'a>;
+
+/// What a multi-stream collection consumes: the streams, and optionally a
+/// callback that summarises them while the collection runs.
+pub struct MultiStreams<'a> {
+    /// One entry per `PerfEventArray` to consume.
+    pub streams: Vec<EventStream<'a>>,
+    /// Called every [`MultiCollectionOptions::tick_interval`] with cumulative
+    /// totals. `None` for a collection that only reports at the end.
+    pub on_tick: Option<TickCallback<'a>>,
 }
 
 /// Runs several perf event streams from one eBPF object over one channel.
@@ -506,10 +605,17 @@ pub fn run_multi_collection<'a>(
     known_tids: &mut BTreeSet<u32>,
     initial_tids: &BTreeSet<u32>,
     options: MultiCollectionOptions,
-    mut streams: Vec<EventStream<'a>>,
+    consumers: MultiStreams<'a>,
 ) -> Result<CollectionSummary> {
+    let MultiStreams {
+        mut streams,
+        mut on_tick,
+    } = consumers;
     if streams.is_empty() {
         bail!("at least one event stream is required");
+    }
+    if options.tick_interval.is_zero() && on_tick.is_some() {
+        bail!("a tick interval of zero would never produce a summary");
     }
 
     let mode_map = bpf.take_map("MODE").context("eBPF map MODE is missing")?;
@@ -534,6 +640,12 @@ pub fn run_multi_collection<'a>(
 
     let (sender, receiver) = mpsc::channel::<MultiMessage>();
     let mut readers = Vec::new();
+    // poll(2) takes milliseconds, and a zero interval would spin, so the
+    // option is clamped to at least the default.
+    let poll_ms = options
+        .poll_interval
+        .as_millis()
+        .clamp(POLL_INTERVAL_MS as u128, i32::MAX as u128) as i32;
 
     for (index, stream) in streams.iter().enumerate() {
         if stream.perf_page_count == 0 {
@@ -567,6 +679,7 @@ pub fn run_multi_collection<'a>(
                 index,
                 Arc::clone(&stop),
                 sender.clone(),
+                poll_ms,
             ));
         }
         // The map is dropped per stream, so two streams must not name the same
@@ -577,6 +690,7 @@ pub fn run_multi_collection<'a>(
 
     let started = Instant::now();
     let mut next_refresh = started + THREAD_REFRESH_INTERVAL;
+    let mut next_tick = started + options.tick_interval;
     let mut process_exited = false;
     let mut fatal_error = None;
 
@@ -614,6 +728,38 @@ pub fn run_multi_collection<'a>(
                 }
                 break;
             }
+        }
+
+        if let Some(tick) = on_tick.as_mut()
+            && Instant::now() >= next_tick
+        {
+            // The snapshots are read here rather than inside the readers, so
+            // the summary is consistent with the events already dispatched.
+            let summary: TickSummary<'_> = streams
+                .iter_mut()
+                .filter_map(|stream| stream.sink.snapshot().map(|value| (stream.name, value)))
+                .collect();
+            tick(started.elapsed(), summary);
+            // Drifted forward from now rather than from the last tick, so a slow
+            // callback does not make the interval shorter every time and end
+            // up firing back to back.
+            next_tick = Instant::now() + options.tick_interval;
+        }
+
+        if let Some(tick) = on_tick.as_mut()
+            && Instant::now() >= next_tick
+        {
+            // The snapshots are read here rather than inside the readers, so
+            // the summary is consistent with the events already dispatched.
+            let summary: TickSummary<'_> = streams
+                .iter_mut()
+                .filter_map(|stream| stream.sink.snapshot().map(|value| (stream.name, value)))
+                .collect();
+            tick(started.elapsed(), summary);
+            // Drifted forward from now rather than from the last tick, so a slow
+            // callback does not make the interval shorter every time and end
+            // up firing back to back.
+            next_tick = Instant::now() + options.tick_interval;
         }
 
         if Instant::now() >= next_refresh {
@@ -715,6 +861,7 @@ fn spawn_stream_reader(
     index: usize,
     stop: Arc<AtomicBool>,
     sender: Sender<MultiMessage>,
+    poll_ms: i32,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut poll_fd = libc::pollfd {
@@ -725,7 +872,7 @@ fn spawn_stream_reader(
 
         while !stop.load(Ordering::Relaxed) {
             poll_fd.revents = 0;
-            let result = unsafe { libc::poll(&mut poll_fd, 1, POLL_INTERVAL_MS) };
+            let result = unsafe { libc::poll(&mut poll_fd, 1, poll_ms) };
             if result < 0 {
                 let error = io::Error::last_os_error();
                 if error.kind() == io::ErrorKind::Interrupted {

@@ -949,6 +949,93 @@ check_diagnose_scenarios() {
         "$FAST_WORKLOAD" net-hog --duration 30s --workers 2 --delay-ms 600
 }
 
+# Proves the flight recorder records real measurements and stays inside its
+# overhead budget.
+#
+# The previous version fed a fabricated p95 into the ring, so there was nothing
+# to check. This runs the recorder against a live fixture and requires three
+# things of the result: more than one interval recorded, at least one interval
+# carrying a non-zero scheduler measurement, and a peak CPU cost and resident
+# set inside the documented budget.
+#
+# The budget is a fraction of one CPU rather than of the host, so it means the
+# same thing on a 4-core box and a 64-core one.
+DAEMON_RUN=${DAEMON_RUN:-45s}
+
+check_daemon_budget() {
+    local dir="$OUT_DIR/incidents"
+    rm -rf "$dir"
+    mkdir -p "$dir"
+
+    "$SCHED_WORKLOAD" target --duration "$DAEMON_RUN" --period 5ms >/dev/null 2>&1 &
+    local target_pid=$!
+    sleep 0.3
+    # A long enough run to record many intervals, short enough to keep the
+    # matrix quick. The window is set so the ring holds all of them.
+    "$FAST" daemon --pid "$target_pid" --duration "$DAEMON_RUN" \
+        --interval 1s --window 120s --output "$dir" \
+        >"$OUT_DIR/daemon.txt" 2>&1 || true
+    kill "$target_pid" 2>/dev/null
+    wait "$target_pid" 2>/dev/null
+
+    if [ ! -s "$OUT_DIR/daemon.txt" ]; then
+        echo "daemon budget: FAIL (the recorder produced no output)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    # "Intervals recorded: N" with N above one proves the tick loop ran, which
+    # is what a fabricated value could never show.
+    local intervals
+    intervals=$(awk '/^Intervals recorded:/ {print $3; exit}' "$OUT_DIR/daemon.txt")
+    if [ -z "${intervals:-}" ] || [ "$intervals" -lt 2 ]; then
+        echo "daemon budget: FAIL (only ${intervals:-0} interval(s) recorded; the tick loop did not run)"
+        head -5 "$OUT_DIR/daemon.txt" | sed 's/^/    /' >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    # A real measurement: at least one interval with a non-zero scheduler p95
+    # and samples, read from the printed table.
+    local measured
+    measured=$(awk '/^ *[0-9]+s +[0-9]+us/ { if ($2 + 0 > 0) n++ } END { print n + 0 }' "$OUT_DIR/daemon.txt")
+    if [ "$measured" -eq 0 ]; then
+        echo "daemon budget: FAIL (no interval carried a non-zero scheduler measurement)"
+        head -12 "$OUT_DIR/daemon.txt" | sed 's/^/    /' >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    # Two budgets, both judged on what the recorder chose to spend. The
+    # resident set is judged above the program's own footprint, because its text
+    # and runtime are resident whether or not anything is being recorded.
+    if ! grep -q 'CPU: .*within budget' "$OUT_DIR/daemon.txt"; then
+        echo "daemon budget: FAIL (the CPU budget was exceeded)"
+        sed -n '/Overhead budget/,+5p' "$OUT_DIR/daemon.txt" | sed 's/^/    /' >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if ! grep -q 'recording cost: .*within budget' "$OUT_DIR/daemon.txt"; then
+        echo "daemon budget: FAIL (the memory budget was exceeded)"
+        sed -n '/Overhead budget/,+5p' "$OUT_DIR/daemon.txt" | sed 's/^/    /' >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    mem_ok=1
+
+    # The recorded cost is the recorder's own CPU, not the target's, so a
+    # reported figure over one core would mean the measurement is wrong.
+    local peak
+    peak=$(awk '/^ *CPU:/ {print $2; exit}' "$OUT_DIR/daemon.txt" | tr -d '%')
+    if ! awk -v v="$peak" 'BEGIN { exit (v + 0 <= 100) ? 0 : 1 }'; then
+        echo "daemon budget: FAIL (reported a peak of ${peak}% of one CPU, which is impossible)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    echo "daemon budget: $intervals intervals, $measured with a real scheduler measurement, peak ${peak}% of one CPU, both budgets met ($mem_ok checks)"
+}
+
 check_cpu_rate_scaling
 check_cpu_symbolization
 check_io_pairing
@@ -960,6 +1047,7 @@ check_diagnose_parallel
 check_diagnose_ranking
 check_json_document
 check_diagnose_scenarios
+check_daemon_budget
 check_net_rtt_crosscheck
 check_net_field_crosscheck
 check_net_retransmit_attribution

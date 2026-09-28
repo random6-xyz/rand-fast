@@ -190,6 +190,18 @@ pub struct DaemonArgs {
     #[arg(long, default_value = "0s", value_parser = parse_duration)]
     pub duration: Duration,
 
+    /// How often an interval is recorded into the rolling window.
+    ///
+    /// Shorter intervals catch a shorter regression and cost proportionally more
+    /// of the overhead budget, so this and the window are the two knobs that
+    /// decide what the recorder is able to see.
+    #[arg(long, default_value = "1s", value_parser = parse_duration)]
+    pub interval: Duration,
+
+    /// How much history the rolling window keeps.
+    #[arg(long, default_value = "60s", value_parser = parse_duration)]
+    pub window: Duration,
+
     /// Trigger threshold for scheduler p95 (default 10ms).
     #[arg(long, default_value = "10ms", value_parser = parse_duration)]
     pub trigger: Duration,

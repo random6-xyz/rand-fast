@@ -176,26 +176,37 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
             pid,
             duration: args.duration,
             mode,
+            // Diagnose reports once at the end, so it never ticks.
+            tick_interval: std::time::Duration::ZERO,
+            // A short report wants its events as soon as they arrive.
+            poll_interval: runtime::DEFAULT_POLL_INTERVAL,
         },
-        vec![
-            runtime::EventStream::of::<SchedulerLatencyEvent, _>(
-                "EVENTS",
-                PERF_PAGE_COUNT,
-                &mut sched_stats,
-            ),
-            runtime::EventStream::of::<CpuSampleEvent, _>(
-                "CPU_EVENTS",
-                PERF_PAGE_COUNT,
-                &mut cpu_stats,
-            ),
-            runtime::EventStream::of::<IoEvent, _>("IO_EVENTS", PERF_PAGE_COUNT, &mut io_stats),
-            runtime::EventStream::of::<TcpEvent, _>("NET_EVENTS", PERF_PAGE_COUNT, &mut net_stats),
-            runtime::EventStream::of::<OffCpuEvent, _>(
-                "OFFCPU_EVENTS",
-                PERF_PAGE_COUNT,
-                &mut offcpu_stats,
-            ),
-        ],
+        runtime::MultiStreams {
+            streams: vec![
+                runtime::EventStream::of::<SchedulerLatencyEvent, _>(
+                    "EVENTS",
+                    PERF_PAGE_COUNT,
+                    &mut sched_stats,
+                ),
+                runtime::EventStream::of::<CpuSampleEvent, _>(
+                    "CPU_EVENTS",
+                    PERF_PAGE_COUNT,
+                    &mut cpu_stats,
+                ),
+                runtime::EventStream::of::<IoEvent, _>("IO_EVENTS", PERF_PAGE_COUNT, &mut io_stats),
+                runtime::EventStream::of::<TcpEvent, _>(
+                    "NET_EVENTS",
+                    PERF_PAGE_COUNT,
+                    &mut net_stats,
+                ),
+                runtime::EventStream::of::<OffCpuEvent, _>(
+                    "OFFCPU_EVENTS",
+                    PERF_PAGE_COUNT,
+                    &mut offcpu_stats,
+                ),
+            ],
+            on_tick: None,
+        },
     )?;
 
     cpu::detach_sampler(&mut bpf, cpu_links);

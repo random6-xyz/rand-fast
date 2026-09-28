@@ -6,6 +6,8 @@
 //! `_us` suffix, rates per second with `_per_s`, byte counts in bytes with
 //! `_bytes`, and an unknown value omitted rather than serialised as null.
 
+use std::time::Duration;
+
 use serde::Serialize;
 
 use crate::{
@@ -88,6 +90,79 @@ pub fn network_json(stats: &NetStats) -> NetJson {
                     max_rcv_wnd_bytes: endpoint.max_rcv_wnd as u64,
                 }
             })
+            .collect(),
+    }
+}
+
+// --- daemon -----------------------------------------------------------------
+
+/// The `daemon` command's `data` object.
+#[derive(Debug, Clone, Serialize)]
+pub struct DaemonJson {
+    /// How long the recorder ran, in seconds.
+    pub ran_s: f64,
+    /// The rolling window the ring covers, in seconds.
+    pub window_s: f64,
+    /// How often an interval was recorded, in seconds.
+    pub interval_s: f64,
+    /// Entries the ring holds at most.
+    pub ring_entries: usize,
+    /// Intervals actually recorded.
+    pub intervals: u64,
+    /// Peak recorder CPU cost, as a percentage of one CPU.
+    pub recorder_cpu_pct: f64,
+    /// Documented CPU budget, as a percentage of one CPU.
+    pub budget_cpu_pct: f64,
+    /// True when the peak recorder CPU cost stayed inside the budget.
+    pub within_cpu_budget: bool,
+    /// Peak recorder resident set, in bytes.
+    pub recorder_memory_bytes: u64,
+    /// Documented memory budget, in bytes, for the ongoing recording.
+    pub budget_recording_bytes: u64,
+    /// True when the peak resident set stayed inside the budget.
+    pub within_memory_budget: bool,
+    /// Where incidents are written.
+    pub output_dir: String,
+    /// The most recent intervals, oldest first.
+    pub intervals_detail: Vec<serde_json::Value>,
+}
+
+/// Builds the `daemon` document's `data` object.
+pub fn daemon_json(
+    ring: &crate::daemon::Ring,
+    peak_cpu_pct: f64,
+    peak_memory_bytes: u64,
+    ticks: u64,
+) -> DaemonJson {
+    let window = ring.window();
+    let entry = ring.entries().next();
+    let interval = entry.map_or(Duration::from_secs(1), |e| {
+        e.at.checked_sub(Duration::ZERO)
+            .map_or(Duration::from_secs(1), |_| {
+                ring.entries()
+                    .nth(1)
+                    .map(|next| next.at.saturating_sub(e.at))
+                    .unwrap_or(Duration::from_secs(1))
+            })
+    });
+    DaemonJson {
+        ran_s: ring.entries().last().map_or(0.0, |e| e.at.as_secs_f64()),
+        window_s: window.as_secs_f64(),
+        interval_s: interval.as_secs_f64(),
+        ring_entries: ring.max_entries(),
+        intervals: ticks,
+        recorder_cpu_pct: peak_cpu_pct,
+        budget_cpu_pct: crate::daemon::BUDGET_CPU_PCT,
+        within_cpu_budget: peak_cpu_pct <= crate::daemon::BUDGET_CPU_PCT,
+        recorder_memory_bytes: peak_memory_bytes,
+        budget_recording_bytes: crate::daemon::BUDGET_RECORDING_BYTES,
+        within_memory_budget: peak_memory_bytes <= crate::daemon::BUDGET_RECORDING_BYTES,
+        output_dir: String::new(),
+        intervals_detail: ring
+            .entries()
+            .rev()
+            .take(10)
+            .map(|entry| entry.to_json())
             .collect(),
     }
 }
