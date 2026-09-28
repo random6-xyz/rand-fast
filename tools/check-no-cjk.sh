@@ -23,8 +23,8 @@ BASE=${1:-main}
 # and the fullwidth forms block.
 PAT='[一-鿿㐀-䶿豈-﫿぀-ゟ゠-ヿ㄰-㆏㆐-ㆿ가-힯ᄀ-ᇿㄱ-ㆎㅀ-㆏ㇰ-ㇿ㈀-㋿㌀-㍿！-｠]'
 
-# grep -P is GNU grep; fall back to a UTF-8 byte-class pattern otherwise.
-if printf '한' | grep -qP "$PAT" 2>/dev/null; then
+# grep -P is GNU grep; fall back to a plain literal match otherwise.
+if printf 'x' | grep -qP 'x' 2>/dev/null; then
     GREP_MODE=-P
 else
     GREP_MODE=-E
@@ -46,11 +46,16 @@ report() {
     return 0
 }
 
+# This script necessarily contains the ranges it looks for. It is excluded
+# from the scan by basename, since the tracked path is tools/<this file>.
+SELF=$(basename "$0")
+
 # Binary and archive payloads are skipped: they carry no reviewable text.
 skip_file() {
     case "$1" in
     *.png|*.jpg|*.jpeg|*.gif|*.ico|*.svg|*.webp|*.pdf|*.zip|*.gz|*.xz|*.bz2|*.woff|*.woff2) return 0 ;;
     esac
+    [ "$(basename "$1")" = "$SELF" ] && return 0
     return 1
 }
 

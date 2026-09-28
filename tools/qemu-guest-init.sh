@@ -76,8 +76,20 @@ export FAST=/bin/fast
 export SCHED_WORKLOAD=/bin/sched-workload
 export FAST_WORKLOAD=/bin/fast-workload
 export OUT_DIR=/tmp/fast-smoke
-export DURATION=5s
 export IO_HOG_PATH
+
+# The per-run collection window is passed on the kernel command line as
+# fast.duration=<value> so the host helper can change it without rebuilding
+# the initramfs. tools/qemu-run.sh sets it; a hand-built guest keeps 5s.
+export DURATION=5s
+if [ -r /proc/cmdline ]; then
+    for arg in $(cat /proc/cmdline); do
+        case "$arg" in
+        fast.duration=*) DURATION=${arg#fast.duration=} ;;
+        esac
+    done
+fi
+echo "guest: collection duration $DURATION"
 
 sh /tools/qemu-smoke.sh
 rc=$?
