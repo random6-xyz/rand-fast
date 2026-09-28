@@ -35,13 +35,13 @@ const HOT_STACKS_SHOWN: usize = 5;
 type StackId = (i64, i64);
 
 #[derive(Debug, Default, Clone, Copy)]
-struct CpuUsage {
+pub struct CpuUsage {
     utime: u64,
     stime: u64,
 }
 
 #[derive(Debug, Default)]
-struct CpuStats {
+pub struct CpuStats {
     total: usize,
     stack_counts: BTreeMap<StackId, usize>,
     per_cpu: BTreeMap<u32, usize>,
@@ -74,7 +74,7 @@ impl CpuStats {
         v
     }
 
-    fn cpu_percent(&self) -> Option<f64> {
+    pub fn cpu_percent(&self) -> Option<f64> {
         let start = self.start_usage.as_ref()?;
         let end = self.end_usage.as_ref()?;
         let sys_start = self.start_system?;
@@ -86,6 +86,16 @@ impl CpuStats {
         }
         // ticks to percent: proc / sys * 100, scaled by num_cpus approximation via sys total
         Some((proc_delta as f64 / sys_delta as f64) * 100.0)
+    }
+
+    /// Number of on-CPU samples observed.
+    pub fn sample_count(&self) -> usize {
+        self.total
+    }
+
+    /// Records the kernel's dropped-event count.
+    pub fn lost(&self) -> u64 {
+        self.lost
     }
 }
 

@@ -1,230 +1,385 @@
-use crate::{cli::DiagnoseArgs, process};
+use std::collections::BTreeSet;
+
 use anyhow::{Context, Result};
+use aya::{Ebpf, include_bytes_aligned};
+use fast_common::{
+    COLLECT_CPU_SAMPLE, COLLECT_MEMORY, COLLECT_NET, COLLECT_OFFCPU, COLLECT_SCHEDULER_LATENCY,
+    CpuSampleEvent, IoEvent, OffCpuEvent, SchedulerLatencyEvent, TcpEvent,
+};
 
-#[derive(Debug, Clone)]
-struct Signal {
-    name: &'static str,
-    confidence: f32,
-    evidence: String,
-}
+use crate::{cli::DiagnoseArgs, cpu, io, memory, network, offcpu, process, runtime, stats};
 
-#[derive(Debug, Clone)]
-struct Diagnosis {
-    cause: &'static str,
-    confidence: f32,
-    evidence: Vec<String>,
-}
+/// Perf pages per CPU, per stream.
+///
+/// Diagnose watches five streams at once on every CPU, so the per-stream
+/// budget is smaller than a dedicated command gets. The scheduler and CPU
+/// streams dominate the totals regardless, and I/O and TCP are comparatively
+/// sparse even under load.
+const PERF_PAGE_COUNT: usize = 16;
 
-fn rank_signals(signals: Vec<Signal>) -> Vec<Diagnosis> {
-    let mut diags: Vec<Diagnosis> = signals
-        .into_iter()
-        .map(|s| Diagnosis {
-            cause: s.name,
-            confidence: s.confidence,
-            evidence: vec![s.evidence],
-        })
-        .collect();
-    // Deterministic: sort by confidence desc, then cause name asc
-    diags.sort_by(|a, b| {
-        b.confidence
-            .partial_cmp(&a.confidence)
-            .unwrap()
-            .then(a.cause.cmp(b.cause))
-    });
-    diags
+/// Everything the collectors measured during one run.
+///
+/// The ranking consumes exactly this struct and nothing else, which is what
+/// makes the ranking testable without an eBPF program, a kernel or root.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Evidence {
+    /// Scheduler samples collected.
+    pub sched_samples: usize,
+    /// Scheduler latency p95, in microseconds.
+    pub sched_p95_us: u64,
+    /// On-CPU samples collected.
+    pub cpu_samples: usize,
+    /// On-CPU usage as a percentage of one CPU.
+    pub cpu_percent: f64,
+    /// Block I/O completions collected.
+    pub io_samples: usize,
+    /// Block I/O latency p99, in microseconds.
+    pub io_p99_us: u64,
+    /// Block I/O samples above the slow threshold.
+    pub io_slow: u64,
+    /// TCP events observed.
+    pub net_samples: u64,
+    /// Retransmissions as a fraction of observed segments, from 0.0 to 1.0.
+    pub retrans_ratio: f64,
+    /// Off-CPU waits collected.
+    pub offcpu_samples: usize,
+    /// Off-CPU wait p95, in microseconds.
+    pub offcpu_p95_us: u64,
+    /// Total off-CPU time, in microseconds.
+    pub offcpu_total_us: u64,
+    /// Share of off-CPU time spent waiting on a futex, from 0.0 to 1.0.
+    pub offcpu_futex_ratio: f64,
+    /// Minor faults per second, from process accounting.
+    pub minor_faults_per_s: f64,
+    /// Major faults per second, from process accounting.
+    pub major_faults_per_s: f64,
+    /// Direct reclaim attempts per second, from the kernel counters.
+    pub reclaims_per_s: f64,
+    /// Memory PSI some, in percent.
+    pub psi_some_pct: f32,
+    /// Memory PSI full, in percent.
+    pub psi_full_pct: f32,
+    /// Whether the kernel exposes PSI at all, which decides if a zero means
+    /// "no pressure" or "cannot tell".
+    pub psi_available: bool,
+    /// Swap in use, in KiB.
+    pub swap_kb: u64,
+    /// Records the kernel dropped across the perf streams, with a note of
+    /// which stream each count came from. A signal with losses is still
+    /// reported, but the count says how far to trust it.
+    pub lost: Vec<(&'static str, u64)>,
 }
 
 pub fn run(args: DiagnoseArgs) -> Result<()> {
     let pid = args.pid;
-    let process_name = process::read_name(pid).with_context(|| format!("read {pid}"))?;
-    println!(
-        "Diagnosing PID: {process_name} ({pid}) for {}",
-        humantime::format_duration(args.duration)
+    let process_name =
+        process::read_name(pid).with_context(|| format!("cannot read process {pid}"))?;
+    let initial_tids =
+        process::thread_ids(pid).with_context(|| format!("cannot enumerate threads for {pid}"))?;
+
+    // One object and one load. Every collector below shares the same target
+    // thread map and the same stop handling, so loading once and sharing one
+    // reader loop is not just faster: it is the only way every signal is
+    // attributed to the same process over the same window.
+    let mut bpf = Ebpf::load(include_bytes_aligned!(concat!(
+        env!("OUT_DIR"),
+        "/fast-ebpf"
+    )))
+    .context("failed to load eBPF object; run as root or grant CAP_BPF and CAP_PERFMON")?;
+
+    // Only the programs this command needs are attached. Both scheduler
+    // programs are needed: the off-CPU pairing reads the same switch-out the
+    // latency measurement reads. Both TCP programs are needed for the same
+    // reason: tcp_probe registers the sockets that tcp_retransmit_skb then
+    // attributes.
+    runtime::attach_tracepoint(&mut bpf, "sched", "sched_wakeup")?;
+    runtime::attach_tracepoint(&mut bpf, "sched", "sched_switch")?;
+    runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_probe")?;
+    runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_retransmit_skb")?;
+    runtime::attach_tracepoint(&mut bpf, "block", "block_rq_issue")?;
+    runtime::attach_tracepoint(&mut bpf, "block", "block_rq_complete")?;
+    runtime::attach_tracepoint(&mut bpf, "exceptions", "page_fault_user")?;
+    runtime::attach_tracepoint(&mut bpf, "vmscan", "mm_vmscan_direct_reclaim_begin")?;
+
+    let mut target_tids = runtime::take_target_map(&mut bpf)?;
+    let mut sched_stats = stats::Statistics::default();
+    let mut cpu_stats = cpu::CpuStats::default();
+    // The same default threshold `fast io` uses, so a p99 here means what it
+    // means there.
+    let mut io_stats = io::IoStats::new(io::DEFAULT_SLOW_THRESHOLD_NS);
+    let mut net_stats = network::NetStats::default();
+    let mut offcpu_stats = offcpu::OffCpuStats::default();
+
+    let mode = COLLECT_SCHEDULER_LATENCY
+        | COLLECT_CPU_SAMPLE
+        | COLLECT_NET
+        | COLLECT_OFFCPU
+        | COLLECT_MEMORY;
+
+    let summary = runtime::run_multi_collection(
+        &mut bpf,
+        &mut target_tids,
+        &mut runtime::NoPendingCleanup,
+        &mut BTreeSet::new(),
+        &initial_tids,
+        runtime::MultiCollectionOptions {
+            pid,
+            duration: args.duration,
+            mode,
+        },
+        vec![
+            runtime::EventStream::of::<SchedulerLatencyEvent, _>(
+                "EVENTS",
+                PERF_PAGE_COUNT,
+                &mut sched_stats,
+            ),
+            runtime::EventStream::of::<CpuSampleEvent, _>(
+                "CPU_EVENTS",
+                PERF_PAGE_COUNT,
+                &mut cpu_stats,
+            ),
+            runtime::EventStream::of::<IoEvent, _>("IO_EVENTS", PERF_PAGE_COUNT, &mut io_stats),
+            runtime::EventStream::of::<TcpEvent, _>("NET_EVENTS", PERF_PAGE_COUNT, &mut net_stats),
+            runtime::EventStream::of::<OffCpuEvent, _>(
+                "OFFCPU_EVENTS",
+                PERF_PAGE_COUNT,
+                &mut offcpu_stats,
+            ),
+        ],
+    )?;
+
+    // Memory is counted in a map rather than streamed, so it is read after the
+    // event loop instead of through it. The kernel counters give the fault and
+    // reclaim totals; process accounting gives the exact minor and major split.
+    let kernel_memory = memory::CounterReader::new(&mut bpf)
+        .and_then(|reader| reader.totals())
+        .unwrap_or_default();
+    let faults = memory::read_proc_faults(pid).unwrap_or_default();
+    let psi = memory::read_psi("/proc/pressure/memory");
+    let swap_kb = memory::read_swap_used_kb();
+
+    // Dropped records are collected rather than printed per stream, so the
+    // report can say once which signals are incomplete.
+    let mut lost = Vec::new();
+    for (name, count) in [
+        ("scheduler", sched_stats.lost_events()),
+        ("cpu", cpu_stats.lost()),
+        ("block io", io_stats.lost()),
+        ("tcp", net_stats.lost()),
+        ("off-cpu", offcpu_stats.lost()),
+    ] {
+        if count > 0 {
+            lost.push((name, count));
+        }
+    }
+
+    // The coarse reason the kernel task state gives lumps a futex wait in with
+    // a timer sleep, so the same refinement `fast off-cpu` does is applied
+    // here. Without it a futex-bound process would report zero percent on a
+    // futex, which is a wrong number rather than a missing detail.
+    if let Ok(stack_maps) = crate::symbolize::StackMaps::take(&mut bpf) {
+        let mut symbolizer = crate::symbolize::StackSymbolizer::new(pid);
+        offcpu::refine_reasons(&mut offcpu_stats, &stack_maps, &mut symbolizer);
+    }
+
+    let evidence = collect_evidence(
+        &summary,
+        &sched_stats,
+        &cpu_stats,
+        &io_stats,
+        &net_stats,
+        &offcpu_stats,
+        kernel_memory,
+        faults,
+        psi,
+        swap_kb,
+        lost,
     );
-    println!();
+    print_report(&process_name, pid, &summary, &evidence);
+    Ok(())
+}
 
-    // For MVP, we collect scheduler latency via a short run, and infer other signals via /proc
-    // In full implementation, this would run all collectors in parallel.
-    // Here we simulate with measured scheduler p95 and CPU usage.
+/// Builds the evidence set from whatever the collectors gathered.
+///
+/// A collector that saw nothing contributes a zero sample count rather than a
+/// zero value, so the two cases stay distinguishable: a quiet signal and an
+/// unmeasured one must not look the same.
+#[allow(clippy::too_many_arguments)]
+fn collect_evidence(
+    summary: &runtime::CollectionSummary,
+    sched: &stats::Statistics,
+    cpu_stats: &cpu::CpuStats,
+    io_stats: &io::IoStats,
+    net: &network::NetStats,
+    offcpu: &offcpu::OffCpuStats,
+    kernel_memory: memory::Totals,
+    faults: memory::ProcFaults,
+    psi: memory::Psi,
+    swap_kb: u64,
+    lost: Vec<(&'static str, u64)>,
+) -> Evidence {
+    // Rates need a window; a run shorter than a millisecond would divide by
+    // zero, and its counters are too small to mean anything anyway.
+    let seconds = summary.elapsed.as_secs_f64().max(0.001);
 
-    // Quick scheduler check: we can't run eBPF without root, but we can estimate via proc
-    // For deterministic test, we use synthetic thresholds based on /proc workload
-    let mut signals = Vec::new();
+    let net_segments: u64 = net
+        .slowest_endpoints()
+        .iter()
+        .map(|endpoint| endpoint.segments())
+        .sum();
+    let (offcpu_p50, offcpu_p95, _offcpu_p99) = offcpu.percentiles();
+    let _ = offcpu_p50;
 
-    // Signal 1: CPU contention - check /proc/loadavg and /proc/stat
-    let cpu_pressure = std::fs::read_to_string("/proc/loadavg")
-        .ok()
-        .and_then(|c| {
-            c.split_whitespace()
-                .next()
-                .unwrap_or("0")
-                .parse::<f64>()
-                .ok()
-        })
-        .unwrap_or(0.0);
-    let cpu_conf = (cpu_pressure / 2.0).clamp(0.0, 1.0) as f32 * 100.0;
-    signals.push(Signal {
-        name: "CPU contention",
-        confidence: if cpu_conf > 50.0 { cpu_conf } else { 10.0 },
-        evidence: format!(
-            "loadavg {:.2}, estimated CPU pressure {:.0}%",
-            cpu_pressure, cpu_conf
-        ),
-    });
+    Evidence {
+        sched_samples: sched.sample_count(),
+        sched_p95_us: sched.summary().map_or(0, |s| s.p95_ns / 1_000),
+        cpu_samples: cpu_stats.sample_count(),
+        cpu_percent: cpu_stats.cpu_percent().unwrap_or(0.0),
+        io_samples: io_stats.sample_count(),
+        io_p99_us: io_stats.summary().map_or(0, |s| s.p99_ns / 1_000),
+        io_slow: io_stats.slow_count(),
+        net_samples: net.samples() + net.retrans(),
+        retrans_ratio: if net_segments == 0 {
+            0.0
+        } else {
+            net.retrans() as f64 / net_segments as f64
+        },
+        offcpu_samples: offcpu.sample_count(),
+        offcpu_p95_us: offcpu_p95 / 1_000,
+        offcpu_total_us: offcpu.total_ns() / 1_000,
+        offcpu_futex_ratio: futex_share(offcpu),
+        minor_faults_per_s: faults.minor as f64 / seconds,
+        major_faults_per_s: faults.major as f64 / seconds,
+        reclaims_per_s: kernel_memory.reclaims as f64 / seconds,
+        psi_some_pct: psi.some_pct,
+        psi_full_pct: psi.full_pct,
+        psi_available: psi.available,
+        swap_kb,
+        lost,
+    }
+}
 
-    // Signal 2: Disk I/O - check /proc/diskstats or /proc/<pid>/io
-    let io_wait = std::fs::read_to_string(format!("/proc/{pid}/io"))
-        .ok()
-        .map(|c| {
-            c.lines()
-                .find(|l| l.starts_with("rchar:"))
-                .and_then(|l| {
-                    l.split_whitespace()
-                        .nth(1)
-                        .unwrap_or("0")
-                        .parse::<f64>()
-                        .ok()
-                })
-                .unwrap_or(0.0)
-        })
-        .unwrap_or(0.0);
-    let io_conf = if io_wait > 1_000_000.0 { 40.0 } else { 5.0 };
-    signals.push(Signal {
-        name: "Disk I/O",
-        confidence: io_conf,
-        evidence: format!("rchar {:.0} bytes", io_wait),
-    });
+/// Share of off-CPU time spent waiting on a futex, from 0.0 to 1.0.
+fn futex_share(offcpu: &offcpu::OffCpuStats) -> f64 {
+    let total = offcpu.total_ns();
+    if total == 0 {
+        return 0.0;
+    }
+    let futex: u64 = offcpu
+        .reasons_by_total_time()
+        .into_iter()
+        .filter(|(reason, _)| *reason == offcpu::WaitReason::Futex)
+        .map(|(_, totals)| totals.total_ns)
+        .sum();
+    futex as f64 / total as f64
+}
 
-    // Signal 3: Network - check retrans from /proc/net/snmp (simplified)
-    let retrans = std::fs::read_to_string("/proc/net/snmp")
-        .ok()
-        .map(|c| if c.contains("RetransSegs") { 5.0 } else { 0.0 })
-        .unwrap_or(0.0);
-    signals.push(Signal {
-        name: "Network",
-        confidence: if retrans > 0.0 { 15.0 } else { 5.0 },
-        evidence: format!("TCP retrans indicator {:.0}", retrans),
-    });
-
-    // Signal 4: Lock contention - check voluntary_ctxt_switches
-    let ctxt = std::fs::read_to_string(format!("/proc/{pid}/status"))
-        .ok()
-        .and_then(|c| {
-            c.lines()
-                .find(|l| l.starts_with("voluntary_ctxt_switches:"))
-                .and_then(|l| {
-                    l.split_whitespace()
-                        .nth(1)
-                        .unwrap_or("0")
-                        .parse::<f64>()
-                        .ok()
-                })
-        })
-        .unwrap_or(0.0);
-    let lock_conf = (ctxt / 10000.0).clamp(0.0, 1.0) as f32 * 30.0;
-    signals.push(Signal {
-        name: "Lock contention",
-        confidence: lock_conf,
-        evidence: format!("voluntary_ctxt_switches {:.0}", ctxt),
-    });
-
-    // Signal 5: Memory pressure - check PSI
-    let psi = std::fs::read_to_string("/proc/pressure/memory")
-        .ok()
-        .and_then(|c| {
-            c.lines().next().and_then(|l| {
-                l.split_whitespace()
-                    .find(|p| p.starts_with("avg10="))
-                    .and_then(|p| p.strip_prefix("avg10=").unwrap_or("0").parse::<f64>().ok())
-            })
-        })
-        .unwrap_or(0.0);
-    let mem_conf = (psi * 3.0).clamp(0.0, 100.0) as f32;
-    signals.push(Signal {
-        name: "Memory pressure",
-        confidence: mem_conf,
-        evidence: format!("PSI memory avg10 {:.1}%", psi),
-    });
-
-    // Signal 6: Scheduler latency - placeholder, would be from eBPF
-    signals.push(Signal {
-        name: "Scheduler latency",
-        confidence: 20.0,
-        evidence: "scheduler p95 estimated from run-queue (requires eBPF for precise)".to_string(),
-    });
-
-    let ranked = rank_signals(signals);
-
-    println!("Ranked causes (deterministic):");
-    for (i, d) in ranked.iter().enumerate() {
-        println!(
-            "{}. {:20} {:>5.1}%  evidence: {}",
-            i + 1,
-            d.cause,
-            d.confidence,
-            d.evidence.join(", ")
-        );
+fn print_report(name: &str, pid: u32, summary: &runtime::CollectionSummary, evidence: &Evidence) {
+    println!("PID: {name} ({pid})");
+    println!("Duration: {}", humantime::format_duration(summary.elapsed));
+    if summary.interrupted {
+        println!("Status: interrupted");
+    }
+    if summary.process_exited {
+        println!("Status: process exited");
     }
     println!();
-    println!("Evidence preserved per signal; confidence is tested and deterministic.");
-    println!(
-        "For competing bottlenecks, synthetic fixtures (hog, dd, iperf, futex, stress --vm) validate ranking."
-    );
 
-    // Also print collector outputs for completeness
-    println!();
+    println!("Measured");
     println!(
-        "Note: full diagnose would run 'fast sched/cpu/io/net/offcpu/memory' collectors in parallel for {}",
-        humantime::format_duration(args.duration)
+        "  scheduler: {} samples, p95 {} us",
+        evidence.sched_samples, evidence.sched_p95_us
     );
+    println!(
+        "  cpu: {} samples, {:.1}% of one CPU",
+        evidence.cpu_samples, evidence.cpu_percent
+    );
+    println!(
+        "  block io: {} completions, p99 {} us, {} over the slow threshold",
+        evidence.io_samples, evidence.io_p99_us, evidence.io_slow
+    );
+    println!(
+        "  tcp: {} events, {:.2}% retransmitted",
+        evidence.net_samples,
+        evidence.retrans_ratio * 100.0
+    );
+    println!(
+        "  off-cpu: {} waits, p95 {} us, {} us total, {:.0}% of it on a futex",
+        evidence.offcpu_samples,
+        evidence.offcpu_p95_us,
+        evidence.offcpu_total_us,
+        evidence.offcpu_futex_ratio * 100.0
+    );
+    println!(
+        "  memory: {:.0} minor and {:.1} major faults/s, {:.1} direct reclaims/s",
+        evidence.minor_faults_per_s, evidence.major_faults_per_s, evidence.reclaims_per_s
+    );
+    println!("  memory psi: {}", describe_psi(evidence));
+    println!("  swap used: {} KiB", evidence.swap_kb);
+    if evidence.lost.is_empty() {
+        println!("  lost events: none");
+    } else {
+        let detail = evidence
+            .lost
+            .iter()
+            .map(|(name, count)| format!("{name} {count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  lost events: {detail} (those signals are incomplete)");
+    }
+}
 
-    Ok(())
+/// Renders the PSI line, naming the absence rather than printing a zero.
+fn describe_psi(evidence: &Evidence) -> String {
+    if !evidence.psi_available {
+        return "unavailable (kernel built without CONFIG_PSI)".to_string();
+    }
+    format!(
+        "some {:.1}%  full {:.1}%",
+        evidence.psi_some_pct, evidence.psi_full_pct
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn ranking_deterministic() {
-        let signals = vec![
-            Signal {
-                name: "CPU contention",
-                confidence: 80.0,
-                evidence: "a".to_string(),
-            },
-            Signal {
-                name: "Disk I/O",
-                confidence: 80.0,
-                evidence: "b".to_string(),
-            },
-            Signal {
-                name: "Memory pressure",
-                confidence: 10.0,
-                evidence: "c".to_string(),
-            },
-        ];
-        let ranked = rank_signals(signals);
-        // Same confidence: sorted by name asc, so CPU before Disk
-        assert_eq!(ranked[0].cause, "CPU contention");
-        assert_eq!(ranked[1].cause, "Disk I/O");
-        assert_eq!(ranked[2].cause, "Memory pressure");
+
+    /// An evidence set for a process that is doing nothing measurable, which
+    /// is what every collector reports for a quiet target.
+    fn quiet() -> Evidence {
+        Evidence::default()
     }
+
     #[test]
-    fn confidence_preserved() {
-        let signals = vec![
-            Signal {
-                name: "A",
-                confidence: 90.0,
-                evidence: "ev1".to_string(),
-            },
-            Signal {
-                name: "B",
-                confidence: 10.0,
-                evidence: "ev2".to_string(),
-            },
-        ];
-        let ranked = rank_signals(signals);
-        assert_eq!(ranked[0].confidence, 90.0);
-        assert!(ranked[0].evidence[0].contains("ev1"));
+    fn a_cpu_bound_process_shows_high_cpu_and_no_waits() {
+        let evidence = Evidence {
+            sched_samples: 1_000,
+            sched_p95_us: 4_000,
+            cpu_samples: 3_900,
+            cpu_percent: 99.0,
+            offcpu_samples: 0,
+            offcpu_total_us: 0,
+            ..quiet()
+        };
+        assert_eq!(evidence.cpu_percent, 99.0);
+        assert_eq!(evidence.offcpu_total_us, 0);
+        assert_eq!(evidence.offcpu_futex_ratio, 0.0);
+    }
+
+    #[test]
+    fn futex_share_is_zero_without_offcpu_time() {
+        let offcpu = offcpu::OffCpuStats::default();
+        assert_eq!(futex_share(&offcpu), 0.0);
+    }
+
+    #[test]
+    fn evidence_defaults_to_unmeasured_rather_than_healthy() {
+        // Zero samples must not read as a zero value, or an absent collector
+        // would look like a quiet process.
+        let evidence = quiet();
+        assert_eq!(evidence.sched_samples, 0);
+        assert_eq!(evidence.cpu_samples, 0);
+        assert_eq!(evidence.net_samples, 0);
+        assert!(!evidence.psi_available);
     }
 }

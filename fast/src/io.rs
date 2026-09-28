@@ -19,7 +19,7 @@ const SLOW_TABLE_ROWS: usize = 16;
 
 /// Aggregate counters for one operation kind.
 #[derive(Debug, Default, Clone, Copy)]
-struct OpStats {
+pub struct OpStats {
     count: u64,
     sectors: u64,
 }
@@ -33,7 +33,7 @@ impl OpStats {
 
 /// Per-device statistics: latency samples, operation split, and sectors moved.
 #[derive(Debug, Default)]
-struct DeviceStats {
+pub struct DeviceStats {
     latencies: Vec<u64>,
     read: OpStats,
     write: OpStats,
@@ -88,8 +88,13 @@ impl PartialOrd for SlowEntry {
     }
 }
 
-#[derive(Debug)]
-struct IoStats {
+/// Default slow-I/O threshold, in nanoseconds.
+///
+/// This is the same 10ms the `--threshold` flag defaults to, and `fast
+/// diagnose` uses it so a p99 quoted by either command means the same thing.
+pub const DEFAULT_SLOW_THRESHOLD_NS: u64 = 10_000_000;
+
+pub struct IoStats {
     threshold_ns: u64,
     latencies: Vec<u64>,
     by_device: BTreeMap<u32, DeviceStats>,
@@ -101,7 +106,8 @@ struct IoStats {
 }
 
 impl IoStats {
-    fn new(threshold_ns: u64) -> Self {
+    /// Builds a collector that calls anything above `threshold_ns` slow.
+    pub fn new(threshold_ns: u64) -> Self {
         Self {
             threshold_ns,
             latencies: Vec::new(),
@@ -136,8 +142,23 @@ impl IoStats {
         self.lost = self.lost.saturating_add(count);
     }
 
-    fn summary(&self) -> Option<Summary> {
+    pub fn summary(&self) -> Option<Summary> {
         summary(&self.latencies)
+    }
+
+    /// Number of completions observed.
+    pub fn sample_count(&self) -> usize {
+        self.latencies.len()
+    }
+
+    /// Records the kernel's dropped-event count.
+    pub fn lost(&self) -> u64 {
+        self.lost
+    }
+
+    /// Number of completions above the slow threshold.
+    pub fn slow_count(&self) -> u64 {
+        self.slow
     }
 
     /// Slow-I/O table rows, slowest first.
@@ -177,12 +198,17 @@ impl runtime::EventHandler<IoEvent> for IoStats {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Summary {
-    count: usize,
-    p50_ns: u64,
-    p95_ns: u64,
-    p99_ns: u64,
-    max_ns: u64,
+pub struct Summary {
+    /// Number of completions the percentiles were computed over.
+    pub count: usize,
+    /// Median latency, in nanoseconds.
+    pub p50_ns: u64,
+    /// 95th percentile latency, in nanoseconds.
+    pub p95_ns: u64,
+    /// 99th percentile latency, in nanoseconds.
+    pub p99_ns: u64,
+    /// Longest single latency, in nanoseconds.
+    pub max_ns: u64,
 }
 
 fn summary(values: &[u64]) -> Option<Summary> {

@@ -132,6 +132,7 @@ run_case io "$FAST_WORKLOAD" io-hog --duration 30s --workers 2 --path "$IO_HOG_P
 run_case net "$FAST_WORKLOAD" net-hog --duration 30s --workers 4
 run_case off-cpu "$FAST_WORKLOAD" lock-hog --duration 30s --workers 16
 run_case memory "$FAST_WORKLOAD" mem-hog --duration 30s --workers 2
+run_case diagnose "$FAST_WORKLOAD" lock-hog --duration 30s --workers 16
 
 # --- v1.0 accuracy checks ---
 check_cpu_rate_scaling() {
@@ -731,6 +732,43 @@ check_memory_verdict() {
     fi
 }
 
+# Proves the parallel collection really is parallel.
+#
+# `fast diagnose` used to run no eBPF at all and infer everything from /proc.
+# The check is that one run of the single loaded object reports real
+# measurements from several streams at once: a process that blocks on a futex
+# must show off-CPU waits, and the same run must also show scheduler latency,
+# because both come out of one collection over one window.
+check_diagnose_parallel() {
+    local report="$OUT_DIR/diagnose-load.txt"
+    if [ ! -f "$report" ]; then
+        echo "diagnose parallel: SKIP (no diagnose report from the matrix)"
+        return
+    fi
+
+    local sched offcpu io_samples
+    sched=$(awk '/^ *scheduler:/ { print $2; exit }' "$report")
+    offcpu=$(awk '/^ *off-cpu:/ { print $2; exit }' "$report")
+    io_samples=$(awk '/^ *block io:/ { print $2; exit }' "$report")
+    if [ -z "${sched:-}" ] || [ -z "${offcpu:-}" ] || [ -z "${io_samples:-}" ]; then
+        echo "diagnose parallel: FAIL (a stream is missing from the report)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    # lock-hog blocks constantly, so off-CPU and scheduler both have to be
+    # populated from the same run. A zero on either means that stream never
+    # produced an event, which is what a broken parallel load would look like.
+    if [ "$offcpu" -eq 0 ]; then
+        echo "diagnose parallel: FAIL (off-CPU stream reported no waits for lock-hog)"
+        FAILURES=$((FAILURES + 1))
+    elif [ "$sched" -eq 0 ]; then
+        echo "diagnose parallel: FAIL (scheduler stream reported no samples)"
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "diagnose parallel: $sched scheduler and $offcpu off-CPU samples from one run"
+    fi
+}
+
 check_cpu_rate_scaling
 check_cpu_symbolization
 check_io_pairing
@@ -738,6 +776,7 @@ check_offcpu_shape
 check_offcpu_ranking
 check_memory_fault_counter
 check_memory_verdict
+check_diagnose_parallel
 check_net_rtt_crosscheck
 check_net_field_crosscheck
 check_net_retransmit_attribution
@@ -762,6 +801,7 @@ print_metrics io 'Samples:|rchar:'
 print_metrics net 'Retransmissions:|RTT p50'
 print_metrics off-cpu 'Samples:'
 print_metrics memory 'eBPF user faults|minor |direct reclaim'
+print_metrics diagnose 'scheduler:|cpu:|block io:|tcp:|off-cpu:|memory:|lost events:'
 echo
 echo "Raw reports saved under $OUT_DIR"
 

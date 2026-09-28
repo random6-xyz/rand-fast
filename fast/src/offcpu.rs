@@ -290,6 +290,34 @@ fn format_ns(ns: u64) -> String {
     format!("{:.2} s", ns as f64 / 1_000_000_000.0)
 }
 
+/// Refines every stack's wait reason from its symbolized frames.
+///
+/// Shared with `fast diagnose`, which reports the same numbers. Doing it in
+/// one place matters because the coarse reason the kernel task state gives is
+/// not merely imprecise: it lumps a futex wait in with a timer sleep, so
+/// without this step a futex-bound process reports zero percent on a futex.
+/// That is a wrong number rather than a missing detail, and it would mislead
+/// the diagnosis that consumes it.
+pub fn refine_reasons(
+    stats: &mut OffCpuStats,
+    stack_maps: &StackMaps,
+    symbolizer: &mut StackSymbolizer,
+) {
+    let stack_ids: Vec<i64> = stats.by_stack.keys().copied().collect();
+    for stack_id in stack_ids {
+        let coarse = stats
+            .by_stack
+            .get(&stack_id)
+            .map(|stack| stack.reason)
+            .unwrap_or(WaitReason::Unknown);
+        let frames = match stack_maps.read(stack_id, false) {
+            Ok(ips) => symbolizer.kernel_frames(&ips),
+            Err(_) => Vec::new(),
+        };
+        stats.refine_stack_reason(stack_id, coarse.refine(&frames));
+    }
+}
+
 pub fn run(args: OffCpuArgs) -> Result<()> {
     let pid = args.pid;
     let process_name = process::read_name(pid).with_context(|| format!("cannot read {pid}"))?;
@@ -339,21 +367,7 @@ pub fn run(args: OffCpuArgs) -> Result<()> {
     let stack_maps = StackMaps::take(&mut bpf)?;
     let mut symbolizer = StackSymbolizer::new(pid);
 
-    // Refine each stack's reason from its symbols, then rebuild the reason
-    // totals from the refined values.
-    let ranked_ids: Vec<i64> = stats.by_stack.keys().copied().collect();
-    for stack_id in &ranked_ids {
-        let coarse = stats
-            .by_stack
-            .get(stack_id)
-            .map(|stack| stack.reason)
-            .unwrap_or(WaitReason::Unknown);
-        let frames = match stack_maps.read(*stack_id, false) {
-            Ok(ips) => symbolizer.kernel_frames(&ips),
-            Err(_) => Vec::new(),
-        };
-        stats.refine_stack_reason(*stack_id, coarse.refine(&frames));
-    }
+    refine_reasons(&mut stats, &stack_maps, &mut symbolizer);
 
     print_report(
         &process_name,
