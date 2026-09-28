@@ -15,6 +15,7 @@ mod runtime;
 mod scoring;
 mod stats;
 mod symbolize;
+mod trigger;
 
 use std::process::ExitCode;
 

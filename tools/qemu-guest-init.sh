@@ -149,6 +149,32 @@ for f in /tmp/fast-smoke/scenario-*.json; do
     echo "----- $f -----"
     tr ',' '\n' <"$f"
 done
+# One incident bundle per trigger case, so the bundle layout itself is
+# inspectable from the log rather than only asserted by the checks. The first
+# bundle of each case is the one written for the earliest interval that tripped.
+echo "=== incident bundles ==="
+for dir in /tmp/fast-smoke/trigger-*/incident-*/; do
+    [ -d "$dir" ] || continue
+    case "$dir" in
+    *io/incident-*) first=1 ;;
+    *net/incident-*) first=1 ;;
+    *sched/incident-*) first=1 ;;
+    *) first=0 ;;
+    esac
+    # Only one bundle per case: there are eighteen of them and they are
+    # near-identical, and the point here is the shape of a bundle.
+    if [ "$first" = 1 ]; then
+        first=0
+        echo "----- $dir -----"
+        ls -1 "$dir"
+        for f in "$dir"summary.txt; do
+            [ -f "$f" ] || continue
+            cat "$f"
+        done
+        echo "--- manifest.json ---"
+        tr ',' '\n' <"$dir/manifest.json" 2>/dev/null
+    fi
+done
 sync
 poweroff -f
 # Fallback if poweroff is not honored

@@ -1036,6 +1036,164 @@ check_daemon_budget() {
     echo "daemon budget: $intervals intervals, $measured with a real scheduler measurement, peak ${peak}% of one CPU, both budgets met ($mem_ok checks)"
 }
 
+# Proves each trigger fires for its own fixture and not for the others.
+#
+# A trigger that fires on everything would pass a "did anything fire" check
+# while being useless, so every case here requires the matching trigger to have
+# fired and the run's incident tally to name it. The network case additionally
+# requires the opposite: the I/O and scheduler triggers must stay quiet, because
+# a link that is losing packets is not a disk that is stuck.
+TRIGGER_RUN=${TRIGGER_RUN:-20s}
+
+trigger_case() {
+    # trigger_case <name> <expected signal> <unexpected signal> <fixture...>
+    local name="$1" expect="$2" unexpected="$3"
+    shift 3
+    local dir="$OUT_DIR/trigger-$name"
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    local log="$OUT_DIR/trigger-$name.txt"
+
+    "$@" >"$OUT_DIR/trigger-$name-fixture.log" 2>&1 &
+    local target_pid=$!
+    sleep 0.3
+
+    # The trigger under test is left on with a threshold the fixture will cross;
+    # every other trigger is off, so the only thing that can produce an
+    # incident is the one under test. A trigger set so high nothing could reach
+    # it would prove nothing.
+    "$FAST" daemon --pid "$target_pid" --duration "$TRIGGER_RUN" \
+        --interval 1s --window 120s --output "$dir" \
+        $(trigger_flags "$name") \
+        >"$log" 2>&1 || true
+    kill "$target_pid" 2>/dev/null
+    wait "$target_pid" 2>/dev/null
+
+    local incidents
+    # Field 3, because the line is "  incidents written: <n>".
+    incidents=$(awk '/^  incidents written:/ {print $3; exit}' "$log")
+    incidents=${incidents:-0}
+    if [ "$incidents" -lt 1 ]; then
+        echo "daemon trigger $name: FAIL (no incident written; the $expect trigger did not fire)"
+        sed -n '/^Triggers/,+8p;/^Recent intervals/,+6p' "$log" | sed 's/^/    /' >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    # The manifest, not the summary line: the bundle is what an operator
+    # actually opens, so it is what has to be right. A glob rather than find,
+    # which the minimal guest may not carry, and the first bundle is the one
+    # written for the earliest interval that tripped.
+    local manifest=""
+    for candidate in "$dir"/*/manifest.json; do
+        if [ -f "$candidate" ]; then
+            manifest="$candidate"
+            break
+        fi
+    done
+    if [ -z "$manifest" ]; then
+        echo "daemon trigger $name: FAIL ($incidents incident(s) counted, no bundle under $dir)"
+        ls -R "$dir" 2>&1 | head -8 | sed 's/^/    /' >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if ! grep -q "\"signal\": \"$expect\"" "$manifest"; then
+        echo "daemon trigger $name: FAIL (bundle names the wrong trigger; expected $expect)"
+        grep -E '"signal"|"measured"|"threshold"' "$manifest" | sed 's/^/    /' >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if grep -q "\"signal\": \"$unexpected\"" "$manifest"; then
+        echo "daemon trigger $name: FAIL (the $unexpected trigger also fired; it should have stayed quiet)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    # The bundle has to be readable without the tool in front of you. The
+    # summary sits next to the manifest, which is inside the bundle directory.
+    local summary="$(dirname "$manifest")/summary.txt"
+    if [ ! -s "$summary" ] || ! grep -q "$expect" "$summary"; then
+        echo "daemon trigger $name: FAIL (the bundle's plain-text summary does not name the trigger)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    echo "daemon trigger $name: $incidents incident(s), $expect fired, $unexpected stayed quiet"
+
+    # The recorder's cost under this fixture, reported rather than asserted.
+    # It is the honest answer to "is a flight recorder cheap": the cost follows
+    # the rate of the events it is watching, so a saturating reader costs far
+    # more than a steady server. Recorded here so the number is in the log next
+    # to the measurement rather than only in a document.
+    local peak_cost
+    peak_cost=$(awk '/^ *CPU:/ {print $2; exit}' "$log" | tr -d '%')
+    echo "  cost under this fixture: ${peak_cost:-?}% of one CPU"
+}
+
+# The complete trigger flag set for a case: exactly one on, the rest off.
+#
+# Written out in full every time rather than layered on top of the defaults,
+# because a case that forgot to disable something would then be testing the
+# default threshold instead of the one it means to test. Each case names its
+# one trigger exactly once, so no flag is ever passed twice.
+trigger_flags() {
+    local off="--trigger-sched-p95 off --trigger-io-p99 off --trigger-retrans off"
+    off="$off --trigger-psi-some off --trigger-psi-full off --trigger-cpu off"
+    case "$1" in
+    io)
+        # The io-hog reads 256 MiB with O_DIRECT against a real block device,
+        # which measures a p99 of about 37us on this storage. A 30us threshold
+        # is deliberately more sensitive than the 25ms production default: it
+        # is set here to prove the trigger is wired to the I/O measurement and
+        # not to something else, and says nothing about what threshold a real
+        # disk should have. A real disk test would need a throttled device,
+        # which this kernel does not offer.
+        echo "--trigger-sched-p95 off --trigger-retrans off --trigger-psi-some off"
+        echo "--trigger-psi-full off --trigger-cpu off --trigger-io-p99 30us"
+        ;;
+    net)
+        # The cycling receive window loses packets every round, so a handful in
+        # one interval is reached quickly.
+        echo "--trigger-sched-p95 off --trigger-io-p99 off --trigger-retrans 2"
+        echo "--trigger-psi-some off --trigger-psi-full off --trigger-cpu off"
+        ;;
+    sched)
+        # Chosen from the two measured regimes rather than picked. An idle
+        # scheduler on this kernel reports a p95 of about 12us; sixteen threads
+        # fighting over one lock report about 504us. 200us sits between them with
+        # room on both sides, so the case separates "watching the scheduler" from
+        # "watching nothing" without depending on a marginal crossing. The
+        # production default of 10ms is far above what this fixture produces and
+        # is deliberately not used here: it would be a threshold the fixture
+        # could never reach, which would test nothing.
+        echo "--trigger-sched-p95 200us --trigger-io-p99 off --trigger-retrans off"
+        echo "--trigger-psi-some off --trigger-psi-full off --trigger-cpu off"
+        ;;
+    *)
+        echo "$off"
+        ;;
+    esac
+}
+
+check_daemon_triggers() {
+    # The block device is real, because reads served from tmpfs never reach the
+    # block tracepoints and the I/O trigger could then only be tested against a
+    # signal the fixture never produces.
+    trigger_case io io_p99 sched_p95 \
+        "$FAST_WORKLOAD" io-hog --duration "$TRIGGER_RUN" --workers 2 \
+        --path "$IO_HOG_PATH" --size-mib 256
+
+    trigger_case net retrans io_p99 \
+        "$FAST_WORKLOAD" net-hog --duration "$TRIGGER_RUN" --workers 2 --delay-ms 600
+
+    # Lock contention, because that is what actually produces scheduler
+    # latency on a machine with spare CPUs. A single spinning worker does not,
+    # which is why a case built on one would be testing a threshold the fixture
+    # can never reach.
+    trigger_case sched sched_p95 io_p99 \
+        "$FAST_WORKLOAD" lock-hog --duration "$TRIGGER_RUN" --workers 16
+}
+
 check_cpu_rate_scaling
 check_cpu_symbolization
 check_io_pairing
@@ -1048,6 +1206,7 @@ check_diagnose_ranking
 check_json_document
 check_diagnose_scenarios
 check_daemon_budget
+check_daemon_triggers
 check_net_rtt_crosscheck
 check_net_field_crosscheck
 check_net_retransmit_attribution

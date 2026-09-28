@@ -33,6 +33,7 @@ use crate::{
     cpu, io,
     json::{self, Envelope, Format},
     network, process, runtime, stats,
+    trigger::{Interval, Signal, Triggers},
 };
 
 /// Perf pages per CPU, per stream.
@@ -101,6 +102,9 @@ pub struct RingEntry {
     pub cpu_cost_pct: f64,
     /// Peak recorder resident set over the interval, in bytes.
     pub memory_bytes: u64,
+    /// The triggers that fired on this interval, worst first. Empty on a
+    /// quiet interval, and the reason the incident was written when it is not.
+    pub fired: Vec<Signal>,
 }
 
 impl RingEntry {
@@ -121,8 +125,179 @@ impl RingEntry {
             "lost_events": self.lost,
             "recorder_cpu_pct": self.cpu_cost_pct,
             "recorder_memory_bytes": self.memory_bytes,
+            // Which trigger fired, so a bundle says what tripped it rather
+            // than only that something did. Empty on a quiet interval.
+            "fired": self.fired.iter().map(|signal| signal.name()).collect::<Vec<_>>(),
         })
     }
+}
+
+/// Writes one incident bundle: the ring, the interval that tripped, and enough
+/// context to read them without the machine they came from.
+///
+/// A recorder whose output is a single line of numbers is no use at three in
+/// the morning to whoever has to work out what happened. So a bundle is a
+/// directory with a manifest, the recent intervals, and a plain-text summary,
+/// and the file name is ordered by time so a directory listing is a timeline.
+///
+/// The bundle is written before its own entry joins the ring, which means it
+/// contains the triggering interval and the history that led up to it, but not
+/// the intervals that follow. That is deliberate: the whole point of the
+/// window is the part before the trigger.
+fn write_incident(
+    ring: &Ring,
+    entry: RingEntry,
+    triggers: &Triggers,
+    args: &DaemonArgs,
+) -> Result<()> {
+    let directory = incident_dir(&args.output, entry.at)?;
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("create incident directory {}", directory.display()))?;
+
+    let manifest = serde_json::json!({
+        "schema": crate::json::SCHEMA,
+        "command": "daemon.incident",
+        "recorded_at_s": entry.at.as_secs_f64(),
+        "process": { "pid": args.pid },
+        "triggered_by": entry
+            .fired
+            .iter()
+            .map(|signal| serde_json::json!({
+                "signal": signal.name(),
+                "unit": signal.unit(),
+                "threshold": signal.threshold(triggers),
+                "measured": entry.measured(*signal),
+            }))
+            .collect::<Vec<_>>(),
+        "thresholds": triggers
+            .enabled()
+            .iter()
+            .map(|signal| serde_json::json!({
+                "signal": signal.name(),
+                "unit": signal.unit(),
+                "at_or_above": signal.threshold(triggers),
+            }))
+            .collect::<Vec<_>>(),
+        "interval": {
+            "at_s": entry.at.as_secs_f64(),
+            "sched_p95_us": entry.sched_p95_us,
+            "sched_samples": entry.sched_samples,
+            "io_p99_us": entry.io_p99_us,
+            "io_samples": entry.io_samples,
+            "retrans": entry.retrans,
+            "psi_some_pct": entry.psi_some_pct,
+            "psi_full_pct": entry.psi_full_pct,
+            "lost_events": entry.lost,
+            "recorder_cpu_pct": entry.cpu_cost_pct,
+            "recorder_memory_bytes": entry.memory_bytes,
+        },
+    });
+    write_json(&directory.join("manifest.json"), &manifest)?;
+
+    let intervals: Vec<Value> = ring.entries().map(RingEntry::to_json).collect();
+    write_json(&directory.join("intervals.json"), &Value::Array(intervals))?;
+    write_text(
+        &directory.join("summary.txt"),
+        &incident_text(&entry, triggers),
+    )?;
+    Ok(())
+}
+
+/// The directory an incident at `at` goes in.
+///
+/// The name sorts lexicographically in time order, so `ls` on the output
+/// directory is a timeline. A second-resolution stamp is deliberate: two
+/// triggers inside the same second append a counter rather than overwriting
+/// the bundle that is already there.
+fn incident_dir(output: &std::path::Path, at: Duration) -> Result<std::path::PathBuf> {
+    let stamp = humantime::format_duration(at).to_string().replace(' ', "_");
+    let base = output.join(format!("incident-{stamp}"));
+    let mut candidate = base.clone();
+    let mut suffix = 2;
+    while candidate.exists() {
+        candidate = base.with_file_name(format!(
+            "{}-{suffix}",
+            base.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("incident")
+        ));
+        suffix += 1;
+        if suffix > 1000 {
+            return Err(anyhow::anyhow!("too many incidents within one second"));
+        }
+    }
+    Ok(candidate)
+}
+
+/// The measurement a signal fired on, in the signal's own unit.
+impl RingEntry {
+    fn measured(&self, signal: Signal) -> Option<f64> {
+        match signal {
+            Signal::SchedulerP95 => Some(self.sched_p95_us as f64),
+            Signal::IoP99 => Some(self.io_p99_us as f64),
+            Signal::Retransmissions => Some(self.retrans as f64),
+            Signal::PsiSome => self.psi_some_pct.map(f64::from),
+            Signal::PsiFull => self.psi_full_pct.map(f64::from),
+            Signal::CpuUsage => Some(self.cpu_percent),
+        }
+    }
+}
+
+/// The human-readable half of a bundle.
+///
+/// Written next to the JSON rather than instead of it, because the first thing
+/// anyone does with a bundle is read it.
+fn incident_text(entry: &RingEntry, triggers: &Triggers) -> String {
+    let mut text = String::new();
+    text.push_str(&format!(
+        "Incident at {}s into the recording\n\n",
+        entry.at.as_secs()
+    ));
+    text.push_str("Triggered by\n");
+    for signal in &entry.fired {
+        let measured = entry.measured(*signal).unwrap_or_default();
+        let threshold = signal.threshold(triggers).unwrap_or_default();
+        text.push_str(&format!(
+            "  {signal} = {measured} {} (threshold {threshold} {})\n",
+            signal.unit(),
+            signal.unit()
+        ));
+    }
+    text.push_str("\nThe interval\n");
+    text.push_str(&format!(
+        "  scheduler p95  {} us over {} samples\n",
+        entry.sched_p95_us, entry.sched_samples
+    ));
+    text.push_str(&format!(
+        "  block I/O p99  {} us over {} completions\n",
+        entry.io_p99_us, entry.io_samples
+    ));
+    text.push_str(&format!("  retransmissions {}\n", entry.retrans));
+    match (entry.psi_some_pct, entry.psi_full_pct) {
+        (Some(some), Some(full)) => {
+            text.push_str(&format!("  memory PSI     {some}% some, {full}% full\n"));
+        }
+        _ => text.push_str("  memory PSI     unavailable, this kernel reports none\n"),
+    }
+    text.push_str(&format!("  events lost    {}\n", entry.lost));
+    text.push_str("\nWhat it cost to measure\n");
+    // Rounded, because a bundle is read by a person at three in the morning
+    // and sixteen significant figures of recorder overhead is not information.
+    text.push_str(&format!(
+        "  recorder {:.2}% of one CPU, {} KiB resident\n",
+        entry.cpu_cost_pct,
+        entry.memory_bytes / 1024
+    ));
+    text
+}
+
+fn write_json(path: &std::path::Path, value: &Value) -> Result<()> {
+    let text = serde_json::to_string_pretty(value).context("render incident JSON")?;
+    write_text(path, &text)
+}
+
+fn write_text(path: &std::path::Path, text: &str) -> Result<()> {
+    fs::write(path, text).with_context(|| format!("write {}", path.display()))
 }
 
 /// The recorder's own resource use, read from `/proc/self`.
@@ -311,8 +486,13 @@ pub fn run(args: DaemonArgs) -> Result<()> {
         peak_cpu_pct: 0.0,
         peak_memory_bytes: 0,
         ticks: 0,
+        incidents: Incidents::default(),
     }));
     let tick_state = std::rc::Rc::clone(&state);
+    // The tick callback needs the thresholds and the output directory, both of
+    // which come from the command line, so it holds its own copy rather than a
+    // borrow of the arguments the caller still owns.
+    let tick_args = args.clone();
 
     // No Ctrl-C handler here: the collection runtime installs one, and the
     // ctrlc crate allows a single registration per process. Registering a
@@ -373,7 +553,7 @@ pub fn run(args: DaemonArgs) -> Result<()> {
             ],
             on_tick: Some(Box::new(move |at, summary| {
                 let mut state = tick_state.borrow_mut();
-                if let Err(error) = tick(pid, started, at, summary, &mut state) {
+                if let Err(error) = tick(pid, started, at, summary, &mut state, &tick_args) {
                     // Reported through the summary rather than stored, because the
                     // collection loop owns the error channel and a tick that cannot
                     // read /proc is not worth ending a recording over.
@@ -386,6 +566,7 @@ pub fn run(args: DaemonArgs) -> Result<()> {
     let state = state.borrow();
     let (peak_cpu_pct, peak_memory_bytes, ticks) =
         (state.peak_cpu_pct, state.peak_memory_bytes, state.ticks);
+    let triggers = Triggers::from_args(&args);
 
     if args.format.format == Format::Json {
         json::emit(
@@ -418,6 +599,8 @@ pub fn run(args: DaemonArgs) -> Result<()> {
             baseline_rss,
             after_object_rss,
             after_attach_rss,
+            &triggers,
+            &state.incidents,
         );
     }
     Ok(())
@@ -436,6 +619,47 @@ struct RecorderState {
     peak_memory_bytes: u64,
     /// Intervals recorded.
     ticks: u64,
+    /// Incidents written, and how many each trigger produced.
+    incidents: Incidents,
+}
+
+/// How often each trigger fired over a run.
+///
+/// Kept as a running tally rather than by re-reading the incident files, so the
+/// summary says what happened even when the output directory is not writable
+/// and nothing was written.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Incidents {
+    total: u64,
+    per_signal: Vec<(Signal, u64)>,
+}
+
+impl Incidents {
+    /// Counts one incident, given the signals that fired.
+    ///
+    /// An empty list is not an incident and does not count as one. The tally
+    /// answers "how many bundles did this run write", and a version that
+    /// incremented on every interval instead reported the interval count and
+    /// claimed a bundle existed for each of them.
+    fn record(&mut self, fired: &[Signal]) {
+        if fired.is_empty() {
+            return;
+        }
+        self.total += 1;
+        for signal in fired {
+            match self.per_signal.iter_mut().find(|(name, _)| name == signal) {
+                Some((_, count)) => *count += 1,
+                None => self.per_signal.push((*signal, 1)),
+            }
+        }
+    }
+
+    /// The signals that fired at least once, most frequent first.
+    fn signals(&self) -> Vec<(Signal, u64)> {
+        let mut counts = self.per_signal.clone();
+        counts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        counts
+    }
 }
 
 /// One tick: difference the cumulative summaries and append an interval.
@@ -445,6 +669,7 @@ fn tick(
     at: Duration,
     summary: runtime::TickSummary<'_>,
     state: &mut RecorderState,
+    args: &DaemonArgs,
 ) -> Result<()> {
     let RecorderState {
         ring,
@@ -452,7 +677,9 @@ fn tick(
         peak_cpu_pct,
         peak_memory_bytes,
         ticks,
+        incidents,
     } = state;
+    let triggers = Triggers::from_args(args);
     let mut current = Cumulative::default();
     for (name, value) in &summary {
         let number = |key: &str| value.get(key).and_then(Value::as_u64).unwrap_or(0);
@@ -502,7 +729,7 @@ fn tick(
     let lost_now = current.sched_lost + current.io_lost;
     let lost_before = before.sched_lost + before.io_lost;
 
-    ring.push(RingEntry {
+    let mut entry = RingEntry {
         at,
         // A percentile is not additive, so differencing one would be
         // meaningless. The p95 and p99 are carried as the latest cumulative
@@ -525,7 +752,29 @@ fn tick(
         lost: lost_now.saturating_sub(lost_before),
         cpu_cost_pct: cost,
         memory_bytes: memory,
+        fired: Vec::new(),
+    };
+
+    // The triggers read the same interval the ring does, so a trigger can
+    // never fire on a number the incident does not show.
+    let fired = triggers.evaluate(&Interval {
+        sched_p95_us: entry.sched_p95_us,
+        sched_samples: entry.sched_samples,
+        io_p99_us: entry.io_p99_us,
+        io_samples: entry.io_samples,
+        retrans: entry.retrans,
+        psi_some_pct: entry.psi_some_pct.map(f64::from),
+        psi_full_pct: entry.psi_full_pct.map(f64::from),
+        cpu_percent: Some(entry.cpu_percent),
     });
+    entry.fired = fired.clone();
+    incidents.record(&fired);
+    // The incident file is written before the entry goes into the ring, so a
+    // bundle that exists always has its triggering interval in it.
+    if !fired.is_empty() {
+        write_incident(ring, entry.clone(), &triggers, args)?;
+    }
+    ring.push(entry);
 
     *peak_cpu_pct = (*peak_cpu_pct).max(cost);
     *peak_memory_bytes = (*peak_memory_bytes).max(memory);
@@ -561,6 +810,8 @@ fn print_summary(
     baseline_rss: u64,
     after_object_rss: u64,
     after_attach_rss: u64,
+    triggers: &Triggers,
+    incidents: &Incidents,
 ) {
     println!("Flight recorder for {name} ({pid})");
     println!("Ran for {}", humantime::format_duration(summary.elapsed));
@@ -605,6 +856,28 @@ fn print_summary(
         verdict(recording_bytes <= BUDGET_RECORDING_BYTES)
     );
     println!();
+    println!("Triggers");
+    let enabled = triggers.enabled();
+    if enabled.is_empty() {
+        println!("  all disabled, so no incident will be written");
+    } else {
+        for signal in enabled {
+            let threshold = signal.threshold(triggers).unwrap_or_default();
+            println!("  {signal} at {threshold} {}", signal.unit());
+        }
+    }
+    // The count stands on its own with no unit glued to it, so a script reading
+    // this line does not have to strip a plural off a number. A line that needs
+    // cleaning up before it can be compared is not machine-readable, and this
+    // is the one line of the report another tool is expected to read.
+    println!("  incidents written: {}", incidents.total);
+    for (signal, count) in incidents.signals() {
+        println!("    {signal}: {count}");
+    }
+    if incidents.total == 0 {
+        println!("    no trigger fired");
+    }
+    println!();
     println!("Recent intervals");
     let shown: Vec<&RingEntry> = ring.entries().rev().take(5).collect();
     if shown.is_empty() {
@@ -612,12 +885,22 @@ fn print_summary(
         return;
     }
     println!(
-        "  {:>8} {:>10} {:>8} {:>10} {:>8} {:>7}",
-        "at", "sched p95", "io p99", "retrans", "cpu cost", "rss KiB"
+        "  {:>8} {:>10} {:>8} {:>10} {:>8} {:>7} {:>8}",
+        "at", "sched p95", "io p99", "retrans", "cpu cost", "rss KiB", "fired"
     );
     for entry in shown {
+        let fired = if entry.fired.is_empty() {
+            "-".to_string()
+        } else {
+            entry
+                .fired
+                .iter()
+                .map(|signal| signal.name())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         println!(
-            "  {:>7}s {:>9}us {:>7}us {:>10} {:>7.2}% {:>7}",
+            "  {:>7}s {:>9}us {:>7}us {:>10} {:>7.2}% {:>7} {fired:>8}",
             entry.at.as_secs(),
             entry.sched_p95_us,
             entry.io_p99_us,
@@ -679,10 +962,136 @@ mod tests {
             peak_cpu_pct: 0.0,
             peak_memory_bytes: 0,
             ticks: 0,
+            incidents: Incidents::default(),
         };
         assert_eq!(state.peak_cpu_pct, 0.0);
         assert_eq!(state.peak_memory_bytes, 0);
         assert_eq!(state.ticks, 0);
+        assert_eq!(state.incidents.total, 0);
+    }
+
+    fn default_args(output: &std::path::Path) -> DaemonArgs {
+        DaemonArgs {
+            pid: 4242,
+            duration: Duration::from_secs(1),
+            interval: Duration::from_secs(1),
+            window: Duration::from_secs(60),
+            trigger_sched_p95: "10ms".parse().expect("threshold"),
+            trigger_io_p99: "25ms".parse().expect("threshold"),
+            trigger_retrans: "8".parse().expect("threshold"),
+            trigger_psi_some: "10".parse().expect("threshold"),
+            trigger_psi_full: "5".parse().expect("threshold"),
+            trigger_cpu: "off".parse().expect("threshold"),
+            output: output.to_path_buf(),
+            format: crate::cli::FormatArg {
+                format: Format::Text,
+            },
+        }
+    }
+
+    fn slow_io_entry() -> RingEntry {
+        RingEntry {
+            at: Duration::from_secs(12),
+            sched_p95_us: 80,
+            sched_samples: 500,
+            io_p99_us: 900_000,
+            io_samples: 30,
+            fired: vec![Signal::IoP99],
+            ..RingEntry::default()
+        }
+    }
+
+    #[test]
+    fn a_bundle_says_which_trigger_fired_and_on_what() {
+        // The point of a bundle: read it later with no other context and find
+        // out what tripped it, by how much, and against which threshold.
+        let dir = temp_dir("bundle_says_which_trigger");
+        let args = default_args(&dir);
+        let triggers = Triggers::from_args(&args);
+        let mut ring = Ring::new(Duration::from_secs(60), Duration::from_secs(1));
+        ring.push(RingEntry {
+            at: Duration::from_secs(11),
+            sched_p95_us: 40,
+            ..RingEntry::default()
+        });
+        write_incident(&ring, slow_io_entry(), &triggers, &args).expect("write bundle");
+
+        let bundle = std::fs::read_dir(&dir)
+            .expect("read output dir")
+            .next()
+            .expect("one bundle")
+            .expect("entry")
+            .path();
+        let manifest: Value = serde_json::from_str(
+            &std::fs::read_to_string(bundle.join("manifest.json")).expect("read manifest"),
+        )
+        .expect("parse manifest");
+
+        let triggered = &manifest["triggered_by"];
+        assert_eq!(triggered.as_array().map(Vec::len), Some(1));
+        assert_eq!(triggered[0]["signal"], "io_p99");
+        assert_eq!(triggered[0]["unit"], "microseconds");
+        assert_eq!(triggered[0]["measured"], 900_000.0);
+        assert_eq!(triggered[0]["threshold"], 25_000.0);
+        // The thresholds that were in force belong in the bundle too, or a
+        // reader cannot tell a 900ms stall from a badly configured trigger.
+        let thresholds = manifest["thresholds"].as_array().expect("thresholds");
+        assert!(thresholds.iter().any(|entry| entry["signal"] == "retrans"));
+
+        // The history that led up to the trigger travels with it.
+        let intervals: Value = serde_json::from_str(
+            &std::fs::read_to_string(bundle.join("intervals.json")).expect("read intervals"),
+        )
+        .expect("parse intervals");
+        assert_eq!(intervals.as_array().map(Vec::len), Some(1));
+
+        let text = std::fs::read_to_string(bundle.join("summary.txt")).expect("read summary");
+        assert!(text.contains("io_p99"), "summary names the trigger: {text}");
+        assert!(text.contains("900000"), "summary states the value: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_triggers_in_one_second_do_not_overwrite_each_other() {
+        // A recorder that drops the earlier bundle loses the first incident of
+        // a burst, which is the one that usually explains the rest.
+        let dir = temp_dir("triggers_do_not_overwrite");
+        let args = default_args(&dir);
+        let triggers = Triggers::from_args(&args);
+        let ring = Ring::new(Duration::from_secs(60), Duration::from_secs(1));
+        write_incident(&ring, slow_io_entry(), &triggers, &args).expect("first");
+        write_incident(&ring, slow_io_entry(), &triggers, &args).expect("second");
+
+        let count = std::fs::read_dir(&dir).expect("read output dir").count();
+        assert_eq!(count, 2, "both bundles survive");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A scratch directory under the target dir, removed by the test itself.
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("fast-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    #[test]
+    fn incidents_are_tallied_per_signal() {
+        // The summary has to say which trigger fired and how often, which is
+        // only knowable if the tally is kept as the run goes rather than
+        // reconstructed from files that may not have been written.
+        let mut incidents = Incidents::default();
+        incidents.record(&[Signal::IoP99, Signal::SchedulerP95]);
+        incidents.record(&[Signal::IoP99]);
+        // A quiet interval writes nothing, so it is not an incident. Counting
+        // it would report a bundle that was never written.
+        incidents.record(&[]);
+        incidents.record(&[]);
+        assert_eq!(incidents.total, 2);
+        assert_eq!(
+            incidents.signals(),
+            vec![(Signal::IoP99, 2), (Signal::SchedulerP95, 1)]
+        );
     }
 
     #[test]
@@ -696,6 +1105,7 @@ mod tests {
             peak_cpu_pct: 0.0,
             peak_memory_bytes: 0,
             ticks: 0,
+            incidents: Incidents::default(),
         };
         for (cost, rss) in [(1.5, 8_000_000u64), (0.2, 9_500_000), (0.1, 1_000_000)] {
             state.peak_cpu_pct = state.peak_cpu_pct.max(cost);

@@ -72,6 +72,108 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
     Ok(duration)
 }
 
+/// Is this value the word that turns a trigger off?
+fn is_off(value: &str) -> bool {
+    value.eq_ignore_ascii_case("off")
+}
+
+/// A latency threshold in microseconds, or the decision not to watch it.
+///
+/// A separate type from [`CountThreshold`] and [`PercentThreshold`] so that
+/// each flag accepts only what makes sense for it. A percentage of scheduler
+/// latency is not a number a person can mean, and a flag that quietly accepted
+/// it would produce a trigger nobody asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LatencyThreshold(Option<u64>);
+
+impl LatencyThreshold {
+    /// The threshold in microseconds, or `None` when the trigger is off.
+    pub fn micros(self) -> Option<u64> {
+        self.0
+    }
+}
+
+impl std::str::FromStr for LatencyThreshold {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if is_off(value) {
+            return Ok(LatencyThreshold(None));
+        }
+        let micros = parse_duration(value)?.as_micros();
+        let micros = u64::try_from(micros)
+            .map_err(|_| format!("latency threshold is too large: {value}"))?;
+        Ok(LatencyThreshold(Some(micros)))
+    }
+}
+
+/// A count threshold, or the decision not to watch it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CountThreshold(Option<u64>);
+
+impl CountThreshold {
+    /// The threshold, or `None` when the trigger is off.
+    pub fn count(self) -> Option<u64> {
+        self.0
+    }
+}
+
+impl std::str::FromStr for CountThreshold {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if is_off(value) {
+            return Ok(CountThreshold(None));
+        }
+        let count: u64 = value
+            .parse()
+            .map_err(|_| format!("invalid count `{value}`: expected a whole number or `off`"))?;
+        if count == 0 {
+            return Err(
+                "a count of zero would fire on every interval; use `off` to disable the trigger"
+                    .to_string(),
+            );
+        }
+        Ok(CountThreshold(Some(count)))
+    }
+}
+
+/// A percentage threshold, or the decision not to watch it.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PercentThreshold(Option<f64>);
+
+impl PercentThreshold {
+    /// The threshold, or `None` when the trigger is off.
+    pub fn percent(self) -> Option<f64> {
+        self.0
+    }
+}
+
+impl std::str::FromStr for PercentThreshold {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if is_off(value) {
+            return Ok(PercentThreshold(None));
+        }
+        let percent: f64 = value
+            .parse()
+            .map_err(|_| format!("invalid percentage `{value}`: expected a number or `off`"))?;
+        if !(0.0..=100.0).contains(&percent) {
+            return Err(format!(
+                "percentage must be between 0 and 100, got {percent}"
+            ));
+        }
+        if percent == 0.0 {
+            return Err(
+                "a threshold of zero would fire on every interval; use `off` to disable the trigger"
+                    .to_string(),
+            );
+        }
+        Ok(PercentThreshold(Some(percent)))
+    }
+}
+
 fn parse_frequency(value: &str) -> Result<u64, String> {
     let frequency = value
         .parse::<u64>()
@@ -202,9 +304,32 @@ pub struct DaemonArgs {
     #[arg(long, default_value = "60s", value_parser = parse_duration)]
     pub window: Duration,
 
-    /// Trigger threshold for scheduler p95 (default 10ms).
-    #[arg(long, default_value = "10ms", value_parser = parse_duration)]
-    pub trigger: Duration,
+    /// Trigger threshold for scheduler latency p95.
+    ///
+    /// One of several triggers; the recorder writes an incident when any of
+    /// them fires, and the incident names which. `off` disables this one.
+    #[arg(long, default_value = "10ms", value_name = "DURATION|off")]
+    pub trigger_sched_p95: LatencyThreshold,
+
+    /// Trigger threshold for block I/O latency p99.
+    #[arg(long, default_value = "25ms", value_name = "DURATION|off")]
+    pub trigger_io_p99: LatencyThreshold,
+
+    /// Trigger threshold for retransmissions in one interval.
+    #[arg(long, default_value = "8", value_name = "COUNT|off")]
+    pub trigger_retrans: CountThreshold,
+
+    /// Trigger threshold for memory pressure "some", in percent.
+    #[arg(long, default_value = "10", value_name = "PERCENT|off")]
+    pub trigger_psi_some: PercentThreshold,
+
+    /// Trigger threshold for memory pressure "full", in percent.
+    #[arg(long, default_value = "5", value_name = "PERCENT|off")]
+    pub trigger_psi_full: PercentThreshold,
+
+    /// Trigger threshold for on-CPU usage, as a percentage of one CPU.
+    #[arg(long, default_value = "off", value_name = "PERCENT|off")]
+    pub trigger_cpu: PercentThreshold,
 
     /// Output directory for incidents.
     #[arg(long, default_value = "./incidents")]
