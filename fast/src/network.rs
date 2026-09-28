@@ -4,11 +4,16 @@ use anyhow::{Context, Result};
 use aya::{Ebpf, include_bytes_aligned};
 use fast_common::{AF_INET, COLLECT_NET, TcpEvent};
 
-use crate::{cli::NetArgs, process, runtime, stats};
+use crate::{cli::NetArgs, process, runtime};
 
 /// RTT samples arrive at roughly the rate the socket sends and receives data.
 /// 64 pages (256 KiB) per CPU keeps event loss low.
 const PERF_PAGE_COUNT: usize = 64;
+
+/// How many rows the endpoint table prints before truncating. A busy process
+/// can hold hundreds of connections, and a table nobody scrolls is better
+/// than one that buries its first line.
+const MAX_REPORTED_ENDPOINTS: usize = 10;
 
 /// Identity of a connection: address family, both addresses, both ports.
 ///
@@ -63,6 +68,39 @@ impl Endpoint {
             max_rcv_wnd: event.rcv_wnd,
         }
     }
+
+    /// Total number of observed segments: RTT samples plus retransmissions.
+    pub fn segments(&self) -> u64 {
+        self.rtts.len() as u64 + self.retrans
+    }
+
+    /// Retransmissions as a fraction of observed segments, from 0.0 to 1.0.
+    pub fn retrans_ratio(&self) -> f64 {
+        let total = self.segments();
+        if total == 0 {
+            return 0.0;
+        }
+        self.retrans as f64 / total as f64
+    }
+
+    /// p50, p95 and p99 of this endpoint's RTT samples, in microseconds.
+    pub fn rtt_percentiles(&self) -> (u32, u32, u32) {
+        crate::stats::percentiles_us(&self.rtts)
+    }
+
+    /// Key used to rank endpoints by how slow they are.
+    ///
+    /// p95 is the ranking signal because a single slow tail is what makes a
+    /// connection the reason a request felt slow, and p95 is far steadier
+    /// than a maximum over a short run. The endpoint label breaks ties so
+    /// the ordering is deterministic between runs.
+    fn slowness(&self) -> (u32, EndpointKey) {
+        let (_, p95, _) = self.rtt_percentiles();
+        (
+            p95,
+            (self.family, self.saddr, self.daddr, self.sport, self.dport),
+        )
+    }
 }
 
 /// Aggregates TCP events per endpoint.
@@ -105,9 +143,15 @@ impl NetStats {
         self.lost = self.lost.saturating_add(count);
     }
 
-    /// Every endpoint seen, in a deterministic order.
-    pub fn endpoints(&self) -> Vec<&Endpoint> {
-        self.endpoints.values().collect()
+    /// Endpoints ordered from slowest to fastest by RTT p95.
+    ///
+    /// This is the ranking the report leads with, so that the endpoint most
+    /// worth looking at comes first rather than whichever one the map
+    /// happened to yield.
+    pub fn slowest_endpoints(&self) -> Vec<&Endpoint> {
+        let mut ordered: Vec<&Endpoint> = self.endpoints.values().collect();
+        ordered.sort_by_key(|endpoint| std::cmp::Reverse(endpoint.slowness()));
+        ordered
     }
 
     /// Total retransmissions across all endpoints.
@@ -218,26 +262,66 @@ pub fn run(args: NetArgs) -> Result<()> {
     println!("Retransmissions: {}", stats.retrans());
     println!("Lost events: {}", stats.lost());
     println!();
-    println!("Endpoints");
-    if stats.endpoints().is_empty() {
+
+    let ranked = stats.slowest_endpoints();
+    if ranked.is_empty() {
+        println!("Endpoints");
         println!("No TCP samples collected.");
         println!("Test with: fast-workload net-hog --duration 30s   (then observe its PID)");
-    } else {
-        for endpoint in stats.endpoints() {
-            let rtt = stats::percentiles_us(&endpoint.rtts);
-            println!(
-                "{:<46} samples {:>6}  RTT p50 {:>8} p95 {:>8} p99 {:>8}  cwnd {:>5} rcv_wnd {:>7}  retrans {}",
-                format_endpoint(endpoint),
-                endpoint.rtts.len(),
-                rtt.0,
-                rtt.1,
-                rtt.2,
-                endpoint.max_cwnd,
-                endpoint.max_rcv_wnd,
-                endpoint.retrans,
-            );
-        }
+        return Ok(());
     }
+
+    // The table leads with the slowest endpoint so the connection worth
+    // looking at is the first thing on screen. All latencies are in
+    // microseconds, and the ratio is retransmissions over observed segments.
+    println!(
+        "Slow endpoints by RTT p95 ({} of {} shown)",
+        ranked.len().min(MAX_REPORTED_ENDPOINTS),
+        ranked.len()
+    );
+    println!(
+        "  {:>8} {:>8} {:>8} {:>8} {:>8} {:>7}  endpoint",
+        "p95", "p50", "p99", "samples", "retrans", "ratio"
+    );
+    for endpoint in ranked.iter().take(MAX_REPORTED_ENDPOINTS) {
+        let (p50, p95, p99) = endpoint.rtt_percentiles();
+        println!(
+            "  {p95:>8} {p50:>8} {p99:>8} {:>8} {:>8} {:>6.1}%  {}",
+            endpoint.rtts.len(),
+            endpoint.retrans,
+            endpoint.retrans_ratio() * 100.0,
+            format_endpoint(endpoint),
+        );
+    }
+    if ranked.len() > MAX_REPORTED_ENDPOINTS {
+        println!(
+            "  ... {} more endpoint(s) not shown",
+            ranked.len() - MAX_REPORTED_ENDPOINTS
+        );
+    }
+
+    // The worst offender is called out on its own, because a table row is
+    // easy to skim past and this is the answer to "which remote is slow".
+    let worst = ranked[0];
+    let (_, worst_p95, _) = worst.rtt_percentiles();
+    println!();
+    println!("Slowest endpoint");
+    println!("  {} us p95", worst_p95);
+    println!("  {}", format_endpoint(worst));
+    if worst.retrans > 0 {
+        println!(
+            "  {} retransmissions, {:.1}% of {} observed segments",
+            worst.retrans,
+            worst.retrans_ratio() * 100.0,
+            worst.segments()
+        );
+    }
+    // A closed congestion window with retransmissions on top is what a
+    // struggling path looks like, so both are always named here.
+    println!(
+        "  congestion window {} segments, receive window {} bytes",
+        worst.max_cwnd, worst.max_rcv_wnd
+    );
     Ok(())
 }
 
@@ -282,13 +366,13 @@ mod tests {
         s.record(probe(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 2), 200));
 
         assert_eq!(s.samples(), 3);
-        assert_eq!(s.endpoints().len(), 2);
+        assert_eq!(s.slowest_endpoints().len(), 2);
         // Endpoints are ordered by their key, so the 10.0.0.1 connection
         // comes first and holds both of its samples.
-        let first = &s.endpoints()[0];
+        let first = &s.slowest_endpoints()[0];
         assert_eq!(first.rtts.len(), 2);
         assert_eq!(format_endpoint(first), "127.0.0.1:1234 -> 10.0.0.1:80");
-        assert_eq!(s.endpoints()[1].rtts.len(), 1);
+        assert_eq!(s.slowest_endpoints()[1].rtts.len(), 1);
     }
 
     #[test]
@@ -297,8 +381,74 @@ mod tests {
         // A fresh connection has no smoothed RTT yet.
         s.record(probe(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 1), 0));
         assert_eq!(s.samples(), 1);
-        assert_eq!(s.endpoints().len(), 1);
-        assert!(s.endpoints()[0].rtts.is_empty());
+        assert_eq!(s.slowest_endpoints().len(), 1);
+        assert!(s.slowest_endpoints()[0].rtts.is_empty());
+    }
+
+    #[test]
+    fn ranks_endpoints_slowest_first() {
+        let mut s = NetStats::default();
+        // A fast endpoint and a slow one, each with a steady distribution.
+        for rtt in [40, 40, 40] {
+            s.record(probe(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 1), rtt));
+        }
+        for rtt in [900, 900, 900] {
+            s.record(probe(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 2), rtt));
+        }
+        // A middle endpoint, added last, to prove the order is by latency
+        // and not by insertion or by address.
+        for rtt in [200, 200, 200] {
+            s.record(probe(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 3), rtt));
+        }
+
+        let ranked = s.slowest_endpoints();
+        assert_eq!(ranked.len(), 3);
+        assert_eq!(format_endpoint(ranked[0]), "127.0.0.1:1234 -> 10.0.0.2:80");
+        assert_eq!(format_endpoint(ranked[1]), "127.0.0.1:1234 -> 10.0.0.3:80");
+        assert_eq!(format_endpoint(ranked[2]), "127.0.0.1:1234 -> 10.0.0.1:80");
+    }
+
+    #[test]
+    fn computes_retrans_ratio() {
+        let mut s = NetStats::default();
+        for _ in 0..3 {
+            s.record(probe(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 1), 100));
+        }
+        s.record(retrans(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 1)));
+
+        let endpoint = &s.slowest_endpoints()[0];
+        assert_eq!(endpoint.segments(), 4);
+        assert!((endpoint.retrans_ratio() - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn retrans_ratio_is_zero_without_segments() {
+        let endpoint = Endpoint {
+            family: AF_INET,
+            saddr: v4(127, 0, 0, 1),
+            daddr: v4(10, 0, 0, 1),
+            sport: 1,
+            dport: 2,
+            rtts: Vec::new(),
+            retrans: 0,
+            max_cwnd: 0,
+            max_rcv_wnd: 0,
+        };
+        assert_eq!(endpoint.segments(), 0);
+        assert_eq!(endpoint.retrans_ratio(), 0.0);
+    }
+
+    #[test]
+    fn ranking_is_stable_for_equal_latency() {
+        let mut s = NetStats::default();
+        for daddr in [10, 9, 8] {
+            s.record(probe(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, daddr), 100));
+        }
+        // Equal latency falls back to the endpoint key, in descending order,
+        // so two reports generated from the same events read identically.
+        let first = format_endpoint(s.slowest_endpoints()[0]);
+        assert_eq!(first, "127.0.0.1:1234 -> 10.0.0.10:80");
+        assert_eq!(first, format_endpoint(s.slowest_endpoints()[0]));
     }
 
     #[test]
@@ -308,7 +458,7 @@ mod tests {
         s.record(retrans(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 1)));
 
         assert_eq!(s.retrans(), 1);
-        let endpoint = &s.endpoints()[0];
+        let endpoint = &s.slowest_endpoints()[0];
         assert_eq!(endpoint.retrans, 1);
         // The sample and the retransmission belong to the same connection.
         assert_eq!(endpoint.rtts.len(), 1);
@@ -322,7 +472,7 @@ mod tests {
         v6[1] = 0x01;
         s.record(probe(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 1), 100));
         s.record(probe(fast_common::AF_INET6, v6, v6, 100));
-        assert_eq!(s.endpoints().len(), 2);
+        assert_eq!(s.slowest_endpoints().len(), 2);
     }
 
     #[test]
@@ -334,7 +484,7 @@ mod tests {
             rcv_wnd: 65535,
             ..probe(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 1), 120)
         });
-        let endpoint = &s.endpoints()[0];
+        let endpoint = &s.slowest_endpoints()[0];
         assert_eq!(endpoint.max_cwnd, 24);
         assert_eq!(endpoint.max_rcv_wnd, 65535);
     }

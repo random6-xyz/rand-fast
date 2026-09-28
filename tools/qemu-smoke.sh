@@ -229,11 +229,13 @@ check_io_pairing() {
 # trip into the tens of milliseconds while the baseline sits in the tens of
 # microseconds.
 #
-# The comparison uses the median of the per-endpoint p50 values, because the
-# net-hog fixture opens several connections and the aggregate is what
-# matters. The gap is measured in orders of magnitude, so a loose threshold
-# still catches a measurement that is stuck or scaled wrong. It reuses the
-# report the retransmission check already collected, since both need the same
+# The slowest endpoint is compared on both sides. Cycling the receive window
+# leaves one direction of each connection fast and the other stretched, so a
+# median lands on whichever side happened to dominate and the ratio collapses
+# from one run to the next. The slowest endpoint is the same measurement on
+# both sides, and the gap is measured in orders of magnitude, so a loose
+# threshold still catches a measurement that is stuck or scaled wrong. The
+# report is reused from the retransmission check, which needs the same
 # cycling workload.
 RTT_MIN_RATIO=${RTT_MIN_RATIO:-20}
 
@@ -242,12 +244,43 @@ RTT_MIN_RATIO=${RTT_MIN_RATIO:-20}
 # RTT, tight enough to catch a wrong scale factor or a misread offset.
 RTT_CROSSCHECK_TOLERANCE=${RTT_CROSSCHECK_TOLERANCE:-2}
 
+# Proves the endpoint ranking is usable: the report is supposed to lead with
+# the connection that is actually slow, so the first row has to be a real
+# outlier rather than one of the healthy ones. The cycling fixture stretches
+# its round trips into the milliseconds while a plain loopback run sits in the
+# microseconds, so the two are compared row by row.
+check_net_endpoint_ranking() {
+    if [ ! -f "$OUT_DIR/net-retrans.txt" ] || [ ! -f "$OUT_DIR/net-rtt-base.txt" ]; then
+        echo "net endpoint ranking: SKIP (no reports from the earlier net checks)"
+        return
+    fi
+
+    # First data row of each table, and the slowest row of the cycling table.
+    local worst_p95 base_p95 median_p95
+    worst_p95=$(max_p95_us "$OUT_DIR/net-retrans.txt")
+    base_p95=$(max_p95_us "$OUT_DIR/net-rtt-base.txt")
+    median_p95=$(median_p50_us "$OUT_DIR/net-retrans.txt")
+
+    if [ "${worst_p95:-0}" -le 0 ] || [ "${median_p95:-0}" -le 0 ]; then
+        echo "net endpoint ranking: FAIL (no p95 values; worst=$worst_p95 median=$median_p95)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if ! awk -v w="$worst_p95" -v m="$median_p95" -v b="$base_p95" \
+            'BEGIN { ok = (w >= b * 5)
+                     printf "net endpoint ranking: first row %d us p95 vs %d us median under load and %d us on plain loopback\n", w, m, b
+                     exit ok ? 0 : 1 }'; then
+        echo "    the first row is not a real outlier, so the ranking is not leading with the slow endpoint"
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
 check_net_rtt_separation() {
     local base stalled ratio_ok=1
-    base=$(median_p50_us "$OUT_DIR/net-rtt-base.txt")
+    base=$(max_p95_us "$OUT_DIR/net-rtt-base.txt")
     # The cycling run that check_net_retransmit_attribution collected: its
     # round trips are stretched by the shut receive window.
-    stalled=$(median_p50_us "$OUT_DIR/net-retrans.txt")
+    stalled=$(max_p95_us "$OUT_DIR/net-retrans.txt")
     if [ "${base:-0}" -le 0 ] || [ "${stalled:-0}" -le 0 ]; then
         echo "net RTT separation: FAIL (no RTT samples; plain loopback=$base window cycling=$stalled)"
         FAILURES=$((FAILURES + 1))
@@ -255,7 +288,7 @@ check_net_rtt_separation() {
     fi
     if ! awk -v b="$base" -v d="$stalled" -v need="$RTT_MIN_RATIO" \
             'BEGIN { r = (b + 0) == 0 ? 0 : d / b
-                     printf "net RTT separation: median endpoint p50 %d us on plain loopback vs %d us with the receive window cycling shut (%.0fx)\n", b, d, r
+                     printf "net RTT separation: slowest endpoint p95 %d us on plain loopback vs %d us with the receive window cycling shut (%.0fx)\n", b, d, r
                      exit (r >= need) ? 0 : 1 }'; then
         ratio_ok=0
     fi
@@ -268,10 +301,31 @@ for candidate in /sbin/ss /bin/ss; do
     [ -x "$candidate" ] && { SS_BIN=$candidate; break; }
 done
 
-# Median of the per-endpoint p50 values rand-fast reported, in microseconds.
+# Median of the per-endpoint p50 column, in microseconds.
+#
+# The endpoint table is printed with fixed-width numeric columns, so the
+# columns are positional: p95, p50, p99, samples, retrans, ratio, endpoint.
+# Data rows are recognised by a leading integer, which the header and the
+# surrounding prose never have.
 median_p50_us() {
-    awk '/RTT p50/ { for (i = 1; i <= NF; i++) if ($i == "p50") { print $(i+1); next } }' \
-        "$1" | sort -n | awk '{ v[NR] = $1 } END { if (NR == 0) { print 0 } else { print v[int((NR+1)/2)] } }'
+    awk '$1 ~ /^[0-9]+$/ { print $2 }' "$1" | sort -n \
+        | awk '{ v[NR] = $1 } END { if (NR == 0) { print 0 } else { print v[int((NR+1)/2)] } }'
+}
+
+# Slowest p95 in a report, in microseconds.
+max_p95_us() {
+    awk '$1 ~ /^[0-9]+$/ && $1 + 0 > m { m = $1 + 0 } END { print m + 0 }' "$1"
+}
+
+# Congestion window rand-fast reported for the slowest endpoint, which the
+# report prints in its detail block.
+fast_cwnd() {
+    awk '/congestion window/ { print $3; exit }' "$1"
+}
+
+# Congestion window `ss -ti` reported for a loopback socket.
+ss_cwnd() {
+    awk '/cwnd:/ { for (i = 1; i <= NF; i++) if ($i ~ /^cwnd:/ && $i != "cwnd:") { split($i, p, ":"); print p[2]; exit } }' "$1"
 }
 
 # Median of the `rtt:` values `ss -ti` printed for loopback sockets, in
@@ -407,8 +461,8 @@ check_net_retransmit_attribution() {
     local total endpoints
     total=$(awk '/^Retransmissions:/ {print $2}' "$OUT_DIR/net-retrans.txt")
     # Endpoints whose retrans column is not zero.
-    endpoints=$(awk '/RTT p50/ { for (i = 1; i <= NF; i++) if ($i == "retrans" && $(i+1) + 0 > 0) n++ }
-                    END { print n + 0 }' "$OUT_DIR/net-retrans.txt")
+    endpoints=$(awk '$1 ~ /^[0-9]+$/ && $5 + 0 > 0 { n++ } END { print n + 0 }' \
+        "$OUT_DIR/net-retrans.txt")
     if [ "${total:-0}" -le 0 ]; then
         echo "net retransmit attribution: FAIL (rand-fast saw no retransmissions; see the kernel counter above for whether the workload produced any)"
         FAILURES=$((FAILURES + 1))
@@ -438,8 +492,8 @@ check_net_rtt_crosscheck() {
     kernel=$(median_ss_rtt_us "$OUT_DIR/net-ss-xcheck.txt")
     # The raw snapshots are summarised so a mismatch can be diagnosed from
     # the log alone instead of re-running the guest.
-    echo "    fast: $(awk '/RTT p50/{n++} END{print n+0}' "$OUT_DIR/net-rtt-xcheck.txt") endpoints, p50 $(awk '/RTT p50/{for(i=1;i<=NF;i++) if($i=="p50"){print $(i+1); exit}}' "$OUT_DIR/net-rtt-xcheck.txt") us, cwnd $(awk '/RTT p50/{for(i=1;i<=NF;i++) if($i=="cwnd"){print $(i+1); exit}}' "$OUT_DIR/net-rtt-xcheck.txt")"
-    echo "    ss:   $(awk '/rtt:/{n++} END{print n+0}' "$OUT_DIR/net-ss-xcheck.txt") samples, first $(awk '/rtt:/{for(i=1;i<=NF;i++) if($i ~ /^rtt:/ && $i != "rtt:"){print $i; exit}}' "$OUT_DIR/net-ss-xcheck.txt"), cwnd $(awk '/cwnd:/{for(i=1;i<=NF;i++) if($i ~ /^cwnd:/){split($i,p,":"); print p[2]; exit}}' "$OUT_DIR/net-ss-xcheck.txt")"
+    echo "    fast: $(awk '$1 ~ /^[0-9]+$/{n++} END{print n+0}' "$OUT_DIR/net-rtt-xcheck.txt") endpoints, p50 $mine us, cwnd $(fast_cwnd "$OUT_DIR/net-rtt-xcheck.txt")"
+    echo "    ss:   $(awk '/rtt:/{n++} END{print n+0}' "$OUT_DIR/net-ss-xcheck.txt") samples, first $(awk '/rtt:/{for(i=1;i<=NF;i++) if($i ~ /^rtt:/ && $i != "rtt:"){print $i; exit}}' "$OUT_DIR/net-ss-xcheck.txt"), cwnd $(ss_cwnd "$OUT_DIR/net-ss-xcheck.txt")"
 
     if [ "${mine:-0}" -le 0 ] || [ "${kernel:-0}" -le 0 ]; then
         echo "net RTT cross-check: FAIL (no samples; fast=$mine us kernel=$kernel us)"
@@ -472,8 +526,8 @@ check_net_field_crosscheck() {
     }
 
     local mine kernel
-    mine=$(awk '/RTT p50/{for(i=1;i<=NF;i++) if($i=="cwnd"){print $(i+1); exit}}' "$report")
-    kernel=$(awk '/cwnd:/{for(i=1;i<=NF;i++) if($i ~ /^cwnd:/){split($i,p,":"); print p[2]; exit}}' "$ss_out")
+    mine=$(fast_cwnd "$report")
+    kernel=$(ss_cwnd "$ss_out")
     if [ "${mine:-0}" -le 0 ] || [ "${kernel:-0}" -le 0 ]; then
         echo "net field cross-check: FAIL (no cwnd samples; fast=$mine kernel=$kernel)"
         FAILURES=$((FAILURES + 1))
@@ -502,6 +556,7 @@ check_io_pairing
 check_net_rtt_crosscheck
 check_net_field_crosscheck
 check_net_retransmit_attribution
+check_net_endpoint_ranking
 check_net_rtt_separation
 
 echo "=== key metrics ==="
