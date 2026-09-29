@@ -68,9 +68,48 @@ impl Statistics {
         self.latencies.len()
     }
 
+    /// The `limit` slowest latencies seen, in nanoseconds, longest first.
+    ///
+    /// A percentile says how big the tail was; this says what the tail was.
+    /// An incident bundle is opened by someone who wants the actual number,
+    /// not the position it occupied in a distribution.
+    pub fn slowest_samples(&self, limit: usize) -> Vec<u64> {
+        let mut worst: Vec<u64> = self.latencies.clone();
+        if limit == 0 || worst.is_empty() {
+            return Vec::new();
+        }
+        // A full sort of a whole run's worth of latencies on every tick would
+        // cost more than the recording itself, and only the tail matters, so
+        // this is a bounded partial selection followed by a sort of just the
+        // part that is kept.
+        let depth = limit.saturating_mul(8).max(limit).min(worst.len() - 1);
+        worst.select_nth_unstable_by(depth, |a, b| b.cmp(a));
+        worst.truncate(limit);
+        worst.sort_unstable_by(|a, b| b.cmp(a));
+        worst
+    }
+
     pub fn lost_events(&self) -> u64 {
         self.lost_events
     }
+}
+
+/// Percentiles of a set of microsecond samples, returned as `(p50, p95, p99)`.
+///
+/// An empty input yields zeroes so callers can format a row without branching
+/// on whether any sample was collected. The nearest-rank method matches the
+/// one used for scheduler latencies, so the numbers line up across reports.
+pub fn percentiles_us(values: &[u32]) -> (u32, u32, u32) {
+    if values.is_empty() {
+        return (0, 0, 0);
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    (
+        nearest_rank(&sorted, 50),
+        nearest_rank(&sorted, 95),
+        nearest_rank(&sorted, 99),
+    )
 }
 
 fn summary(values: &[u64]) -> Option<Summary> {
@@ -89,7 +128,7 @@ fn summary(values: &[u64]) -> Option<Summary> {
     })
 }
 
-fn nearest_rank(sorted: &[u64], percentile: usize) -> u64 {
+fn nearest_rank<T: Copy + Ord>(sorted: &[T], percentile: usize) -> T {
     let rank = sorted.len().saturating_mul(percentile).saturating_add(99) / 100;
     sorted[rank.saturating_sub(1)]
 }
@@ -160,5 +199,12 @@ mod tests {
     #[test]
     fn empty_statistics_have_no_summary() {
         assert!(Statistics::default().summary().is_none());
+    }
+
+    #[test]
+    fn computes_microsecond_percentiles() {
+        assert_eq!(percentiles_us(&[]), (0, 0, 0));
+        assert_eq!(percentiles_us(&[40, 10, 30, 20]), (20, 40, 40));
+        assert_eq!(percentiles_us(&[5]), (5, 5, 5));
     }
 }

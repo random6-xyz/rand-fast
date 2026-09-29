@@ -9,6 +9,8 @@ use bytemuck::{Pod, Zeroable};
 mod aya_pod {
     unsafe impl aya::Pod for crate::PendingIo {}
     unsafe impl aya::Pod for crate::IoRequestKey {}
+    unsafe impl aya::Pod for crate::OffCpuPending {}
+    unsafe impl aya::Pod for crate::MemoryCounters {}
 }
 
 pub const MAX_TARGET_TIDS: u32 = 4096;
@@ -16,6 +18,13 @@ pub const MAX_TARGET_TIDS: u32 = 4096;
 /// requests enter the map, so this is generous headroom over any realistic
 /// queue depth.
 pub const MAX_PENDING_IO: u32 = 8192;
+/// Upper bound for remembered TCP sockets. Entries are added only for sockets
+/// a target thread is seen using, so this is generous headroom over the
+/// number of connections a process keeps open.
+pub const MAX_TCP_SOCKETS: u32 = 8192;
+/// Upper bound for per-thread memory counters. Only target threads get an
+/// entry, so this matches the target thread limit.
+pub const MAX_MEMORY_THREADS: u32 = MAX_TARGET_TIDS;
 /// Stack trace map capacity. Sized for periodic on-CPU sampling where many
 /// distinct user/kernel stacks accumulate over a run; entries are allocated
 /// lazily (~1 KiB each at the default 127-frame depth).
@@ -32,6 +41,13 @@ pub const SLOW_50MS_NS: u64 = 50_000_000;
 pub const COLLECT_SCHEDULER_LATENCY: u32 = 1;
 pub const COLLECT_CPU_SAMPLE: u32 = 2;
 pub const COLLECT_OFFCPU: u32 = 4;
+pub const COLLECT_NET: u32 = 8;
+pub const COLLECT_MEMORY: u32 = 16;
+
+/// Address family of an IPv4 socket, as stored in [`TcpEvent::family`].
+pub const AF_INET: u16 = 2;
+/// Address family of an IPv6 socket, as stored in [`TcpEvent::family`].
+pub const AF_INET6: u16 = 10;
 
 /// Event type discriminator for the extensible ABI.
 #[repr(u32)]
@@ -136,18 +152,69 @@ pub struct IoEvent {
     pub op: u32,
 }
 
-/// TCP/network event for RTT and retransmission.
+/// A TCP sample or retransmission attributed to a socket.
+///
+/// Addresses are stored in network byte order. For [`AF_INET`] only the first
+/// four bytes of each address are meaningful and the rest are zero; for
+/// [`AF_INET6`] all sixteen are. Ports are stored in host byte order.
+///
+/// The kernel's `tcp_probe` tracepoint reports its smoothed RTT as
+/// `tp->srtt_us >> 3`, so [`Self::rtt_us`] carries the shifted-back value in
+/// microseconds. Retransmission events have no RTT and report zero.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct TcpEvent {
+    /// Thread the event was attributed to.
     pub tid: u32,
-    pub saddr: u32,
-    pub daddr: u32,
-    pub rtt_us: u32,
-    pub sport: u16,
-    pub dport: u16,
+    /// [`AF_INET`] or [`AF_INET6`].
+    pub family: u16,
+    /// 1 for a retransmission, 0 for an ordinary sample.
     pub retrans: u8,
-    pub _pad: [u8; 3],
+    /// Padding, always zero.
+    pub _pad: u8,
+    /// Source port, host byte order.
+    pub sport: u16,
+    /// Destination port, host byte order.
+    pub dport: u16,
+    /// Smoothed RTT in microseconds, zero for retransmissions.
+    pub rtt_us: u32,
+    /// Congestion window in segments, zero for retransmissions.
+    pub snd_cwnd: u32,
+    /// Receive window in bytes, zero for retransmissions.
+    pub rcv_wnd: u32,
+    /// Source address, network byte order.
+    pub saddr: [u8; 16],
+    /// Destination address, network byte order.
+    pub daddr: [u8; 16],
+}
+
+/// The wait reason could not be classified from the task state alone.
+pub const OFFCPU_REASON_UNKNOWN: u32 = 0;
+/// The task was sleeping in an interruptible wait. Futexes, condition
+/// variables and timed sleeps all land here, because the kernel blocks them
+/// the same way.
+pub const OFFCPU_REASON_WAIT: u32 = 1;
+/// The task was in an uninterruptible wait, which is what disk and network
+/// I/O use for the duration of a request.
+pub const OFFCPU_REASON_IO: u32 = 2;
+
+/// A target thread that has switched out and not yet been woken.
+///
+/// The blocking stack is captured here, at switch-out, rather than at
+/// wakeup: by the time the task is woken the frame that blocked it is gone,
+/// and the captured stack would describe whatever woke the task instead.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct OffCpuPending {
+    /// When the thread stopped running, from `bpf_ktime_get_ns`.
+    pub start_ns: u64,
+    /// Stack id of the blocking context, or a negative value when the capture
+    /// failed.
+    pub stack_id: i64,
+    /// One of the `OFFCPU_REASON_*` constants, derived from the task state.
+    pub reason: u32,
+    /// Padding, always zero.
+    pub _pad: u32,
 }
 
 /// Off-CPU wait event with stack.
@@ -162,17 +229,22 @@ pub struct OffCpuEvent {
     pub _pad2: u32,
 }
 
-/// Memory pressure snapshot.
+/// Per-thread memory activity, accumulated in the kernel and read by
+/// userspace.
+///
+/// A process can take hundreds of thousands of page faults a second, and
+/// emitting a perf event for each one drowns the buffer and loses records.
+/// Counting in a map instead costs a map update per fault and produces no
+/// events at all, so userspace polls the map and differences two snapshots to
+/// get a rate. The counts are cumulative from the start of collection.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
-pub struct MemoryEvent {
-    pub minflt: u64,
-    pub majflt: u64,
-    pub swap_kb: u64,
-    pub tid: u32,
-    pub psi_some_pct: u32,
-    pub psi_full_pct: u32,
-    pub _pad: u32,
+pub struct MemoryCounters {
+    /// User page faults seen on this thread.
+    pub faults: u64,
+    /// Direct reclaim attempts this thread entered, which is where a task
+    /// stalls when memory runs short.
+    pub reclaims: u64,
 }
 
 #[cfg(test)]
@@ -243,8 +315,41 @@ mod tests {
 
     #[test]
     fn tcp_event_layout_is_stable() {
-        assert_eq!(size_of::<TcpEvent>(), 24);
+        assert_eq!(size_of::<TcpEvent>(), 56);
         assert_eq!(align_of::<TcpEvent>(), 4);
+    }
+
+    #[test]
+    fn tcp_event_fits_the_decode_buffer() {
+        // runtime::MAX_EVENT_SIZE is 64, so a TcpEvent must stay under it.
+        assert!(size_of::<TcpEvent>() <= 64);
+    }
+
+    fn sample_tcp_event() -> TcpEvent {
+        TcpEvent {
+            tid: 42,
+            family: AF_INET,
+            retrans: 0,
+            _pad: 0,
+            sport: 1234,
+            dport: 80,
+            rtt_us: 1500,
+            snd_cwnd: 10,
+            rcv_wnd: 65535,
+            saddr: [127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            daddr: [10, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        }
+    }
+
+    #[test]
+    fn tcp_event_round_trips_through_bytes() {
+        let event = sample_tcp_event();
+        let decoded: TcpEvent = bytemuck::pod_read_unaligned(bytemuck::bytes_of(&event));
+        assert_eq!(decoded.tid, 42);
+        assert_eq!(decoded.family, AF_INET);
+        assert_eq!(decoded.sport, 1234);
+        assert_eq!(decoded.rtt_us, 1500);
+        assert_eq!(decoded.daddr[0], 10);
     }
 
     #[test]
@@ -254,8 +359,39 @@ mod tests {
     }
 
     #[test]
-    fn memory_event_layout_is_stable() {
-        assert_eq!(size_of::<MemoryEvent>(), 40);
-        assert_eq!(align_of::<MemoryEvent>(), 8);
+    fn offcpu_pending_layout_is_stable() {
+        assert_eq!(size_of::<OffCpuPending>(), 24);
+        assert_eq!(align_of::<OffCpuPending>(), 8);
+    }
+
+    #[test]
+    fn offcpu_pending_round_trips_through_bytes() {
+        let pending = OffCpuPending {
+            start_ns: 1_000,
+            stack_id: -3,
+            reason: OFFCPU_REASON_IO,
+            _pad: 0,
+        };
+        let decoded: OffCpuPending = bytemuck::pod_read_unaligned(bytemuck::bytes_of(&pending));
+        assert_eq!(decoded.start_ns, 1_000);
+        assert_eq!(decoded.stack_id, -3);
+        assert_eq!(decoded.reason, OFFCPU_REASON_IO);
+    }
+
+    #[test]
+    fn memory_counters_layout_is_stable() {
+        assert_eq!(size_of::<MemoryCounters>(), 16);
+        assert_eq!(align_of::<MemoryCounters>(), 8);
+    }
+
+    #[test]
+    fn memory_counters_round_trip_through_bytes() {
+        let counters = MemoryCounters {
+            faults: 12_345,
+            reclaims: 7,
+        };
+        let decoded: MemoryCounters = bytemuck::pod_read_unaligned(bytemuck::bytes_of(&counters));
+        assert_eq!(decoded.faults, 12_345);
+        assert_eq!(decoded.reclaims, 7);
     }
 }
