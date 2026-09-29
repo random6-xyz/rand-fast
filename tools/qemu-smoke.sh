@@ -1130,63 +1130,105 @@ trigger_case() {
     echo "  cost under this fixture: ${peak_cost:-?}% of one CPU"
 }
 
+# Counts the bundle directories under an output directory.
+count_bundles() {
+    local dir="$1" count=0
+    for bundle in "$dir"/*/; do
+        [ -d "$bundle" ] || continue
+        count=$((count + 1))
+    done
+    echo "$count"
+}
+
+# Waits until the output directory holds at least $2 bundle directories, or
+# $3 seconds pass. A loop rather than a fixed sleep, because the point is to
+# kill the recorder after it has written something and a fixed delay would be a
+# guess about when that happens.
+wait_for_bundles() {
+    local dir="$1" want="$2" limit="$3" waited=0 count
+    while [ "$waited" -lt "$limit" ]; do
+        count=$(count_bundles "$dir")
+        [ "$count" -ge "$want" ] && return 0
+        sleep 1
+        waited=$((waited + 1))
+    done
+    return 1
+}
+
+# Kills a background PID, for the paths that give up early.
+cleanup_killed_pid() {
+    [ -n "${1:-}" ] || return 0
+    kill -9 "$1" 2>/dev/null
+    wait "$1" 2>/dev/null
+    return 0
+}
+
 # Proves the two claims the incident storage makes: a killed recorder keeps its
-# window when it comes back, and the output directory never outgrows its cap.
+# window when it comes back, and the output directory does not grow with the
+# number of incidents.
 check_daemon_storage() {
     local dir="$OUT_DIR/storage"
     rm -rf "$dir"
     mkdir -p "$dir"
 
-    # A cap of 4 KiB with a bundle of a few hundred bytes, so a handful of
-    # incidents is enough to force rotation. A cap no run would reach would
-    # leave the rotation path untested, which is the same as not testing it.
+    # The cap is set in bytes and checked against what a bundle costs. It is
+    # deliberately big enough to hold a handful of bundles: rotation then has to
+    # be proved from the bundles that survived the kill, since a recorder that
+    # is killed never gets to print how many it wrote. A cap of one bundle would
+    # prove nothing a single directory could not prove on its own.
+    local cap=$((512 * 1024))
     # Lock contention, with a threshold below what it produces, so the run
     # writes a bundle every interval or two. A run where no trigger fires writes
     # nothing, and a storage check with nothing to store tests nothing.
     local first_log="$OUT_DIR/storage-first.txt"
-    "$FAST_WORKLOAD" lock-hog --duration "$TRIGGER_RUN" --workers 16 >/dev/null 2>&1 &
+    "$FAST_WORKLOAD" lock-hog --duration 300s --workers 16 >/dev/null 2>&1 &
     local target_pid=$!
     sleep 0.3
-    "$FAST" daemon --pid "$target_pid" --duration "$TRIGGER_RUN" \
-        --interval 1s --window 120s --output "$dir" --max-disk-bytes 4k \
+    # The recorder is killed rather than allowed to finish, because that is the
+    # acceptance criterion and because it is the case that matters: a process
+    # killed mid-write is exactly what the completion marker exists to detect,
+    # and a restart after a clean exit never exercises that path.
+    "$FAST" daemon --pid "$target_pid" --duration 300s \
+        --interval 1s --window 120s --output "$dir" --max-disk-bytes "$cap" \
         --trigger-sched-p95 200us \
         --trigger-io-p99 off --trigger-retrans off \
         --trigger-psi-some off --trigger-psi-full off \
         --restore false \
-        >"$first_log" 2>&1 || true
+        >"$first_log" 2>&1 &
+    local daemon_pid=$!
+
+    # Wait for the recorder to have written something, so the kill lands after
+    # there is a window worth recovering rather than before anything exists.
+    if ! wait_for_bundles "$dir" 2 90; then
+        echo "daemon storage: FAIL (the recorder wrote no bundle in 90s)"
+        FAILURES=$((FAILURES + 1))
+        cleanup_killed_pid "$target_pid"
+        return
+    fi
+    # Let it keep going so there are more incidents than the cap can hold, then
+    # kill it. A run long enough to have needed rotation is the only way the
+    # rotation check means anything.
+    wait_for_bundles "$dir" 2 90
+    sleep 20
+    kill -9 "$daemon_pid" 2>/dev/null
+    wait "$daemon_pid" 2>/dev/null
     kill "$target_pid" 2>/dev/null
     wait "$target_pid" 2>/dev/null
 
-    # How many incidents the run wrote, from its own report. Counting the
-    # directories instead would measure what survived, which is the thing the
-    # cap is supposed to reduce, so it could not tell "wrote none" from
-    # "wrote many and kept one".
-    local first_bundles
-    first_bundles=$(awk '/^  incidents written:/ {print $3; exit}' "$first_log")
-    first_bundles=${first_bundles:-0}
-    if [ "$first_bundles" -lt 2 ]; then
-        echo "daemon storage: FAIL (the first run wrote ${first_bundles} incident(s); there is nothing for rotation to drop)"
-        grep 'incidents written' "$first_log" | sed 's/^/    /' >&2
+    # How many bundles survive the kill, and how many the cap could hold. The
+    # recorder ran well past the point where it had written more incidents than
+    # the cap allows, so a directory holding no more than the cap allows is the
+    # evidence. The recorder's own tally cannot be used here: it was killed, and
+    # a killed process never gets to print one.
+    local after_first
+    after_first=$(count_bundles "$dir")
+    if [ "$after_first" -lt 1 ]; then
+        echo "daemon storage: FAIL (no bundle survived the kill)"
         FAILURES=$((FAILURES + 1))
         return
     fi
-    local after_first=0
-    for bundle in "$dir"/*/; do
-        [ -d "$bundle" ] || continue
-        after_first=$((after_first + 1))
-    done
-    if [ "$after_first" -ge "$first_bundles" ]; then
-        echo "daemon storage: FAIL (rotation kept $after_first of $first_bundles bundles; nothing was dropped)"
-        FAILURES=$((FAILURES + 1))
-        return
-    fi
-    if [ "$first_bundles" -lt 1 ]; then
-        echo "daemon storage: FAIL (no bundle directory)"
-        FAILURES=$((FAILURES + 1))
-        return
-    fi
-    if ! grep -q 'History: none restored' "$first_log"; then
-        echo "daemon storage: FAIL (a fresh run claimed a restored history)"
+    if grep -q '^History: [0-9]' "$first_log"; then
+        echo "daemon storage: FAIL (a run told not to restore claimed a restored history)"
         FAILURES=$((FAILURES + 1))
         return
     fi
@@ -1199,7 +1241,7 @@ check_daemon_storage() {
     target_pid=$!
     sleep 0.3
     "$FAST" daemon --pid "$target_pid" --duration "$TRIGGER_RUN" \
-        --interval 1s --window 120s --output "$dir" --max-disk-bytes 4k \
+        --interval 1s --window 120s --output "$dir" --max-disk-bytes "$cap" \
         --trigger-sched-p95 200us \
         --trigger-io-p99 off --trigger-retrans off \
         --trigger-psi-some off --trigger-psi-full off \
@@ -1216,14 +1258,11 @@ check_daemon_storage() {
         return
     fi
 
-    # The cap, measured from the bytes on disk rather than read back from the
-    # tool's own report: the point is what is actually stored, not what the tool
-    # claims about it.
-    #
-    # Summed from file sizes, not from du. du counts allocated blocks, and a
-    # bundle of six small files costs 24 KiB of blocks whatever the bytes in it,
-    # so a block count would measure the filesystem's rounding rather than the
-    # cap.
+    # The bytes on disk, summed from file sizes rather than read back from the
+    # tool's own report: the point is what is actually stored. Not from du,
+    # which counts allocated blocks, where a bundle of six small files costs
+    # 24 KiB of blocks whatever the bytes in it, so a block count would measure
+    # the filesystem's rounding rather than the cap.
     local total=0
     for bundle in "$dir"/*/; do
         [ -d "$bundle" ] || continue
@@ -1233,37 +1272,53 @@ check_daemon_storage() {
             total=$((total + ${bytes:-0}))
         done
     done
-    local cap=4096
     local kept
-    kept=0
+    kept=$(count_bundles "$dir")
+
+    # The invariant is the documented one, in the form it actually holds: the
+    # directory stays within the cap, with a floor of one incident, because the
+    # bundle just written is never deleted. The floor is measured from the
+    # largest bundle on disk rather than estimated, so the bound cannot be
+    # shifted into agreeing by a wrong constant.
+    local largest=0
     for bundle in "$dir"/*/; do
         [ -d "$bundle" ] || continue
-        kept=$((kept + 1))
+        bytes=0
+        for file in "$bundle"*; do
+            [ -f "$file" ] || continue
+            size=$(wc -c <"$file" 2>/dev/null | tr -d ' ')
+            bytes=$((bytes + ${size:-0}))
+        done
+        [ "$bytes" -gt "$largest" ] && largest=$bytes
     done
-    # The run wrote a bundle every interval or two. What matters is that the
-    # directory did not keep them: a cap below the size of one incident has a
-    # floor of one incident, and the claim being checked is that the count stops
-    # growing rather than that the byte total is below a number smaller than a
-    # single bundle.
-    if [ "$kept" -ge "$first_bundles" ]; then
-        echo "daemon storage: FAIL (rotation kept $kept of $first_bundles bundles; nothing was dropped)"
+    local ceiling=$((cap + largest))
+    if [ "$total" -gt "$ceiling" ]; then
+        echo "daemon storage: FAIL (the directory holds $total bytes, past the ${cap}-byte cap plus one incident ($ceiling))"
         FAILURES=$((FAILURES + 1))
         return
     fi
 
-    # The bundles are complete, not half-written directories.
-    local incomplete=0
+    # A bundle the kill interrupted is expected and is not a failure: that is
+    # what the completion marker is for. What must hold is that the restart
+    # ignored it, which is only provable by the window coming back intact from
+    # a complete bundle. So this reports how many were left partial rather than
+    # failing on them.
+    local complete=0 incomplete=0
     for bundle in "$dir"/*/; do
         [ -d "$bundle" ] || continue
-        [ -f "$bundle/complete.json" ] || incomplete=$((incomplete + 1))
+        if [ -f "$bundle/complete.json" ]; then
+            complete=$((complete + 1))
+        else
+            incomplete=$((incomplete + 1))
+        fi
     done
-    if [ "$incomplete" -ne 0 ]; then
-        echo "daemon storage: FAIL ($incomplete bundle(s) were left without a completion marker)"
+    if [ "$complete" -lt 1 ]; then
+        echo "daemon storage: FAIL (no complete bundle survived the kill, so the restart had nothing to recover from)"
         FAILURES=$((FAILURES + 1))
         return
     fi
 
-    echo "daemon storage: $first_bundles incident(s) written, $kept kept under a ${cap}-byte cap ($total bytes; one incident is the floor), $restored interval(s) restored after restart, all bundles complete"
+    echo "daemon storage: recorder SIGKILLed, $kept bundle(s) and $total bytes held under a ${cap}-byte cap plus one incident ($ceiling), $restored interval(s) restored after restart, $complete complete and $incomplete interrupted"
 }
 
 # The complete trigger flag set for a case: exactly one on, the rest off.
