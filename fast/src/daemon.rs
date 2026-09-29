@@ -74,6 +74,20 @@ pub const BUDGET_CPU_PCT: f64 = 6.0;
 /// nobody can act on is not a budget.
 pub const BUDGET_RECORDING_BYTES: u64 = 4 * 1024 * 1024;
 
+/// How many intervals an incident bundle carries.
+///
+/// The ring holds as many as `--window` asks for, but a bundle is a report, not
+/// a second copy of the ring: what it needs is the run-up to the trigger, and
+/// the oldest part of that is the least likely to explain the interval that
+/// tripped. Bounding this is what makes a bundle a fixed size, and a fixed size
+/// is what lets `--max-disk-bytes` be a real ceiling instead of a number that
+/// is exceeded whenever the window is wide.
+///
+/// The cost is that a restart restores this many intervals rather than the whole
+/// window, and the live ring refills from the next tick, so nothing is lost
+/// except history older than the trigger.
+pub const BUNDLE_MAX_INTERVALS: usize = 60;
+
 /// One interval of the rolling window.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RingEntry {
@@ -155,6 +169,11 @@ fn write_incident(
     fs::create_dir_all(&directory)
         .with_context(|| format!("create incident directory {}", directory.display()))?;
 
+    // The most recent intervals, not all of them: see BUNDLE_MAX_INTERVALS.
+    // Taken from the end, because the newest is what leads to the trigger.
+    let total_entries = ring.entries().count();
+    let carried = total_entries.min(BUNDLE_MAX_INTERVALS);
+
     let manifest = serde_json::json!({
         "schema": crate::json::SCHEMA,
         "command": "daemon.incident",
@@ -179,6 +198,13 @@ fn write_incident(
                 "at_or_above": signal.threshold(triggers),
             }))
             .collect::<Vec<_>>(),
+        // Stated in the bundle, because a reader who assumed it holds the whole
+        // window would draw the wrong conclusion from a short one.
+        "history": {
+            "intervals_carried": carried,
+            "interval_limit": BUNDLE_MAX_INTERVALS,
+            "ring_window_s": args.window.as_secs_f64(),
+        },
         "interval": {
             "at_s": entry.at.as_secs_f64(),
             "sched_p95_us": entry.sched_p95_us,
@@ -195,7 +221,11 @@ fn write_incident(
     });
     write_json(&directory.join("manifest.json"), &manifest)?;
 
-    let intervals: Vec<Value> = ring.entries().map(RingEntry::to_json).collect();
+    let intervals: Vec<Value> = ring
+        .entries()
+        .skip(total_entries - carried)
+        .map(RingEntry::to_json)
+        .collect();
     write_json(&directory.join("intervals.json"), &Value::Array(intervals))?;
     write_json(&directory.join("slow-samples.json"), &slow.to_json())?;
 
@@ -226,7 +256,18 @@ fn write_incident(
             ],
         }),
     )?;
-    rotate(&args.output, args.max_disk_bytes, &directory)?;
+    let floor = rotate(&args.output, args.max_disk_bytes, &directory)?;
+    if let Some(total) = floor {
+        // Reported once per incident rather than swallowed, because a cap the
+        // user set is being exceeded and only they can decide whether to widen
+        // it, narrow the window, or accept it.
+        eprintln!(
+            "warning: incident directory holds {total} bytes, over the {} byte cap; \
+             a single incident is {} bytes and is never deleted, so this run's floor is one incident",
+            args.max_disk_bytes,
+            directory_size(&directory).unwrap_or(0)
+        );
+    }
     Ok(())
 }
 
@@ -263,10 +304,14 @@ impl SlowSamples {
 /// Removal failures are ignored rather than propagated. A recorder that cannot
 /// delete an old bundle is still recording, and ending the run over it would
 /// trade a working diagnosis for a tidy directory.
-fn rotate(output: &std::path::Path, max_bytes: u64, just_written: &std::path::Path) -> Result<()> {
+fn rotate(
+    output: &std::path::Path,
+    max_bytes: u64,
+    just_written: &std::path::Path,
+) -> Result<Option<u64>> {
     let entries = match std::fs::read_dir(output) {
         Ok(entries) => entries,
-        Err(_) => return Ok(()),
+        Err(_) => return Ok(None),
     };
     // Oldest first, by name, which is why bundle directories are stamped.
     let mut bundles: Vec<std::path::PathBuf> = entries
@@ -282,12 +327,13 @@ fn rotate(output: &std::path::Path, max_bytes: u64, just_written: &std::path::Pa
             break;
         }
         // The bundle that was just written is never removed. A cap exists to
-        // keep a recorder from filling a disk; a version that deletes the
-        // incident it was called to save is worse than a directory slightly over
-        // its budget, because it leaves a recorder that reports incidents and
-        // stores none. The check that found this was a run whose single bundle
-        // was larger than the whole cap. The floor is therefore one incident's
-        // size, and it is a floor rather than a violation.
+        // keep a recorder from filling a disk, and a version that deletes the
+        // incident it was called to save leaves a recorder that reports
+        // incidents and stores none, which is worse than a directory slightly
+        // over budget. The floor is therefore one incident, and BUNDLE_MAX_
+        // INTERVALS is what keeps that incident small enough for the cap to
+        // still mean something. When the cap is below that floor, the returned
+        // value says so instead of the recorder absorbing the overage quietly.
         if bundle == just_written {
             continue;
         }
@@ -296,7 +342,7 @@ fn rotate(output: &std::path::Path, max_bytes: u64, just_written: &std::path::Pa
         }
         let _ = fs::remove_dir_all(&bundle);
     }
-    Ok(())
+    Ok((total > max_bytes).then_some(total))
 }
 
 /// Sum of the regular files under every bundle in the output directory.
@@ -503,12 +549,20 @@ fn diagnose_from(entry: &RingEntry, pid: u32, slow: &SlowSamples) -> Value {
 /// The directory an incident at `at` goes in.
 ///
 /// The name sorts lexicographically in time order, so `ls` on the output
-/// directory is a timeline. A second-resolution stamp is deliberate: two
-/// triggers inside the same second append a counter rather than overwriting
-/// the bundle that is already there.
+/// directory is a timeline. That is not decoration: rotation deletes the oldest
+/// first, and a restart recovers from the newest, so if the names did not sort
+/// by time both would act on the wrong bundle.
+///
+/// The stamp is therefore a zero-padded millisecond count, not a formatted
+/// duration. A human-readable one sorts wrongly: `10s` sorts after `2s`, so
+/// `max()` over the names picks the wrong bundle and rotation would delete a
+/// recent one before an old one. The readable form is in the manifest, where
+/// nothing has to sort it.
+fn stamp(at: Duration) -> String {
+    format!("{:012}s", at.as_millis())
+}
 fn incident_dir(output: &std::path::Path, at: Duration) -> Result<std::path::PathBuf> {
-    let stamp = humantime::format_duration(at).to_string().replace(' ', "_");
-    let base = output.join(format!("incident-{stamp}"));
+    let base = output.join(format!("incident-{}", stamp(at)));
     let mut candidate = base.clone();
     let mut suffix = 2;
     while candidate.exists() {
@@ -1510,6 +1564,96 @@ mod tests {
     }
 
     #[test]
+    fn bundle_names_sort_in_time_order() {
+        // Rotation deletes the oldest first and a restart recovers from the
+        // newest, so both read the names as a timeline. A human-readable stamp
+        // does not sort that way: "10s" comes after "2s", which would make a
+        // restart recover a two-second-old bundle and rotation delete a
+        // ten-second-old one.
+        let mut stamps: Vec<String> = (0..12)
+            .map(|second| stamp(Duration::from_secs(second)))
+            .collect();
+        let sorted = stamps.clone();
+        stamps.sort();
+        assert_eq!(stamps, sorted, "ascending time sorts into ascending name");
+
+        let newest = stamps.iter().max().expect("a stamp");
+        assert_eq!(
+            newest,
+            &stamp(Duration::from_secs(11)),
+            "the newest is the maximum, not the largest digit count"
+        );
+
+        // Sub-second resolution has to keep working, or two triggers in the
+        // same second would collide on the name.
+        assert_ne!(
+            stamp(Duration::from_millis(1_500)),
+            stamp(Duration::from_secs(1)),
+            "milliseconds are part of the stamp"
+        );
+    }
+
+    #[test]
+    fn a_bundle_carries_a_bounded_number_of_intervals() {
+        // A bundle whose size grew with --window could not be bounded by
+        // --max-disk-bytes, because the one incident that is never deleted
+        // would grow with it. The run-up to a trigger is the recent history,
+        // so the bound drops the oldest.
+        let dir = temp_dir("bundle_is_bounded");
+        let args = default_args(&dir);
+        let triggers = Triggers::from_args(&args);
+        let slow = SlowSamples {
+            sched_us: vec![],
+            io_us: vec![],
+        };
+        // A window far wider than the bound, so the ring holds more than a
+        // bundle is allowed to.
+        let mut ring = Ring::new(
+            Duration::from_secs(BUNDLE_MAX_INTERVALS as u64 * 4),
+            Duration::from_secs(1),
+        );
+        for second in 1..=(BUNDLE_MAX_INTERVALS as u64 * 3) {
+            ring.push(RingEntry {
+                at: Duration::from_secs(second),
+                sched_p95_us: 40,
+                ..RingEntry::default()
+            });
+        }
+        let mut entry = slow_io_entry();
+        entry.at = Duration::from_secs(BUNDLE_MAX_INTERVALS as u64 * 3 + 1);
+        write_incident(&ring, entry, &triggers, &args, &slow).expect("write bundle");
+
+        let bundle = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .next()
+            .expect("one bundle")
+            .expect("entry")
+            .path();
+        let intervals: Value = serde_json::from_slice(
+            &std::fs::read(bundle.join("intervals.json")).expect("read intervals"),
+        )
+        .expect("parse");
+        assert_eq!(
+            intervals.as_array().map(Vec::len),
+            Some(BUNDLE_MAX_INTERVALS),
+            "the bundle is bounded regardless of the window"
+        );
+
+        // The newest run-up is what is kept, and the manifest says so rather
+        // than letting a reader assume it is the whole window.
+        let manifest: Value = serde_json::from_slice(
+            &std::fs::read(bundle.join("manifest.json")).expect("read manifest"),
+        )
+        .expect("parse");
+        assert_eq!(
+            manifest["history"]["intervals_carried"],
+            BUNDLE_MAX_INTERVALS
+        );
+        assert_eq!(manifest["history"]["interval_limit"], BUNDLE_MAX_INTERVALS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_bundle_holds_the_window_the_samples_and_a_diagnosis() {
         // The three things the issue asks a bundle to contain, checked in the
         // files rather than in the code that writes them.
@@ -1677,14 +1821,22 @@ mod tests {
             "the total stops growing rather than tracking the incident count: {totals:?}"
         );
         let names = bundle_names(&dir);
+        // The stamp is a padded millisecond count, so the check has to match
+        // the whole name rather than a fragment: "4s" is not a substring of
+        // "000000004000s", which is the point of the padded form.
         assert!(
-            names.iter().any(|name| name.contains("4s")),
-            "kept: {names:?}"
+            names
+                .iter()
+                .any(|name| name.ends_with(&stamp(Duration::from_secs(4)))),
+            "the newest is kept: {names:?}"
         );
         assert!(
-            !names.iter().any(|name| name.contains("1s")),
-            "dropped: {names:?}"
+            !names
+                .iter()
+                .any(|name| name.ends_with(&stamp(Duration::from_secs(1)))),
+            "the oldest is dropped: {names:?}"
         );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1710,7 +1862,7 @@ mod tests {
         let names = bundle_names(&dir);
         assert_eq!(names.len(), 1, "the incident survives: {names:?}");
         assert!(
-            names[0].contains("2s"),
+            names[0].ends_with(&stamp(Duration::from_secs(2))),
             "and it is the one just written: {names:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);

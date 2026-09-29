@@ -1176,7 +1176,10 @@ check_daemon_storage() {
     # be proved from the bundles that survived the kill, since a recorder that
     # is killed never gets to print how many it wrote. A cap of one bundle would
     # prove nothing a single directory could not prove on its own.
-    local cap=$((512 * 1024))
+    # Room for several bounded incidents, so rotation has to run and the cap
+    # still has to hold afterwards. A bundle is capped in size by the tool, so
+    # this is a cap a bundle fits inside rather than one it straddles.
+    local cap=$((256 * 1024))
     # Lock contention, with a threshold below what it produces, so the run
     # writes a bundle every interval or two. A run where no trigger fires writes
     # nothing, and a storage check with nothing to store tests nothing.
@@ -1275,11 +1278,10 @@ check_daemon_storage() {
     local kept
     kept=$(count_bundles "$dir")
 
-    # The invariant is the documented one, in the form it actually holds: the
-    # directory stays within the cap, with a floor of one incident, because the
-    # bundle just written is never deleted. The floor is measured from the
-    # largest bundle on disk rather than estimated, so the bound cannot be
-    # shifted into agreeing by a wrong constant.
+    # The acceptance criterion, checked literally: the directory does not go
+    # over its cap. That is only true because a bundle is a bounded size, so
+    # the cap is set well above one of them. Both are measured from disk rather
+    # than estimated, so no constant here can shift the bound into agreeing.
     local largest=0
     for bundle in "$dir"/*/; do
         [ -d "$bundle" ] || continue
@@ -1291,9 +1293,13 @@ check_daemon_storage() {
         done
         [ "$bytes" -gt "$largest" ] && largest=$bytes
     done
-    local ceiling=$((cap + largest))
-    if [ "$total" -gt "$ceiling" ]; then
-        echo "daemon storage: FAIL (the directory holds $total bytes, past the ${cap}-byte cap plus one incident ($ceiling))"
+    if [ "$largest" -ge "$cap" ]; then
+        echo "daemon storage: FAIL (one incident is $largest bytes, at or over the ${cap}-byte cap; the cap has to leave room for the incident that is never deleted)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if [ "$total" -gt "$cap" ]; then
+        echo "daemon storage: FAIL (the directory holds $total bytes, over its ${cap}-byte cap)"
         FAILURES=$((FAILURES + 1))
         return
     fi
@@ -1318,7 +1324,7 @@ check_daemon_storage() {
         return
     fi
 
-    echo "daemon storage: recorder SIGKILLed, $kept bundle(s) and $total bytes held under a ${cap}-byte cap plus one incident ($ceiling), $restored interval(s) restored after restart, $complete complete and $incomplete interrupted"
+    echo "daemon storage: recorder SIGKILLed, $kept bundle(s) and $total bytes under a ${cap}-byte cap (largest incident $largest), $restored interval(s) restored after restart, $complete complete and $incomplete interrupted"
 }
 
 # The complete trigger flag set for a case: exactly one on, the rest off.

@@ -476,10 +476,40 @@ trigger record, because that incident has already been written.
 on a timer, because the thing that fills a directory is incidents and a recorder
 that is not firing is not filling anything. The oldest bundles go first.
 
-The cap is a ceiling with a floor of one incident's size: the bundle that was
-just written is never a candidate for deletion. A cap is there to keep a
-background recorder from filling a disk, and a version that deletes the incident
-it was called to save is worse than a directory slightly over budget.
+The directory stays within the cap. Two decisions make that true rather than
+nearly true:
+
+- **A bundle is a bounded size.** The ring holds as many intervals as `--window`
+  asks for, but a bundle carries at most 60 — the most recent, which is the run-up
+  to the trigger. The oldest part of a run-up is the least likely to explain the
+  interval that tripped. Without this bound a bundle grows with `--window`, so
+  the one incident that is never deleted grows with it and the cap stops
+  meaning anything. Measured: 16 KiB per incident with a 120 s window, down from
+  24 KiB unbounded.
+- **The incident just written is never deleted.** A cap exists to keep a
+  background recorder from filling a disk, and a version that deletes the
+  incident it was called to save leaves a recorder that reports incidents and
+  stores none.
+
+The one incident is the floor, so the cap has to leave room for it. If it does
+not, the recorder says so on stderr for every incident rather than absorbing the
+overage quietly, because only the operator can decide whether to widen the cap,
+narrow the window, or accept it.
+
+#### What a restart recovers
+
+`--restore` reads the newest complete bundle back and continues that run's
+timeline, so the window does not read as though time ran backwards. Two
+properties that are easy to get wrong and are both tested:
+
+- Only the newest bundle is read. Older ones are there to be rotated away, and
+  stitching several together would produce a window with gaps in it that look
+  exactly like a quiet machine.
+- Bundle names sort in time order, because rotation deletes the oldest first and
+  a restart recovers from the newest. The stamp is a zero-padded millisecond
+  count, not a formatted duration: `10s` sorts after `2s`, which would make a
+  restart recover a two-second-old bundle. The readable form is in the manifest,
+  where nothing has to sort it.
 
 #### What it costs
 
@@ -521,7 +551,7 @@ enabled:
 | `io` | `io-hog`, O_DIRECT against ext4 | 18 incidents, `io_p99` fired, `sched_p95` stayed quiet |
 | `net` | `net-hog` cycling its receive window | 4 incidents, `retrans` fired, `io_p99` stayed quiet |
 | `sched` | `lock-hog --workers 16` | 18 incidents, `sched_p95` fired, `io_p99` stayed quiet |
-| storage | 4 KiB cap, 18 incidents written | 1 kept, 17 intervals restored after a kill and restart, every bundle complete |
+| storage | 256 KiB cap, recorder SIGKILLed mid-write | 20 bundles and 256441 bytes on disk, under the cap; 21 intervals restored after the restart |
 
 The thresholds in the `io` and `sched` cases are deliberately more sensitive
 than the production defaults. `io-hog` measures a p99 of 37 µs on this storage
@@ -586,9 +616,15 @@ papered over in the tool:
   reachable. The budget now covers the ongoing recording, and the fixed cost
   is reported beside it. This is stated rather than worked around because it is
   a property of the loader, not of this tool.
-- The incident directory is bounded by count and age rather than by content:
-  a single bundle can exceed a small `--max-disk-bytes`, because the one just
-  written is never deleted. Lower the cap or widen `--window` knowingly.
+- A single incident is never deleted to satisfy `--max-disk-bytes`, so a cap
+  below one incident's size cannot be honoured. The recorder reports the overage
+  on stderr every time rather than losing the incident. With a cap above one
+  incident the directory does stay within it, which the QEMU run checks with the
+  recorder killed mid-write: 20 bundles, 256441 bytes, under a 262144-byte cap.
+- A bundle carries at most the 60 most recent intervals, not the whole ring
+  window. A restart therefore restores 60 intervals and the live ring refills
+  from the next tick, so a very wide `--window` costs the bundle's history
+  depth rather than the recorder's.
 - Diagnosis confidences are shares of the measured severity across the causes
   that scored, not calibrated probabilities that a slowdown was caused by
   each. They rank the causes worth looking at; they do not estimate how much
