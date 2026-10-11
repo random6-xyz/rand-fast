@@ -388,7 +388,11 @@ where
         fatal_error = Some(anyhow!("a perf event reader thread panicked"));
     }
 
-    drain_messages(&receiver, handler);
+    if let Some(error) = drain_messages(&receiver, handler)
+        && fatal_error.is_none()
+    {
+        fatal_error = Some(error);
+    }
 
     let summary = CollectionSummary {
         // Cap at the requested duration: joining the readers and draining the
@@ -598,6 +602,15 @@ pub type TickSummary<'a> = Vec<(&'static str, serde_json::Value)>;
 /// Named because the type is long enough to be worth not writing twice.
 pub type TickCallback<'a> = Box<dyn FnMut(Duration, TickSummary<'_>) + 'a>;
 
+/// Claims at most one tick in a collection-loop iteration.
+fn should_run_tick(next_tick: Instant, now: Instant, ticked_this_iteration: &mut bool) -> bool {
+    if *ticked_this_iteration || now < next_tick {
+        return false;
+    }
+    *ticked_this_iteration = true;
+    true
+}
+
 /// What a multi-stream collection consumes: the streams, and optionally a
 /// callback that summarises them while the collection runs.
 pub struct MultiStreams<'a> {
@@ -712,6 +725,7 @@ pub fn run_multi_collection<'a>(
     let mut fatal_error = None;
 
     while started.elapsed() < options.duration {
+        let mut ticked_this_iteration = false;
         if stop.load(Ordering::Relaxed) {
             break;
         }
@@ -748,23 +762,7 @@ pub fn run_multi_collection<'a>(
         }
 
         if let Some(tick) = on_tick.as_mut()
-            && Instant::now() >= next_tick
-        {
-            // The snapshots are read here rather than inside the readers, so
-            // the summary is consistent with the events already dispatched.
-            let summary: TickSummary<'_> = streams
-                .iter_mut()
-                .filter_map(|stream| stream.sink.snapshot().map(|value| (stream.name, value)))
-                .collect();
-            tick(started.elapsed(), summary);
-            // Drifted forward from now rather than from the last tick, so a slow
-            // callback does not make the interval shorter every time and end
-            // up firing back to back.
-            next_tick = Instant::now() + options.tick_interval;
-        }
-
-        if let Some(tick) = on_tick.as_mut()
-            && Instant::now() >= next_tick
+            && should_run_tick(next_tick, Instant::now(), &mut ticked_this_iteration)
         {
             // The snapshots are read here rather than inside the readers, so
             // the summary is consistent with the events already dispatched.
@@ -808,22 +806,12 @@ pub fn run_multi_collection<'a>(
         fatal_error = Some(anyhow!("a perf event reader thread panicked"));
     }
 
-    // Drain what the readers produced while they were shutting down, so the
-    // last moments of a collection are not thrown away.
-    for message in receiver.try_iter() {
-        match message {
-            MultiMessage::Sample(index, bytes) => {
-                if let Some(stream) = streams.get_mut(index) {
-                    let _ = stream.sink.on_event(&bytes);
-                }
-            }
-            MultiMessage::Lost(index, count) => {
-                if let Some(stream) = streams.get_mut(index) {
-                    stream.sink.on_lost(count);
-                }
-            }
-            MultiMessage::Error(_) => {}
-        }
+    // Drain everything the readers produced while shutting down. Preserve any
+    // late reader or decode error so an incomplete run cannot look successful.
+    if let Some(error) = drain_multi_messages(&receiver, &mut streams)
+        && fatal_error.is_none()
+    {
+        fatal_error = Some(error);
     }
 
     let summary = CollectionSummary {
@@ -843,6 +831,33 @@ enum MultiMessage {
     Sample(usize, [u8; MAX_EVENT_SIZE]),
     Lost(usize, u64),
     Error(String),
+}
+
+fn drain_multi_messages(
+    receiver: &Receiver<MultiMessage>,
+    streams: &mut [EventStream<'_>],
+) -> Option<anyhow::Error> {
+    let mut first_error = None;
+    for message in receiver.try_iter() {
+        match message {
+            MultiMessage::Sample(index, bytes) => {
+                if let Some(stream) = streams.get_mut(index)
+                    && let Err(error) = stream.sink.on_event(&bytes)
+                {
+                    preserve_first_error(&mut first_error, error);
+                }
+            }
+            MultiMessage::Lost(index, count) => {
+                if let Some(stream) = streams.get_mut(index) {
+                    stream.sink.on_lost(count);
+                }
+            }
+            MultiMessage::Error(error) => {
+                preserve_first_error(&mut first_error, anyhow!(error));
+            }
+        }
+    }
+    first_error
 }
 
 /// Copies one event payload out of a perf record, which may be split across
@@ -1126,20 +1141,134 @@ fn decode_event<E: Pod>(head: &[u8], tail: &[u8]) -> Option<E> {
     Some(bytemuck::pod_read_unaligned(&bytes[..event_size]))
 }
 
-fn drain_messages<E, H: EventHandler<E>>(receiver: &Receiver<PerfMessage<E>>, handler: &mut H) {
+fn drain_messages<E, H: EventHandler<E>>(
+    receiver: &Receiver<PerfMessage<E>>,
+    handler: &mut H,
+) -> Option<anyhow::Error> {
+    let mut first_error = None;
     for message in receiver.try_iter() {
         match message {
             PerfMessage::Sample(event) => handler.on_event(event),
             PerfMessage::Lost(count) => handler.on_lost(count),
-            PerfMessage::Error(_) => {}
+            PerfMessage::Error(error) => preserve_first_error(&mut first_error, anyhow!(error)),
         }
+    }
+    first_error
+}
+
+fn preserve_first_error(first_error: &mut Option<anyhow::Error>, error: anyhow::Error) {
+    if first_error.is_none() {
+        *first_error = Some(error);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
     use super::*;
     use fast_common::{CpuSampleEvent, IoEvent, OffCpuEvent, SchedulerLatencyEvent, TcpEvent};
+
+    #[derive(Default)]
+    struct RecordingHandler {
+        events: Vec<u32>,
+        lost: u64,
+    }
+
+    impl EventHandler<u32> for RecordingHandler {
+        fn on_event(&mut self, event: u32) {
+            self.events.push(event);
+        }
+
+        fn on_lost(&mut self, count: u64) {
+            self.lost += count;
+        }
+    }
+
+    struct RecordingSink {
+        events: Rc<RefCell<Vec<u32>>>,
+        lost: Rc<Cell<u64>>,
+    }
+
+    impl EventSink for RecordingSink {
+        fn on_event(&mut self, bytes: &[u8]) -> Result<()> {
+            let event = u32::from_ne_bytes(bytes[..4].try_into().unwrap());
+            self.events.borrow_mut().push(event);
+            Ok(())
+        }
+
+        fn on_lost(&mut self, count: u64) {
+            self.lost.set(self.lost.get() + count);
+        }
+    }
+
+    #[test]
+    fn slow_tick_callback_is_claimed_once_per_iteration() {
+        let interval = Duration::from_millis(1);
+        let next_tick = Instant::now();
+        let mut ticked_this_iteration = false;
+        let mut calls = 0;
+
+        for _ in 0..2 {
+            if should_run_tick(next_tick, Instant::now(), &mut ticked_this_iteration) {
+                calls += 1;
+                // A slow callback takes longer than the interval. A second due
+                // check in the same outer-loop iteration must still be denied.
+                thread::sleep(interval * 5);
+            }
+        }
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn single_reader_error_in_final_drain_is_returned_after_events_are_drained() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(PerfMessage::Error("late poll failure".to_string()))
+            .unwrap();
+        sender.send(PerfMessage::Sample(7u32)).unwrap();
+        sender.send(PerfMessage::Lost(3)).unwrap();
+        drop(sender);
+
+        let mut handler = RecordingHandler::default();
+        let error = drain_messages(&receiver, &mut handler).unwrap();
+        assert!(error.to_string().contains("late poll failure"));
+        assert_eq!(handler.events, vec![7]);
+        assert_eq!(handler.lost, 3);
+    }
+
+    #[test]
+    fn multi_reader_error_in_final_drain_is_returned_after_events_are_drained() {
+        let (sender, receiver) = mpsc::channel();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let lost = Rc::new(Cell::new(0));
+        let mut streams = vec![EventStream {
+            map_name: "TEST_EVENTS",
+            name: "test",
+            perf_page_count: 1,
+            event_size: 4,
+            sink: Box::new(RecordingSink {
+                events: Rc::clone(&events),
+                lost: Rc::clone(&lost),
+            }),
+        }];
+        sender
+            .send(MultiMessage::Error("late multi-reader failure".to_string()))
+            .unwrap();
+        let mut sample = [0u8; MAX_EVENT_SIZE];
+        sample[..4].copy_from_slice(&9u32.to_ne_bytes());
+        sender.send(MultiMessage::Sample(0, sample)).unwrap();
+        sender.send(MultiMessage::Lost(0, 5)).unwrap();
+        drop(sender);
+
+        let error = drain_multi_messages(&receiver, &mut streams).unwrap();
+        assert!(error.to_string().contains("late multi-reader failure"));
+        assert_eq!(*events.borrow(), vec![9]);
+        assert_eq!(lost.get(), 5);
+    }
 
     #[test]
     fn known_events_fit_the_decode_buffer() {
