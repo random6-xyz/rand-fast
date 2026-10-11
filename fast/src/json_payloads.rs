@@ -359,6 +359,10 @@ pub struct OffCpuJson {
     pub samples: u64,
     /// Records the kernel dropped from the perf buffer.
     pub lost_events: u64,
+    /// Pending thread states remaining after collection stopped.
+    pub pending_at_stop: u64,
+    /// Pending states classified as unknown rather than interruptible/I/O waits.
+    pub pending_unknown_at_stop: u64,
     /// Summed off-CPU time.
     pub total_us: u64,
     /// Median wait.
@@ -412,6 +416,8 @@ pub fn offcpu_json(stats: &OffCpuStats) -> OffCpuJson {
     OffCpuJson {
         samples: stats.sample_count() as u64,
         lost_events: stats.lost(),
+        pending_at_stop: stats.pending_at_stop() as u64,
+        pending_unknown_at_stop: stats.pending_unknown_at_stop() as u64,
         total_us: total / 1_000,
         p50_us: p50 / 1_000,
         p95_us: p95 / 1_000,
@@ -633,8 +639,11 @@ mod tests {
                 WaitReason::Futex,
             );
         }
+        stats.set_pending_at_stop(2, 1);
         let value = value_of(&offcpu_json(&stats));
         assert_eq!(value["samples"], serde_json::json!(3));
+        assert_eq!(value["pending_at_stop"], serde_json::json!(2));
+        assert_eq!(value["pending_unknown_at_stop"], serde_json::json!(1));
         assert_eq!(value["total_us"], serde_json::json!(6));
         assert_eq!(
             value["reasons"][0]["reason"],

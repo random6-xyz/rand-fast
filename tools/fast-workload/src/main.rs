@@ -1,5 +1,6 @@
 use std::{
     alloc::{Layout, alloc, dealloc},
+    collections::HashSet,
     fs::{File, OpenOptions},
     hint::black_box,
     io::{Read, Seek, SeekFrom, Write},
@@ -8,7 +9,7 @@ use std::{
     path::PathBuf,
     ptr,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
     thread,
@@ -40,6 +41,9 @@ enum Mode {
     /// Futex contention across N threads (validates `fast offcpu`).
     #[command(name = "lock-hog")]
     Lock(LockHogArgs),
+    /// Repeatedly create and exit sleeping threads (validates TID cleanup).
+    #[command(name = "thread-exit-hog")]
+    ThreadExit(ThreadExitArgs),
     /// Allocation and page-fault churn (validates `fast memory`).
     #[command(name = "mem-hog")]
     Mem(MemHogArgs),
@@ -145,6 +149,21 @@ struct LockHogArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+struct ThreadExitArgs {
+    /// How long the churn workload should run.
+    #[arg(long, value_parser = parse_duration)]
+    duration: Duration,
+
+    /// Number of short-lived sleeping threads in each batch.
+    #[arg(long, default_value_t = 64)]
+    workers: usize,
+
+    /// How long each worker sleeps before exiting, in milliseconds.
+    #[arg(long, default_value_t = 200, value_name = "MS")]
+    sleep_ms: u64,
+}
+
+#[derive(Debug, Clone, Args)]
 struct MemHogArgs {
     /// How long the workload should run.
     #[arg(long, value_parser = parse_duration)]
@@ -165,6 +184,7 @@ fn main() -> std::process::ExitCode {
         Mode::Io(args) => run_io_hog(args),
         Mode::Net(args) => run_net_hog(args),
         Mode::Lock(args) => run_lock_hog(args),
+        Mode::ThreadExit(args) => run_thread_exit_hog(args),
         Mode::Mem(args) => run_mem_hog(args),
     };
 
@@ -630,6 +650,57 @@ fn run_lock_hog(args: LockHogArgs) -> Result<(), String> {
     println!(
         "lock-hog: {} acquisitions",
         acquisitions.load(Ordering::Relaxed),
+    );
+    Ok(())
+}
+
+fn run_thread_exit_hog(args: ThreadExitArgs) -> Result<(), String> {
+    if args.workers == 0 {
+        return Err("workers must be greater than zero".to_string());
+    }
+    if args.sleep_ms == 0 {
+        return Err("sleep-ms must be greater than zero".to_string());
+    }
+
+    let seen_tids = Arc::new(Mutex::new(HashSet::new()));
+    let created = Arc::new(AtomicU64::new(0));
+    let reused = Arc::new(AtomicU64::new(0));
+    let deadline = Instant::now() + args.duration;
+    let sleep = Duration::from_millis(args.sleep_ms);
+
+    while Instant::now() < deadline {
+        let mut handles = Vec::with_capacity(args.workers);
+        for worker in 0..args.workers {
+            let seen_tids = Arc::clone(&seen_tids);
+            let created = Arc::clone(&created);
+            let reused = Arc::clone(&reused);
+            handles.push(
+                thread::Builder::new()
+                    .name(format!("thread-exit-{worker}"))
+                    .spawn(move || {
+                        let tid = u32::try_from(unsafe { libc::syscall(libc::SYS_gettid) })
+                            .map_err(|error| format!("gettid returned an invalid id: {error}"))?;
+                        created.fetch_add(1, Ordering::Relaxed);
+                        let mut seen = seen_tids
+                            .lock()
+                            .map_err(|_| "TID reuse tracker was poisoned".to_string())?;
+                        if !seen.insert(tid) {
+                            reused.fetch_add(1, Ordering::Relaxed);
+                        }
+                        drop(seen);
+                        thread::sleep(sleep);
+                        Ok(())
+                    })
+                    .map_err(|error| format!("failed to spawn exit worker: {error}"))?,
+            );
+        }
+        join_workers(handles)?;
+    }
+
+    println!(
+        "thread-exit-hog: created {} threads, reused {} TIDs",
+        created.load(Ordering::Relaxed),
+        reused.load(Ordering::Relaxed)
     );
     Ok(())
 }

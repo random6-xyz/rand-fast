@@ -32,9 +32,27 @@ DURATION=${DURATION:-5s}
 OUT_DIR=${OUT_DIR:-/tmp/fast-smoke}
 IO_HOG_PATH=${IO_HOG_PATH:-/tmp/fast-workload-io}
 FAILURES=0
+PID_MAX_ORIGINAL=
+
+finish() {
+    if [ "$FAILURES" -gt 0 ]; then
+        echo "smoke matrix: FAILED ($FAILURES failure(s))"
+        exit 1
+    fi
+    echo "smoke matrix: all cases passed"
+    exit 0
+}
+
+restore_pid_max() {
+    if [ -n "$PID_MAX_ORIGINAL" ]; then
+        printf '%s\n' "$PID_MAX_ORIGINAL" > /proc/sys/kernel/pid_max 2>/dev/null || true
+        PID_MAX_ORIGINAL=
+    fi
+}
 
 cleanup() {
     kill $(jobs -p) 2>/dev/null
+    restore_pid_max
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -125,6 +143,12 @@ run_sched_case() {
     echo "  load report: $report_load"
     echo
 }
+
+# Host-side stub tests exercise the same case/failure accounting without QEMU.
+if [ "${QEMU_SMOKE_TEST_CASE:-}" = "single-io" ]; then
+    run_case io "$FAST_WORKLOAD" io-hog --duration 1s --workers 1
+    finish
+fi
 
 run_sched_case
 run_case cpu "$SCHED_WORKLOAD" hog --duration 30s --workers 8
@@ -649,6 +673,55 @@ check_offcpu_shape() {
     else
         echo "off-CPU shape: $busy waits for the CPU-bound hog against $locked for lock-hog"
     fi
+}
+
+check_offcpu_thread_exit_cleanup() {
+    # Lower the disposable guest's pid_max so rapid thread churn deterministically
+    # reuses TIDs. The workload sleeps in the kernel, then exits each TID while
+    # off-CPU state may be pending.
+    local fixture="$OUT_DIR/thread-exit-fixture.log"
+    local report="$OUT_DIR/thread-exit.json"
+    local reused pending pending_unknown samples
+    if [ ! -w /proc/sys/kernel/pid_max ]; then
+        echo "off-CPU thread-exit cleanup: FAIL (guest pid_max is not writable)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    PID_MAX_ORIGINAL=$(cat /proc/sys/kernel/pid_max 2>/dev/null || true)
+    if [ -z "$PID_MAX_ORIGINAL" ] || ! printf '1024\n' > /proc/sys/kernel/pid_max; then
+        echo "off-CPU thread-exit cleanup: FAIL (could not set guest pid_max to 1024)"
+        FAILURES=$((FAILURES + 1))
+        restore_pid_max
+        return
+    fi
+
+    "$FAST_WORKLOAD" thread-exit-hog --duration 12s --workers 64 --sleep-ms 200 \
+        >"$fixture" 2>&1 &
+    local target_pid=$!
+    sleep 0.3
+    if "$FAST" off-cpu --pid "$target_pid" --duration 13s --format json >"$report" 2>&1; then
+        reused=$(sed -n 's/.*reused \([0-9]*\) TIDs.*/\1/p' "$fixture")
+        pending=$(grep -o '"pending_at_stop":[0-9]*' "$report" | head -n 1 | cut -d: -f2)
+        pending_unknown=$(grep -o '"pending_unknown_at_stop":[0-9]*' "$report" | head -n 1 | cut -d: -f2)
+        samples=$(grep -o '"samples":[0-9]*' "$report" | head -n 1 | cut -d: -f2)
+        if awk -v r="${reused:-0}" -v p="${pending:-999999}" \
+            -v pu="${pending_unknown:-999999}" -v s="${samples:-0}" \
+            'BEGIN {
+                printf "off-CPU thread-exit cleanup: %s reused TIDs, %s waits, %s pending (%s unknown) at stop\n", r, s, p, pu
+                exit (r+0 > 0 && s+0 > 0 && p+0 == 0) ? 0 : 1
+            }'; then
+            :
+        else
+            FAILURES=$((FAILURES + 1))
+        fi
+    else
+        echo "off-CPU thread-exit cleanup: FAIL (collection failed; see $report)"
+        head -5 "$report" 2>/dev/null | sed 's/^/    /'
+        FAILURES=$((FAILURES + 1))
+    fi
+    kill "$target_pid" 2>/dev/null
+    wait "$target_pid" 2>/dev/null
+    restore_pid_max
 }
 
 # Proves the off-CPU report answers the question it exists for: which wait is
@@ -1443,6 +1516,7 @@ check_cpu_symbolization
 check_io_pairing
 check_io_request_identity
 check_offcpu_shape
+check_offcpu_thread_exit_cleanup
 check_offcpu_ranking
 check_memory_fault_counter
 check_memory_verdict
@@ -1481,8 +1555,4 @@ print_metrics diagnose 'scheduler:|cpu:|block io:|tcp:|off-cpu:|memory:|lost eve
 echo
 echo "Raw reports saved under $OUT_DIR"
 
-if [ "$FAILURES" -gt 0 ]; then
-    echo "smoke matrix: FAILED ($FAILURES failure(s))"
-    exit 1
-fi
-echo "smoke matrix: all cases passed"
+finish

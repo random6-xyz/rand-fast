@@ -127,6 +127,16 @@ pub struct IoRequestLayout {
 /// Operation code used for an I/O event whose request could not be tracked.
 pub const IO_OP_UNMATCHED: u32 = 3;
 
+/// Exit-state bits reported by sched_switch's prev_state field.
+///
+/// The tracepoint reports EXIT_DEAD/EXIT_ZOMBIE rather than TASK_DEAD itself.
+pub const SCHED_EXIT_STATE_MASK: u64 = 0x10 | 0x20;
+
+/// Whether sched_switch reports an exiting task rather than a wait.
+pub fn scheduler_state_is_exiting(state: u64) -> bool {
+    state & SCHED_EXIT_STATE_MASK != 0
+}
+
 /// Maps the low REQ_OP bits of request flags to rand-fast's operation codes.
 pub fn io_op_from_request_flags(flags: u32) -> u32 {
     match flags & 0xff {
@@ -322,6 +332,16 @@ mod tests {
         assert_eq!(io_op_from_request_flags(2), 2);
         assert_eq!(io_op_from_request_flags(3), 2);
         assert_eq!(io_op_from_request_flags(0x101), 1);
+    }
+
+    #[test]
+    fn scheduler_exit_state_is_not_classified_as_an_off_cpu_wait() {
+        assert!(!scheduler_state_is_exiting(0));
+        assert!(!scheduler_state_is_exiting(1));
+        assert!(!scheduler_state_is_exiting(2));
+        assert!(scheduler_state_is_exiting(0x10));
+        assert!(scheduler_state_is_exiting(0x20));
+        assert!(scheduler_state_is_exiting(0x10 | 1));
     }
 
     #[test]

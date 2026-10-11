@@ -127,16 +127,28 @@ pub trait PendingCleanup {
 impl<V: AyaPod> PendingCleanup for AyaHashMap<MapData, u32, V> {
     fn clear(&mut self, tid: u32) -> Result<(), MapError> {
         match self.remove(&tid) {
-            Ok(()) | Err(MapError::KeyNotFound) => Ok(()),
+            Ok(()) => Ok(()),
+            Err(error) if pending_key_is_missing(&error) => Ok(()),
             Err(error) => Err(error),
         }
     }
 }
 
+fn pending_key_is_missing(error: &MapError) -> bool {
+    match error {
+        MapError::KeyNotFound => true,
+        MapError::SyscallError(error) => {
+            error.call == "bpf_map_delete_elem"
+                && error.io_error.raw_os_error() == Some(libc::ENOENT)
+        }
+        _ => false,
+    }
+}
+
 /// Pending-state no-op for collectors whose pending maps are not keyed by
-/// TID, so thread-exit cleanup has nothing to remove: on-CPU sampling keeps
-/// no pending state, and per-request I/O entries die through the map's LRU
-/// eviction instead.
+/// TID: on-CPU sampling keeps no pending state, and block I/O is keyed by the
+/// unique request pointer. I/O map capacity failures are reported as unmatched
+/// requests rather than silently evicting a pending entry.
 pub struct NoPendingCleanup;
 
 impl PendingCleanup for NoPendingCleanup {
@@ -1268,6 +1280,27 @@ mod tests {
         assert!(error.to_string().contains("late multi-reader failure"));
         assert_eq!(*events.borrow(), vec![9]);
         assert_eq!(lost.get(), 5);
+    }
+
+    #[test]
+    fn pending_cleanup_ignores_only_already_removed_keys() {
+        let missing = MapError::SyscallError(aya::sys::SyscallError {
+            call: "bpf_map_delete_elem",
+            io_error: io::Error::from_raw_os_error(libc::ENOENT),
+        });
+        assert!(pending_key_is_missing(&MapError::KeyNotFound));
+        assert!(pending_key_is_missing(&missing));
+
+        let other_delete_error = MapError::SyscallError(aya::sys::SyscallError {
+            call: "bpf_map_delete_elem",
+            io_error: io::Error::from_raw_os_error(libc::EFAULT),
+        });
+        let lookup_error = MapError::SyscallError(aya::sys::SyscallError {
+            call: "bpf_map_lookup_elem",
+            io_error: io::Error::from_raw_os_error(libc::ENOENT),
+        });
+        assert!(!pending_key_is_missing(&other_delete_error));
+        assert!(!pending_key_is_missing(&lookup_error));
     }
 
     #[test]

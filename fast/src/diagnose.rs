@@ -143,6 +143,7 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
     // attributes.
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_wakeup")?;
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_switch")?;
+    runtime::attach_tracepoint(&mut bpf, "sched", "sched_process_exit")?;
     runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_probe")?;
     runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_retransmit_skb")?;
     runtime::attach_raw_tracepoint(&mut bpf, "block_rq_issue")?;

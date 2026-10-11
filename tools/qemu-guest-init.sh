@@ -64,7 +64,7 @@ fi
 # Record the scheduler tracepoint payload layouts used by scheduler and
 # off-CPU collection. Block I/O uses raw request pointers and BTF-derived
 # struct offsets rather than tracepoint payload offsets.
-for event in sched_wakeup sched_switch; do
+for event in sched_wakeup sched_switch sched_process_exit; do
     if [ -e "/sys/kernel/tracing/events/sched/$event/format" ]; then
         echo "=== $event format ==="
         cat "/sys/kernel/tracing/events/sched/$event/format"

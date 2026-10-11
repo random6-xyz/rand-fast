@@ -39,6 +39,7 @@ pub fn run(args: SchedArgs) -> Result<()> {
     .context("failed to load the eBPF object; run as root or grant CAP_BPF and CAP_PERFMON")?;
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_wakeup")?;
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_switch")?;
+    runtime::attach_tracepoint(&mut bpf, "sched", "sched_process_exit")?;
 
     let mut target_tids = runtime::take_target_map(&mut bpf)?;
     let pending_map = bpf

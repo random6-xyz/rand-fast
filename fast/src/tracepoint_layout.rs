@@ -182,6 +182,11 @@ const EVENTS: &[ExpectedEvent] = &[
         fields: SCHED_SWITCH_FIELDS,
     },
     ExpectedEvent {
+        category: "sched",
+        name: "sched_process_exit",
+        fields: NO_PAYLOAD_FIELDS,
+    },
+    ExpectedEvent {
         category: "tcp",
         name: "tcp_probe",
         fields: TCP_PROBE_FIELDS,

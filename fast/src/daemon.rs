@@ -54,9 +54,10 @@ const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 /// Documented CPU budget, as a fraction of one CPU.
 ///
 /// Revised from an aspirational 2% once the recorder could measure itself.
-/// The cost is the kernel invoking six tracepoint programs on every matching
-/// event across every CPU, and it does not move when the user-space side is
-/// made cheaper: a five-fold increase in the poll interval changed the peak
+/// The cost is the kernel invoking six hot tracepoint programs on every
+/// matching scheduler/block/TCP event across every CPU, plus one cleanup
+/// program only when a target thread exits. It does not move when the user-space
+/// side is made cheaper: a five-fold increase in the poll interval changed the peak
 /// not at all. Watching the scheduler, block I/O and TCP continuously is what
 /// costs, so 2% was not reachable while watching what this recorder is
 /// specified to watch. The figure is the measured peak with headroom for a
@@ -846,6 +847,7 @@ pub fn run(args: DaemonArgs) -> Result<()> {
     let after_object_rss = read_self_rss_bytes().unwrap_or(0);
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_wakeup")?;
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_switch")?;
+    runtime::attach_tracepoint(&mut bpf, "sched", "sched_process_exit")?;
     runtime::attach_raw_tracepoint(&mut bpf, "block_rq_issue")?;
     runtime::attach_raw_tracepoint(&mut bpf, "block_rq_complete")?;
     runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_probe")?;

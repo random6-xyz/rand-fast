@@ -8,6 +8,8 @@ field:pid_t prev_pid; offset:24; size:4; signed:1;
 field:long prev_state; offset:32; size:8; signed:1;
 field:pid_t next_pid; offset:56; size:4; signed:1;
 
+name: sched_process_exit
+
 name: tcp_probe
 field:__u8 saddr[28]; offset:8; size:28; signed:0;
 field:__u8 daddr[28]; offset:36; size:28; signed:0;

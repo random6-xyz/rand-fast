@@ -21,7 +21,7 @@ use fast_common::{
     IoRequestLayout, MAX_MEMORY_THREADS, MAX_PENDING_IO, MAX_STACKS, MAX_TARGET_TIDS,
     MAX_TCP_SOCKETS, MemoryCounters, OFFCPU_REASON_IO, OFFCPU_REASON_UNKNOWN, OFFCPU_REASON_WAIT,
     OffCpuEvent, OffCpuPending, PendingIo, PendingWakeup, SchedulerLatencyEvent, TcpEvent,
-    io_op_from_request_flags,
+    io_op_from_request_flags, scheduler_state_is_exiting,
 };
 
 // Payload offsets for the supported scheduler tracepoint layouts. The user-space
@@ -150,6 +150,10 @@ static OFFCPU_EVENTS: PerfEventArray<OffCpuEvent> = PerfEventArray::new(0);
 static OFFCPU_START: LruHashMap<u32, OffCpuPending> =
     LruHashMap::with_max_entries(MAX_TARGET_TIDS, 0);
 
+/// TIDs whose exit hook ran but final sched_switch has not been observed yet.
+#[map]
+static EXITING_TIDS: LruHashMap<u32, u8> = LruHashMap::with_max_entries(MAX_TARGET_TIDS, 0);
+
 #[map]
 static MEMORY_COUNTERS: LruHashMap<u32, MemoryCounters> =
     LruHashMap::with_max_entries(MAX_MEMORY_THREADS, 0);
@@ -167,6 +171,9 @@ fn try_sched_wakeup(ctx: TracePointContext) -> Result<u32, u32> {
 
     if unsafe { TARGET_TIDS.get(tid) }.is_none() {
         return Ok(0);
+    }
+    if unsafe { EXITING_TIDS.get(tid) }.is_some() {
+        let _ = EXITING_TIDS.remove(tid);
     }
 
     let mode = unsafe { MODE.get(0) }.copied().unwrap_or(0);
@@ -256,25 +263,32 @@ fn try_sched_switch(ctx: TracePointContext) -> Result<u32, u32> {
         && let Ok(prev_pid) = unsafe { ctx.read_at::<u32>(SCHED_SWITCH_PREV_PID_OFFSET) }
         && unsafe { TARGET_TIDS.get(prev_pid) }.is_some()
         && let Ok(prev_state) = unsafe { ctx.read_at::<u64>(SCHED_SWITCH_PREV_STATE_OFFSET) }
-        && prev_state != 0
     {
-        let stack = unsafe {
-            bpf_get_stackid(
-                ctx.as_ptr(),
-                &STACK_TRACES as *const _ as *mut core::ffi::c_void,
-                // BPF_F_REUSE_STACKID lets a recurring blocking path share one
-                // entry. Without it every distinct stack takes a slot, and a
-                // thread that blocks in a tight loop evicts everything else.
-                BPF_F_REUSE_STACKID as u64,
-            )
-        };
-        let pending = OffCpuPending {
-            start_ns: unsafe { bpf_ktime_get_ns() },
-            stack_id: stack as i64,
-            reason: offcpu_reason_from_state(prev_state),
-            _pad: 0,
-        };
-        let _ = OFFCPU_START.insert(prev_pid, pending, BPF_ANY as u64);
+        if unsafe { EXITING_TIDS.get(prev_pid) }.is_some() || scheduler_state_is_exiting(prev_state)
+        {
+            // sched_switch reports EXIT_DEAD/EXIT_ZOMBIE for an exiting task.
+            // It is not a wait, and the marker also covers kernel state encoding.
+            let _ = OFFCPU_START.remove(prev_pid);
+            let _ = EXITING_TIDS.remove(prev_pid);
+        } else if prev_state != 0 {
+            let stack = unsafe {
+                bpf_get_stackid(
+                    ctx.as_ptr(),
+                    &STACK_TRACES as *const _ as *mut core::ffi::c_void,
+                    // BPF_F_REUSE_STACKID lets a recurring blocking path share one
+                    // entry. Without it every distinct stack takes a slot, and a
+                    // thread that blocks in a tight loop evicts everything else.
+                    BPF_F_REUSE_STACKID as u64,
+                )
+            };
+            let pending = OffCpuPending {
+                start_ns: unsafe { bpf_ktime_get_ns() },
+                stack_id: stack as i64,
+                reason: offcpu_reason_from_state(prev_state),
+                _pad: 0,
+            };
+            let _ = OFFCPU_START.insert(prev_pid, pending, BPF_ANY as u64);
+        }
     }
 
     if unsafe { TARGET_TIDS.get(tid) }.is_none() {
@@ -306,6 +320,35 @@ fn try_sched_switch(ctx: TracePointContext) -> Result<u32, u32> {
         EVENTS.output(&ctx, event, BPF_ANY);
     }
 
+    Ok(0)
+}
+
+#[tracepoint(name = "sched_process_exit", category = "sched")]
+pub fn sched_process_exit(ctx: TracePointContext) -> u32 {
+    match try_sched_process_exit(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_sched_process_exit(_ctx: TracePointContext) -> Result<u32, u32> {
+    let tid = bpf_get_current_pid_tgid() as u32;
+    let mode = unsafe { MODE.get(0) }.copied().unwrap_or(0);
+    if mode & (COLLECT_SCHEDULER_LATENCY | COLLECT_OFFCPU) == 0 {
+        return Ok(0);
+    }
+    if unsafe { TARGET_TIDS.get(tid) }.is_some() {
+        let _ = EXITING_TIDS.insert(tid, 1, BPF_ANY as u64);
+    }
+    // Pending maps only contain target threads, but the userspace polling loop
+    // can remove TARGET_TIDS immediately before this tracepoint runs. Delete by
+    // TID regardless so that race cannot preserve state for a reused ID.
+    if mode & COLLECT_SCHEDULER_LATENCY != 0 {
+        let _ = PENDING_WAKEUPS.remove(tid);
+    }
+    if mode & COLLECT_OFFCPU != 0 {
+        let _ = OFFCPU_START.remove(tid);
+    }
     Ok(0)
 }
 
