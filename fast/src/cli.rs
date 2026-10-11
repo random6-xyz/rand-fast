@@ -2,11 +2,21 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::json::Format;
+
 #[derive(Debug, Parser)]
 #[command(name = "fast", version, about = "Linux performance diagnostics")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// Adds the shared `--format` flag to a subcommand's arguments.
+#[derive(Debug, Clone, Args)]
+pub struct FormatArg {
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = Format::Text)]
+    pub format: Format,
 }
 
 #[derive(Debug, Subcommand)]
@@ -38,6 +48,9 @@ pub struct SchedArgs {
     /// Collection duration, for example 10s or 500ms.
     #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
     pub duration: Duration,
+
+    #[command(flatten)]
+    pub format: FormatArg,
 }
 
 fn parse_pid(value: &str) -> Result<u32, String> {
@@ -57,6 +70,126 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
         return Err("duration must be greater than zero".to_string());
     }
     Ok(duration)
+}
+
+/// Is this value the word that turns a trigger off?
+fn is_off(value: &str) -> bool {
+    value.eq_ignore_ascii_case("off")
+}
+
+/// A latency threshold in microseconds, or the decision not to watch it.
+///
+/// A separate type from [`CountThreshold`] and [`PercentThreshold`] so that
+/// each flag accepts only what makes sense for it. A percentage of scheduler
+/// latency is not a number a person can mean, and a flag that quietly accepted
+/// it would produce a trigger nobody asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LatencyThreshold(Option<u64>);
+
+impl LatencyThreshold {
+    /// The threshold in microseconds, or `None` when the trigger is off.
+    pub fn micros(self) -> Option<u64> {
+        self.0
+    }
+}
+
+impl std::str::FromStr for LatencyThreshold {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if is_off(value) {
+            return Ok(LatencyThreshold(None));
+        }
+        let micros = parse_duration(value)?.as_micros();
+        let micros = u64::try_from(micros)
+            .map_err(|_| format!("latency threshold is too large: {value}"))?;
+        Ok(LatencyThreshold(Some(micros)))
+    }
+}
+
+/// A count threshold, or the decision not to watch it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CountThreshold(Option<u64>);
+
+impl CountThreshold {
+    /// The threshold, or `None` when the trigger is off.
+    pub fn count(self) -> Option<u64> {
+        self.0
+    }
+}
+
+impl std::str::FromStr for CountThreshold {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if is_off(value) {
+            return Ok(CountThreshold(None));
+        }
+        let count: u64 = value
+            .parse()
+            .map_err(|_| format!("invalid count `{value}`: expected a whole number or `off`"))?;
+        if count == 0 {
+            return Err(
+                "a count of zero would fire on every interval; use `off` to disable the trigger"
+                    .to_string(),
+            );
+        }
+        Ok(CountThreshold(Some(count)))
+    }
+}
+
+/// A percentage threshold, or the decision not to watch it.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PercentThreshold(Option<f64>);
+
+impl PercentThreshold {
+    /// The threshold, or `None` when the trigger is off.
+    pub fn percent(self) -> Option<f64> {
+        self.0
+    }
+}
+
+impl std::str::FromStr for PercentThreshold {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if is_off(value) {
+            return Ok(PercentThreshold(None));
+        }
+        let percent: f64 = value
+            .parse()
+            .map_err(|_| format!("invalid percentage `{value}`: expected a number or `off`"))?;
+        if !(0.0..=100.0).contains(&percent) {
+            return Err(format!(
+                "percentage must be between 0 and 100, got {percent}"
+            ));
+        }
+        if percent == 0.0 {
+            return Err(
+                "a threshold of zero would fire on every interval; use `off` to disable the trigger"
+                    .to_string(),
+            );
+        }
+        Ok(PercentThreshold(Some(percent)))
+    }
+}
+
+/// Parses a byte size, with the usual `k`, `m` and `g` suffixes.
+fn parse_bytes(value: &str) -> Result<u64, String> {
+    let digits: String = value.chars().take_while(char::is_ascii_digit).collect();
+    let (number, suffix) = value.split_at(digits.len());
+    let scale: u64 = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        other => return Err(format!("unknown size suffix `{other}` in `{value}`")),
+    };
+    let base: u64 = number
+        .parse()
+        .map_err(|_| format!("invalid size `{value}`"))?;
+    base.checked_mul(scale)
+        .ok_or_else(|| format!("size `{value}` is too large"))
 }
 
 fn parse_frequency(value: &str) -> Result<u64, String> {
@@ -88,6 +221,9 @@ pub struct CpuArgs {
     /// On-CPU sampling frequency in Hz (default 99).
     #[arg(long, value_name = "HZ", default_value_t = 99, value_parser = parse_frequency)]
     pub frequency: u64,
+
+    #[command(flatten)]
+    pub format: FormatArg,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -103,6 +239,9 @@ pub struct IoArgs {
     /// Slow I/O threshold (default 10ms).
     #[arg(long, default_value = "10ms", value_parser = parse_duration)]
     pub threshold: Duration,
+
+    #[command(flatten)]
+    pub format: FormatArg,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -114,6 +253,9 @@ pub struct NetArgs {
     /// Collection duration, for example 10s or 500ms.
     #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
     pub duration: Duration,
+
+    #[command(flatten)]
+    pub format: FormatArg,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -125,6 +267,9 @@ pub struct OffCpuArgs {
     /// Collection duration, for example 10s or 500ms.
     #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
     pub duration: Duration,
+
+    #[command(flatten)]
+    pub format: FormatArg,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -136,6 +281,9 @@ pub struct MemoryArgs {
     /// Collection duration, for example 10s or 500ms.
     #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
     pub duration: Duration,
+
+    #[command(flatten)]
+    pub format: FormatArg,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -147,6 +295,9 @@ pub struct DiagnoseArgs {
     /// Collection duration, for example 10s or 500ms.
     #[arg(long, default_value = "10s", value_parser = parse_duration)]
     pub duration: Duration,
+
+    #[command(flatten)]
+    pub format: FormatArg,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -159,13 +310,70 @@ pub struct DaemonArgs {
     #[arg(long, default_value = "0s", value_parser = parse_duration)]
     pub duration: Duration,
 
-    /// Trigger threshold for scheduler p95 (default 10ms).
-    #[arg(long, default_value = "10ms", value_parser = parse_duration)]
-    pub trigger: Duration,
+    /// How often an interval is recorded into the rolling window.
+    ///
+    /// Shorter intervals catch a shorter regression and cost proportionally more
+    /// of the overhead budget, so this and the window are the two knobs that
+    /// decide what the recorder is able to see.
+    #[arg(long, default_value = "1s", value_parser = parse_duration)]
+    pub interval: Duration,
+
+    /// How much history the rolling window keeps.
+    #[arg(long, default_value = "60s", value_parser = parse_duration)]
+    pub window: Duration,
+
+    /// Trigger threshold for scheduler latency p95.
+    ///
+    /// One of several triggers; the recorder writes an incident when any of
+    /// them fires, and the incident names which. `off` disables this one.
+    #[arg(long, default_value = "10ms", value_name = "DURATION|off")]
+    pub trigger_sched_p95: LatencyThreshold,
+
+    /// Trigger threshold for block I/O latency p99.
+    #[arg(long, default_value = "25ms", value_name = "DURATION|off")]
+    pub trigger_io_p99: LatencyThreshold,
+
+    /// Trigger threshold for retransmissions in one interval.
+    #[arg(long, default_value = "8", value_name = "COUNT|off")]
+    pub trigger_retrans: CountThreshold,
+
+    /// Trigger threshold for memory pressure "some", in percent.
+    #[arg(long, default_value = "10", value_name = "PERCENT|off")]
+    pub trigger_psi_some: PercentThreshold,
+
+    /// Trigger threshold for memory pressure "full", in percent.
+    #[arg(long, default_value = "5", value_name = "PERCENT|off")]
+    pub trigger_psi_full: PercentThreshold,
+
+    /// Trigger threshold for on-CPU usage, as a percentage of one CPU.
+    #[arg(long, default_value = "off", value_name = "PERCENT|off")]
+    pub trigger_cpu: PercentThreshold,
 
     /// Output directory for incidents.
     #[arg(long, default_value = "./incidents")]
     pub output: std::path::PathBuf,
+
+    /// Total size the incident directory is allowed to reach.
+    ///
+    /// Checked after every incident, and the oldest bundles are removed to get
+    /// back under it. A recorder that runs for days on a machine that keeps
+    /// having bad minutes will otherwise fill the disk it is trying to
+    /// diagnose, which is the one failure mode a background process must not
+    /// have.
+    #[arg(long, default_value = "512m", value_name = "BYTES", value_parser = parse_bytes)]
+    pub max_disk_bytes: u64,
+
+    /// Keep the rolling window from the previous run instead of starting empty.
+    ///
+    /// A recorder restarted after a crash or a deploy is least useful exactly
+    /// when it is most needed, which is immediately after whatever made it
+    /// restart. Reading the last bundle back means the window still covers the
+    /// minutes before the restart.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub restore: bool,
+
+    #[command(flatten)]
+    pub format: FormatArg,
 }
 
 #[cfg(test)]

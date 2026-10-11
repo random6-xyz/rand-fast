@@ -4,7 +4,12 @@ use anyhow::{Context, Result};
 use aya::{Ebpf, include_bytes_aligned, maps::HashMap as AyaHashMap, maps::MapData};
 use fast_common::{COLLECT_SCHEDULER_LATENCY, SchedulerLatencyEvent};
 
-use crate::{cli::SchedArgs, output, process, runtime, stats::Statistics};
+use crate::{
+    cli::SchedArgs,
+    json::{self, Envelope, Format},
+    output, process, runtime,
+    stats::Statistics,
+};
 
 /// The scheduler emits at most one event per wakeup of the target threads, so
 /// the default buffer size matches earlier releases.
@@ -61,13 +66,28 @@ pub fn run(args: SchedArgs) -> Result<()> {
         },
     )?;
 
-    output::print_report(
-        pid,
-        &process_name,
-        summary.elapsed,
-        &stats,
-        summary.interrupted,
-        summary.process_exited,
-    );
+    if args.format.format == Format::Json {
+        json::emit(
+            args.format.format,
+            &Envelope::new(
+                "sched",
+                pid,
+                Some(process_name),
+                summary.elapsed,
+                summary.interrupted,
+                summary.process_exited,
+                output::scheduler_json(&stats),
+            ),
+        );
+    } else {
+        output::print_report(
+            pid,
+            &process_name,
+            summary.elapsed,
+            &stats,
+            summary.interrupted,
+            summary.process_exited,
+        );
+    }
     Ok(())
 }

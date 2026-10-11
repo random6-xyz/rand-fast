@@ -82,6 +82,79 @@ pub fn format_ns(nanoseconds: u64) -> String {
     format!("{:.2} s", nanoseconds as f64 / 1_000_000_000.0)
 }
 
+/// The scheduler command's `data` object.
+///
+/// The human report prints percentiles per CPU as well; the document carries
+/// the overall percentiles plus the per-CPU rows, because a consumer that
+/// wanted the table should not have to re-run the collection to get it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SchedulerJson {
+    /// Number of latency samples collected.
+    pub samples: u64,
+    /// Records the kernel dropped from the perf buffer.
+    pub lost_events: u64,
+    /// Median runnable-to-running latency.
+    pub p50_us: u64,
+    /// 95th percentile latency.
+    pub p95_us: u64,
+    /// 99th percentile latency.
+    pub p99_us: u64,
+    /// Longest single latency.
+    pub max_us: u64,
+    /// Waits over 1ms.
+    pub slow_over_1ms: u64,
+    /// Waits over 10ms.
+    pub slow_over_10ms: u64,
+    /// Waits over 50ms.
+    pub slow_over_50ms: u64,
+    /// The same percentiles broken down by the CPU the thread ran on.
+    pub per_cpu: Vec<CpuLatencyJson>,
+}
+
+/// One CPU's scheduler latency row.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CpuLatencyJson {
+    /// CPU the thread ran on.
+    pub cpu: u32,
+    /// Samples on this CPU.
+    pub samples: u64,
+    /// Median latency on this CPU.
+    pub p50_us: u64,
+    /// 95th percentile latency on this CPU.
+    pub p95_us: u64,
+    /// 99th percentile latency on this CPU.
+    pub p99_us: u64,
+    /// Longest single latency on this CPU.
+    pub max_us: u64,
+}
+
+/// Builds the scheduler document's `data` object.
+pub fn scheduler_json(stats: &Statistics) -> SchedulerJson {
+    let summary = stats.summary();
+    SchedulerJson {
+        samples: stats.sample_count() as u64,
+        lost_events: stats.lost_events(),
+        p50_us: summary.map_or(0, |s| s.p50_ns / 1_000),
+        p95_us: summary.map_or(0, |s| s.p95_ns / 1_000),
+        p99_us: summary.map_or(0, |s| s.p99_ns / 1_000),
+        max_us: summary.map_or(0, |s| s.max_ns / 1_000),
+        slow_over_1ms: stats.slow_1ms(),
+        slow_over_10ms: stats.slow_10ms(),
+        slow_over_50ms: stats.slow_50ms(),
+        per_cpu: stats
+            .cpu_summaries()
+            .map(|(cpu, summary)| CpuLatencyJson {
+                cpu,
+                samples: summary.count as u64,
+                p50_us: summary.p50_ns / 1_000,
+                p95_us: summary.p95_ns / 1_000,
+                p99_us: summary.p99_ns / 1_000,
+                max_us: summary.max_ns / 1_000,
+            })
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +171,69 @@ mod tests {
     #[test]
     fn rounds_sub_millisecond_values_without_printing_1000_microseconds() {
         assert_eq!(format_ns(999_600), "1.0 ms");
+    }
+
+    /// A collector with a known distribution, so the document's numbers can be
+    /// checked against the ones the human report prints.
+    fn sample_stats() -> Statistics {
+        let mut stats = Statistics::default();
+        for latency_ns in [40_000u64, 900_000, 2_000_000, 84_000_000] {
+            stats.record(fast_common::SchedulerLatencyEvent {
+                latency_ns,
+                wake_ns: 0,
+                run_ns: latency_ns,
+                tid: 1,
+                wake_cpu: 0,
+                run_cpu: 3,
+                reserved: 0,
+            });
+        }
+        stats.record_lost(2);
+        stats
+    }
+
+    #[test]
+    fn scheduler_json_reports_microseconds() {
+        let data = scheduler_json(&sample_stats());
+        assert_eq!(data.samples, 4);
+        assert_eq!(data.lost_events, 2);
+        // 40us, 900us, 2ms, 84ms -> the maximum survives the unit change.
+        assert_eq!(data.max_us, 84_000);
+        assert!(data.p99_us <= data.max_us);
+        assert!(data.p50_us <= data.p95_us);
+    }
+
+    #[test]
+    fn scheduler_json_carries_the_per_cpu_rows() {
+        let data = scheduler_json(&sample_stats());
+        assert_eq!(data.per_cpu.len(), 1);
+        assert_eq!(data.per_cpu[0].cpu, 3);
+        assert_eq!(data.per_cpu[0].samples, 4);
+    }
+
+    #[test]
+    fn scheduler_json_counts_slow_events() {
+        let data = scheduler_json(&sample_stats());
+        assert_eq!(data.slow_over_1ms, 2, "2ms and 84ms are over 1ms");
+        assert_eq!(data.slow_over_10ms, 1, "only 84ms is over 10ms");
+        assert_eq!(data.slow_over_50ms, 1, "only 84ms is over 50ms");
+    }
+
+    #[test]
+    fn scheduler_json_of_an_empty_run_is_still_a_valid_document() {
+        // No samples must produce a document with zero counts, not a missing
+        // or malformed one.
+        let data = scheduler_json(&Statistics::default());
+        assert_eq!(data.samples, 0);
+        assert_eq!(data.p95_us, 0);
+        assert!(data.per_cpu.is_empty());
+    }
+
+    #[test]
+    fn scheduler_json_is_serializable() {
+        let value = serde_json::to_value(scheduler_json(&sample_stats()))
+            .expect("the payload must serialize");
+        assert_eq!(value["samples"], serde_json::json!(4));
+        assert_eq!(value["per_cpu"][0]["cpu"], serde_json::json!(3));
     }
 }

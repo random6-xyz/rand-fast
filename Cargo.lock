@@ -369,6 +369,8 @@ dependencies = [
  "fast-common",
  "humantime",
  "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

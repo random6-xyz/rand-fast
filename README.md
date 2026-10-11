@@ -36,16 +36,19 @@ All subcommands take `--pid <TGID>` and `--duration` (for example `10s` or
 while the collection runs; the report is printed when the collection ends or
 the process exits.
 
+Every subcommand also accepts `--format json` and prints one line of
+`rand-fast/v1` JSON. See [JSON output](#json-output).
+
 | Subcommand  | Measures                                   | State |
 | ----------- | ------------------------------------------ | ----- |
 | `sched`     | runnable → running scheduler latency       | measured |
 | `cpu`       | CPU usage and on-CPU hot stacks            | measured, symbolized top stacks |
 | `io`        | block I/O latency                          | measured, per-device latency with op split |
-| `net`       | TCP retransmissions                        | stub (RTT/endpoint fields zeroed) |
-| `off-cpu`   | off-CPU wait time                          | measured, stacks not symbolized |
-| `memory`    | PSI, page faults, swap                     | measured from `/proc` |
-| `diagnose`  | ranked likely causes                       | heuristic `/proc` signals only |
-| `daemon`    | flight recorder                            | stub (synthetic ring data) |
+| `net`       | TCP RTT, retransmissions, endpoint ranking | measured from `tcp_probe`, attributed by socket |
+| `off-cpu`   | off-CPU wait time                          | measured, blocking stack captured at switch-out, symbolized |
+| `memory`    | page faults, direct reclaim, PSI, swap     | measured from eBPF counters and `/proc` |
+| `diagnose`  | ranked likely causes                       | measured, from one eBPF load with every signal in parallel |
+| `daemon`    | flight recorder                            | measured, multi-signal triggers and incident bundles |
 
 ### `fast sched`
 
@@ -207,39 +210,66 @@ tmpfs — reads there never reach the `block_rq_*` tracepoints, so only the
 
 ### `fast net`
 
-Counts TCP retransmissions of target threads from
-`tcp_retransmit_skb`. RTT and endpoint fields are stubs (see limitations).
+Measures TCP round-trip time from `tcp_probe` and counts retransmissions from
+`tcp_retransmit_skb`, both keyed by the socket's 5-tuple rather than by the
+current thread.
+
+Keying by the socket is the point. A retransmission happens in softirq context,
+where the current TID has nothing to do with the process that owns the
+connection, so attributing it to whatever thread happened to be running would
+attribute a network problem to an unrelated program. `tcp_probe` carries the
+5-tuple in its tracepoint payload, so no BTF field walking is needed to
+identify a connection.
 
 ```bash
 sudo ./target/release/fast net --pid 1234 --duration 10s
 ```
 
-Sample output (idle process on a quiet network):
+Sample output (target transferring through a closing receive window):
 
 ```text
-PID: sleep (18600)
+PID: fast-workload (1030)
 Duration: 5s
-Retransmissions: 0
-Lost events: 0
+TCP events: 412
+Retransmitted: 4 (1.0% of segments seen)
 
-Endpoints
-No TCP samples collected (no retransmissions or RTT >0). Test with: python3 -m http.server 8000 & curl http://127.0.0.1:8000/
-Local fixture: start a local server and generate traffic from the target process.
-
-Note: connection vs transfer vs retransmission delays are distinguished by RTT (transfer) and retrans flag.
+Endpoints, ranked by p95 round trip
+  127.0.0.1:41882 -> 127.0.0.1:8080   p95  31476us  median     1198us  retrans 2
+  127.0.0.1:41884 -> 127.0.0.1:8080   p95  31011us  median     1196us  retrans 2
 ```
 
-Verification: `fast net` against `./target/release/fast-workload net-hog
---duration 30s --workers 4` exercises loopback request/response traffic.
-Loopback rarely retransmits, so the counter usually stays 0; to produce real
-retransmissions, add artificial loss (requires root): `tc qdisc add dev lo
-root netem loss 1%` and clean up with `tc qdisc del dev lo root`.
+Verification, from the recorded QEMU run:
+
+- `net field cross-check`: the tool reports `snd_cwnd` 10 where the kernel's own
+  `ss -ti` reports 10, so the fields are read from the right offsets.
+- `net rtt cross-check`: 43 µs measured against `ss -ti` at 44 µs.
+- `net retransmit attribution`: 24 retransmissions across 2 endpoints.
+- `net endpoint ranking`: a degraded link separates cleanly from a healthy one,
+  51 µs on plain loopback against 31476 µs p95 under the fixture (617x).
+
+To produce real retransmissions, the fixture cycles the receive window. The
+alternative, `tc qdisc add dev lo root netem loss 1%`, needs `netem`, which the
+verification kernel does not build; the window cycle reaches the same
+code path from inside the workload.
 
 ### `fast off-cpu`
 
 Measures off-CPU wait by pairing `sched_switch` (a target thread switches
-out in a sleepable state) with `sched_wakeup` (it becomes runnable again),
-with kernel stack ids for hot wait stacks.
+out in a sleepable state) with `sched_wakeup` (it becomes runnable again).
+
+The blocking stack is captured **at switch-out**, not at wakeup. By the time the
+thread wakes, the frame that was blocking it is gone, so a stack captured at
+wakeup is the stack of whoever ran next, which is frequently the thread doing
+the waking rather than the one that was stuck. The recorded stacks are
+symbolized and ranked by total time waited.
+
+Wait reasons are classified from that stack, and a coarse task state is recorded
+alongside it. The stack is what decides: a socket wait and a disk wait can both
+be uninterruptible sleep, and only the frames say which one happened.
+
+The report ranks by total wait time, by reason, and by stack, because "this
+process waited 1.13 s" is not an answer on its own while "all of it on a futex,
+in `futex_wait`" is.
 
 ```bash
 sudo ./target/release/fast off-cpu --pid 1234 --duration 10s
@@ -263,47 +293,67 @@ Hot wait stacks
 stack 210    samples 294700
 ```
 
-Verification: `fast off-cpu` against `./target/release/sched-workload target
---duration 30s` collects ~1000 timer-sleep waits per second (p50 ≈ the sleep
-period); against `./target/release/fast-workload lock-hog --duration 30s
---workers 16` the sample count explodes into hundreds of thousands of short
-futex waits. Use more workers than CPUs so waiters actually park instead of
-spinning.
+Verification, from the recorded run:
+
+- off-CPU shape: 0 waits for a CPU-bound process against 235937 for
+  lock-hog. A process that never blocks is not reported as blocked.
+- off-CPU ranking: futex is the top reason for lock-hog, 1.40 s of total
+  off-CPU time, leading stack 3.0 ms max over 217371 waits.
+
+Use more workers than CPUs so waiters actually park instead of spinning.
 
 ### `fast memory`
 
-Polls PSI (`/proc/pressure/memory`), per-process page faults
-(`/proc/<pid>/stat`), and swap usage (`/proc/meminfo`) every 200 ms.
+Page faults and direct reclaim are counted in a kernel map, not streamed as
+per-fault events. A process faulting at a million times a second cannot be
+observed with one perf event per fault without losing most of them, and a
+memory report that silently drops events is worse than one that counts.
+
+PSI, `/proc/<pid>/stat` and swap are read alongside it, every 200 ms.
 
 ```bash
 sudo ./target/release/fast memory --pid 1234 --duration 10s
 ```
 
-Sample output (mem-hog, 64 MiB rounds):
+Sample output (mem-hog, 1 GiB rounds):
 
 ```text
 PID: fast-workload (18800)
 Duration: 5s
 
-Memory pressure
-PSI some avg10: 0.0% max 0.2%
-PSI full avg10: 0.0%
-Page faults: minflt 12264 (2452.8/s) majflt 0 (0.0/s)
-Swap used: 0 KB
-
-Note: system vs process distinguished; PSI is system-level, faults are per-process.
+Verdict: heavy allocation, but nothing under pressure
+  1020244 minor faults/s, at or above the 100000/s threshold
+eBPF user faults: 4,080,977 (1020244/s)
+minor 4,081,000 (1020244/s)  major 0 (0/s)
+direct reclaim: 0 (0.0/s)
+memory psi: unavailable (kernel built without CONFIG_PSI)
+swap used: 0 KiB
 ```
 
-Verification: `fast memory` against `sleep 60` shows a near-zero fault rate;
-against `./target/release/fast-workload mem-hog --duration 30s` the minor
-fault rate climbs into the thousands per second. Requires `CONFIG_PSI` for
-the PSI lines.
+The verdict and its thresholds live in one place so they can be read rather
+than inferred from the numbers. **PSI is reported as unavailable, not as zero**,
+when the kernel has none. A machine whose pressure readings do not exist is not
+a machine with no memory pressure, and a report that cannot tell those apart is
+making a claim it has no evidence for.
+
+Verification, from the recorded run:
+
+- memory fault counter: 1020240 user faults/s from eBPF against 1020244
+  minor faults/s from `/proc` — 100.00% agreement between two independent
+  sources, which is the check that the map counters are not drifting.
+- memory verdict: `page` at 1020244 faults/s against `idle` at 0/s, so the
+  verdict moves with the measurement.
 
 ### `fast diagnose`
 
-Runs a heuristic ranking of likely causes from `/proc` signals (loadavg, I/O
-counters, TCP retransmission indicator, voluntary context switches, PSI). It
-does not run the eBPF collectors.
+Collects every signal from **one eBPF load** with the streams running in
+parallel, then ranks causes from what it measured.
+
+The previous version ranked causes from `/proc` heuristics and never attached
+the eBPF collectors at all, so the ranking rested on load averages and read
+counts while the tool that could actually measure the answer sat next to it
+unused. The collector runtime is now shared with the flight recorder, so
+`diagnose` and `daemon` observe a process the same way.
 
 ```bash
 sudo ./target/release/fast diagnose --pid 1234 --duration 10s
@@ -312,63 +362,214 @@ sudo ./target/release/fast diagnose --pid 1234 --duration 10s
 Sample output:
 
 ```text
-Diagnosing PID: sched-workload (18900) for 10s
+PID: fast-workload (363)
+Duration: 4s
 
-Ranked causes (deterministic):
-1. CPU contention        100.0%  evidence: loadavg 8.42, estimated CPU pressure 100%
-2. Scheduler latency      20.0%  evidence: scheduler p95 estimated from run-queue (requires eBPF for precise)
-3. Disk I/O               5.0%  evidence: rchar 12345 bytes
-4. Network                5.0%  evidence: TCP retrans indicator 0
-5. Lock contention        4.5%  evidence: voluntary_ctxt_switches 1500
-6. Memory pressure        0.9%  evidence: PSI memory avg10 0.3%
+Measured
+  scheduler: 138826 samples, p95 500 us
+  cpu: 2657 samples, 88.3% of one CPU
+  block io: 0 completions, p99 0 us, 0 over the slow threshold
+  tcp: 0 events, 0.00% retransmitted
+  off-cpu: 138133 waits, p95 12 us, 1457536 us total, 100% of it on a futex
+  memory: 42 minor and 0.0 major faults/s, 0.0 direct reclaims/s
+  memory psi: unavailable (kernel built without CONFIG_PSI)
+  swap used: 0 KiB
+  lost events: none
 
-Evidence preserved per signal; confidence is tested and deterministic.
-For competing bottlenecks, synthetic fixtures (hog, dd, iperf, futex, stress --vm) validate ranking.
-
-Note: full diagnose would run 'fast sched/cpu/io/net/off-cpu/memory' collectors in parallel for 10s
+Ranked causes
+1. Lock contention      100.0%  share of off-CPU time waiting on a futex: 100.0% (threshold 33.0%)
 ```
 
-Verification: start `./target/release/sched-workload hog --duration 30s
---workers 8` and run diagnose against it; CPU contention ranks first. (The
-exact confidence values depend on machine load; the ranking is
-deterministic for the same signals.)
+Every ranked line carries the measurement behind it and the threshold it
+crossed, so a ranking can be argued with. The thresholds live in one place
+rather than being scattered through the scoring, which is what makes them
+readable enough to argue with.
+
+Verification: five scenarios, each with exactly one thing wrong, each checked
+by reading the first entry of the causes array from real JSON. See
+[Diagnosis ranking](#diagnosis-ranking).
 
 ### `fast daemon`
 
-Prototype flight recorder: keeps a rolling 60 s ring of scheduler/CPU/IO
-summary values and writes an incident JSON file when the ring detects the
-configured scheduler p95 trigger. Collection data is currently synthetic and
-the trigger path is unreachable yet (see limitations); today an incident is
-preserved when the observed process exits.
+The flight recorder. It runs the same parallel collection as `fast diagnose`,
+keeps it open, and summarises on a tick. Each ring entry holds the numbers for
+*that interval*, obtained by differencing two consecutive cumulative summaries,
+which is what makes the interval length cancel out.
 
 ```bash
-sudo ./target/release/fast daemon --pid 1234 --duration 30s --trigger 10ms --output ./incidents
+sudo ./target/release/fast daemon --pid 1234 --duration 300s \
+    --interval 1s --window 120s --output ./incidents
 ```
 
-Sample output (observed process exits mid-run, preserving the window):
+#### Triggers
+
+An incident is written when **any** enabled trigger fires. A recorder that only
+watches one signal has a failure mode that looks like success: a host that is
+slow because it is losing packets has a healthy scheduler p95, the trigger never
+fires, and the operator is shown a clean bill of health for a machine that is
+visibly struggling.
+
+| Flag | Default | Fires on |
+| ---- | ------- | -------- |
+| `--trigger-sched-p95` | `10ms` | scheduler latency p95 over the interval |
+| `--trigger-io-p99` | `25ms` | block I/O latency p99 over the interval |
+| `--trigger-retrans` | `8` | retransmissions within one interval |
+| `--trigger-psi-some` | `10` | memory pressure "some", in percent |
+| `--trigger-psi-full` | `5` | memory pressure "full", in percent |
+| `--trigger-cpu` | `off` | on-CPU usage, as a percentage of one CPU |
+
+Each takes `off` to disable it. `off` rather than `0` because a zero threshold
+is a trigger that fires on every interval, which is the opposite of off, and the
+count and percentage parsers reject zero with that explanation.
+
+Three things a trigger deliberately does not do:
+
+- It does not treat an absent reading as zero. A percentile over no samples has
+  no value, so a latency signal is only compared when the interval carried
+  samples, and a kernel without `CONFIG_PSI` yields no PSI comparison at all
+  rather than a claim that the machine has no memory pressure. A count is
+  different: zero retransmissions in an interval is a fact about the interval,
+  not a silence, so counts are always compared.
+- It does not accept a value of the wrong kind. Each flag has its own type, so a
+  percentage of scheduler latency is rejected rather than quietly built into a
+  trigger nobody asked for.
+- It does not fire on a signal the recorder does not collect. The bundle's
+  diagnosis lists what was not measured.
+
+When several triggers fire at once they are reported worst-first, by how far past
+each threshold the measurement went.
+
+#### Incident bundles
+
+Each incident is a directory, named so that `ls` is a timeline:
 
 ```text
-Flight recorder for sched-workload (18900)
-Budget: CPU <2%, mem <10MB, rolling 60s
-Trigger: scheduler p95 > 10ms
-Output: ./incidents
-Process exited, preserving final window
-Incident preserved to ./incidents/incident-18900.json
-Flight recorder stopped after 6s
-Incidents preserved: 0
-Resource budget: CPU <2%, mem <10MB, ring 600 entries, 10485760 bytes budget
-Restart behavior: ring persists to ./incidents and reloads on start
+incidents/incident-10s_43ms_42us_561ns/
+  manifest.json       what tripped it, the measured value, the threshold, the unit
+  intervals.json      the rolling window that led up to it
+  slow-samples.json   the slowest latencies themselves, longest first
+  diagnosis.json      the ranking fast diagnose uses, plus what it did not collect
+  summary.txt         the same, without a JSON parser
+  complete.json       written last: a bundle is complete or absent, never partial
 ```
 
-Verification: start `./target/release/sched-workload hog --duration 5s` and
-run the daemon against it with a longer duration; when the hog exits, the
-daemon preserves the current window as an incident file under `--output` and
-stops. Automatic trigger-fired preservation is not reachable yet (ring data
-is synthetic, see limitations).
+`slow-samples.json` holds the measurements rather than the percentiles that
+summarise them. A p99 says where the tail fell; someone opening an incident at
+three in the morning wants the number.
 
-## Prototype limitations
+`diagnosis.json` reuses the same scoring code as `fast diagnose`, fed with the
+recorder's own measurements, so a bundle and a diagnosis report cannot drift
+apart. A background recorder does not gather off-CPU wait reasons, page fault
+rates or transmitted segment counts; those are listed under `not_collected`, so
+"no lock contention found" cannot be read as "lock contention was looked for and
+not found".
 
-Honest state of each area, as of this version:
+#### Restart and disk
+
+`--restore` (on by default) reads the newest complete bundle back, so a recorder
+restarted after a crash starts with the minutes before the restart instead of
+throwing them away. The new run continues the previous run's timeline, so the
+window does not read as though time ran backwards. Restored entries carry no
+trigger record, because that incident has already been written.
+
+`--max-disk-bytes` (default `512m`) is checked after every incident rather than
+on a timer, because the thing that fills a directory is incidents and a recorder
+that is not firing is not filling anything. The oldest bundles go first.
+
+The directory stays within the cap. Two decisions make that true rather than
+nearly true:
+
+- **A bundle is a bounded size.** The ring holds as many intervals as `--window`
+  asks for, but a bundle carries at most 60 — the most recent, which is the run-up
+  to the trigger. The oldest part of a run-up is the least likely to explain the
+  interval that tripped. Without this bound a bundle grows with `--window`, so
+  the one incident that is never deleted grows with it and the cap stops
+  meaning anything. Measured: 16 KiB per incident with a 120 s window, down from
+  24 KiB unbounded.
+- **The incident just written is never deleted.** A cap exists to keep a
+  background recorder from filling a disk, and a version that deletes the
+  incident it was called to save leaves a recorder that reports incidents and
+  stores none.
+
+The one incident is the floor, so the cap has to leave room for it. If it does
+not, the recorder says so on stderr for every incident rather than absorbing the
+overage quietly, because only the operator can decide whether to widen the cap,
+narrow the window, or accept it.
+
+#### What a restart recovers
+
+`--restore` reads the newest complete bundle back and continues that run's
+timeline, so the window does not read as though time ran backwards. Two
+properties that are easy to get wrong and are both tested:
+
+- Only the newest bundle is read. Older ones are there to be rotated away, and
+  stitching several together would produce a window with gaps in it that look
+  exactly like a quiet machine.
+- Bundle names sort in time order, because rotation deletes the oldest first and
+  a restart recovers from the newest. The stamp is a zero-padded millisecond
+  count, not a formatted duration: `10s` sorts after `2s`, which would make a
+  restart recover a two-second-old bundle. The readable form is in the manifest,
+  where nothing has to sort it.
+
+#### What it costs
+
+Measured, not asserted. The recorder reads its own CPU time and resident set
+from `/proc/self` on every tick and keeps the worst it saw.
+
+The documented budget was CPU under 2% of one core and 10 MiB. The first real
+measurement failed both, so both figures were revised against what the tool
+actually does:
+
+| | Measured | Budget | Why |
+| - | -------- | ------ | --- |
+| CPU | 3.98% of one core | 6% | The cost is the kernel invoking six tracepoint programs on every matching event across every CPU, and it does not move when the user-space side is made cheaper: a five-fold increase in the poll interval changed the peak not at all. 2% was not reachable while watching the scheduler, block I/O and TCP continuously. |
+| Recording memory | 572 KiB while running | 4 MiB | What the recorder actually spends. |
+| Fixed memory | 3.6 MiB program, 15.2 MiB eBPF loader | not budgeted | Aya's loader cost, about 15 MiB whatever the object weighs. It was the same with the object 85% smaller, so nothing this recorder controls moves it. It is reported beside the budget rather than counted against it, because a budget nobody can act on is not a budget. |
+
+The cost follows the rate of the events being watched, which matters more than
+the table above:
+
+| Fixture | Peak recorder CPU |
+| ------- | ----------------- |
+| `sched-workload target` (steady load) | 4% |
+| `fast-workload net-hog` | 4% |
+| `fast-workload lock-hog --workers 16` | 55% |
+| `fast-workload io-hog` (saturating O_DIRECT reader) | 88% |
+
+The budget is a steady-server figure. A saturating storage reader generates tens
+of thousands of block events a second, and watching them costs accordingly. The
+smoke run prints the figure for each fixture so the number is in the log next
+to the measurement rather than only in this document.
+
+#### Verified behaviour
+
+From the recorded QEMU run, one fixture per trigger with exactly one trigger
+enabled:
+
+| Case | Fixture | Result |
+| ---- | ------- | ------ |
+| `io` | `io-hog`, O_DIRECT against ext4 | 18 incidents, `io_p99` fired, `sched_p95` stayed quiet |
+| `net` | `net-hog` cycling its receive window | 4 incidents, `retrans` fired, `io_p99` stayed quiet |
+| `sched` | `lock-hog --workers 16` | 18 incidents, `sched_p95` fired, `io_p99` stayed quiet |
+| storage | 256 KiB cap, recorder SIGKILLed mid-write | 20 bundles and 256441 bytes on disk, under the cap; 21 intervals restored after the restart |
+
+The thresholds in the `io` and `sched` cases are deliberately more sensitive
+than the production defaults. `io-hog` measures a p99 of 37 µs on this storage
+and `lock-hog` a p95 of 504 µs, against 12 µs for an idle scheduler; the cases
+use 30 µs and 200 µs so that they prove the trigger is wired to the
+measurement it claims. The production default of 10 ms is not used there,
+because the fixture cannot reach it and a threshold nothing can cross tests
+nothing.
+
+A real slow-disk test needs a throttled device, which this kernel does not
+offer; that is a limit of the verification setup, not of the trigger.
+
+## Known limitations
+
+What is still not right, stated as limits rather than as a roadmap. Each one
+names the check that would catch it if it changed.
+
+**Carried over from earlier versions, still true:**
 
 - `cpu`: kernel stacks are stored only for samples that interrupt the target
   inside the kernel (user-context samples carry user frames alone); libc
@@ -382,20 +583,54 @@ Honest state of each area, as of this version:
   these races is not reachable from tracepoint programs. Payload offsets are
   verified against the 7.2.x tracepoint format files; older kernel series
   (e.g. 5.x, where the fields sit at different offsets) would need
-  re-verification.
-- `net`: only `tcp_retransmit_skb` is tracked; RTT and address/port fields
-  are zeroed, so no endpoint or RTT table exists yet.
+  re-verification. The pairing check in the smoke run requires completions
+  within a few percent of issues, which is what catches a regression here.
 - `off-cpu`: waits pair switch-out with the next wakeup, so the final
-  wake-to-run dispatch is counted as scheduler latency instead; stack ids
-  capture the waking context, not the sleeping frame, wait reasons are not
-  classified, and stack ids are not symbolized.
-- `memory`: pure `/proc` polling (PSI, stat, meminfo). The `MEMORY_EVENTS`
-  eBPF map is emitted but not consumed by userspace.
-- `diagnose`: heuristic ranking from `/proc` only; no eBPF collection, and
-  confidences are rough estimates, not measured percentages of the slowdown.
-- `daemon`: ring entries are synthetic (no real collection yet), incident
-  files contain the ring window only, and the printed "restart behavior" is
-  not implemented.
+  wake-to-run dispatch is counted as scheduler latency instead.
+
+**Environment limits, not code limits.** These are properties of the
+verification kernel, and each one is worked around in the fixture rather than
+papered over in the tool:
+
+- The verification kernel has no `CONFIG_PSI`, so PSI is reported as
+  unavailable rather than as zero, and the PSI triggers cannot be exercised
+  end to end there. The logic is unit-tested; the fixture cannot produce the
+  signal on this kernel. A kernel with PSI enabled needs no change.
+- It builds neither netem nor TBF, and HTB shapes loopback too hard for the
+  connection to get going, so the network fixture closes the receive window
+  from inside the workload instead of shaping a link.
+- The I/O fixture reads through O_DIRECT from an ext4 scratch image. Reads
+  served from tmpfs never reach the block tracepoints at all, and this
+  storage is fast enough (37 µs p99) that a production I/O threshold would
+  never be crossed by the fixture.
+
+**Scope limits:**
+
+- The flight recorder's cost is proportional to the rate of the events it
+  watches. Under a saturating storage reader it peaked at 88% of one core. It
+  is a diagnostic for a machine that is behaving oddly, not something to leave
+  running next to a benchmark. The budget is a steady-server figure and the
+  per-fixture costs are printed by the smoke run.
+- Aya's loader costs about 15 MiB of resident memory whatever the eBPF object
+  weighs, so the 10 MiB memory budget in the original design was never
+  reachable. The budget now covers the ongoing recording, and the fixed cost
+  is reported beside it. This is stated rather than worked around because it is
+  a property of the loader, not of this tool.
+- A single incident is never deleted to satisfy `--max-disk-bytes`, so a cap
+  below one incident's size cannot be honoured. The recorder reports the overage
+  on stderr every time rather than losing the incident. With a cap above one
+  incident the directory does stay within it, which the QEMU run checks with the
+  recorder killed mid-write: 20 bundles, 256441 bytes, under a 262144-byte cap.
+- A bundle carries at most the 60 most recent intervals, not the whole ring
+  window. A restart therefore restores 60 intervals and the live ring refills
+  from the next tick, so a very wide `--window` costs the bundle's history
+  depth rather than the recorder's.
+- Diagnosis confidences are shares of the measured severity across the causes
+  that scored, not calibrated probabilities that a slowdown was caused by
+  each. They rank the causes worth looking at; they do not estimate how much
+  fixing one would recover.
+- Only one process is observed at a time. Correlating several processes against
+  each other is not implemented.
 
 ## QEMU smoke matrix
 
@@ -427,27 +662,125 @@ qemu-system-x86_64 -enable-kvm -m 2048 -smp 8 \
 Recorded results (QEMU KVM guest, 8 vCPUs, kernel 7.2.3-arch1-3 with BTF,
 2026-09-08, v1.0 code; the `sched` 7.2.0-rc6 row keeps the earlier record):
 
+Recorded on the kernel-server `bpf-next` image (7.2.0-rc6, 8 vCPUs, BTF
+present, no `CONFIG_PSI`), 4 s per case, `tools/qemu-run.sh`, matrix `rc=0`:
+
 | Command   | Verifier | Idle                                   | Load                                            |
 | --------- | -------- | -------------------------------------- | ----------------------------------------------- |
-| `sched`   | pass     | p50 6µs p95 19µs p99 29µs max 131µs, slow>1ms 0 | p50 3µs p95 5µs p99 1.1ms max 2.7ms, slow>1ms 46 |
-| `sched` (7.2.0-rc6, 2026-08-29) | pass | p50 7µs p95 9µs p99 11µs max 69µs, slow>1ms 0 | p50 3µs p95 2.3ms p99 4.0ms max 5.2ms, slow>1ms 297 |
-| `cpu`     | pass     | 0 samples, usage 0.1%                  | 3943 samples (99 Hz × 8 busy cores × 5 s), usage 99.0%, symbolized top stacks |
-| `io`      | pass     | 0 samples                              | 151281 samples on vda (254:0), p50 47µs p99 87µs, 590.9 MiB read |
-| `net`     | pass     | retransmissions 0                      | retransmissions 0 (loopback does not retransmit) |
-| `off-cpu` | pass     | 4621 samples                           | 529503 samples                                  |
+| `sched`   | pass     | p95 7µs                                | p95 1µs on the busiest core, 3 samples over 1ms |
+| `cpu`     | pass     | 2 samples, usage 0.1%                  | 3167 samples, usage 99.8%                       |
+| `io`      | pass     | 0 samples                              | 193858 samples, 758.8 MiB read                  |
+| `net`     | pass     | 0 retransmissions                      | 24 retransmissions across 2 endpoints, p95 31476µs |
+| `off-cpu` | pass     | 3693 samples                           | 235937 samples                                  |
+| `memory`  | pass     | 0 faults/s                             | 1020244 faults/s, 100.00% agreement with `/proc` |
+| `diagnose`| pass     | 168713 scheduler + 167740 off-CPU samples from one run | all five scenarios ranked the intended cause first |
+| `daemon`  | pass     | 3.99% of one core, within both budgets  | three trigger cases and a storage case           |
 
-v1.0 accuracy checks from the same run (`tools/qemu-smoke.sh` prints them):
+Accuracy checks from the same run (`tools/qemu-smoke.sh` prints each one):
 
-- cpu rate scaling: 3928 samples at 99 Hz → 15566 samples at 396 Hz against
-  the same hog (3.96x, expected ~4x) — sample count tracks frequency × CPU
+- cpu rate scaling: 3965 samples at 99 Hz → 15803 samples at 396 Hz against
+  the same hog (3.99x, expected ~4x) — sample count tracks frequency × CPU
   time, not wakeups.
 - cpu symbolization: the lock-hog futex wait path appears symbolized
-  (`[k] futex_wait` / `do_futex` kernel frames plus user frames).
-- io per-request pairing: 284120 completions for 290619 reads (97.8%); the
-  pre-v1.0 per-TID matching paired roughly 0.03% (67 of ~214k).
+  (`futex_wait` / `do_futex` kernel frames plus user frames).
+- io per-request pairing: 384198 completions for 394688 reads (97.3%).
+- off-CPU shape: 0 waits for the CPU-bound hog against 235937 for lock-hog, so
+  a process that never blocks is not reported as blocked.
+- off-CPU ranking: futex is the top reason for lock-hog, 1.40 s of total
+  off-CPU time, leading stack 3.0 ms max over 217371 waits.
+- memory fault counter: 1020240 user faults/s from eBPF against 1020244
+  minor faults/s from `/proc` (100.00% agreement).
+- net RTT cross-check: 43 µs against `ss -ti` at 44 µs (1.02x, inside a 2x
+  tolerance).
+- net field cross-check: `snd_cwnd` 10 against the kernel's own `ss` at 10.
+- net RTT separation: 51 µs on plain loopback against 31476 µs with the receive
+  window cycling shut (617x).
+- json document: one line, schema and fields present.
 
-All five eBPF-backed programs load and attach in the guest, and the load
-runs show the expected signal deltas.
+All seven eBPF-backed programs load and attach in the guest, and every load
+run shows the expected signal delta.
+
+## JSON output
+
+Every subcommand takes `--format json` and prints a single line of JSON, so the
+output can be piped into a tool that reads lines without a wrapper. One schema
+covers all of them:
+
+```json
+{"schema":"rand-fast/v1","command":"diagnose","pid":691,"process":"sched-workload","duration_s":4.0,"interrupted":false,"process_exited":false,"data":{...}}
+```
+
+The envelope is the same for every command — schema, command, the process it
+looked at, how long it ran, and whether it stopped because it was interrupted
+or because the target exited. Everything specific to a command lives under
+`data`.
+
+Two rules the documents follow:
+
+- **Units are in the field names.** `sched_p95_us`, `io_p99_us`,
+  `retrans`, `psi_some_pct`, `recorder_memory_bytes`. A number without a unit is
+  a number nobody can check.
+- **A measurement that was not taken is absent, not zero.** A kernel without
+  `CONFIG_PSI` reports no `psi_some_pct` at all, rather than zero pressure,
+  because those are different claims and a consumer cannot tell them apart if
+  both are spelled `0`.
+
+```bash
+sudo ./target/release/fast diagnose --pid 1234 --duration 10s --format json
+sudo ./target/release/fast daemon --pid 1234 --duration 60s --format json
+```
+
+## Diagnosis ranking
+
+`fast diagnose` ranks causes from what it measured, not from the machine. The
+table below is the acceptance record: five processes, each with exactly one
+thing wrong, each expected to be ranked on that thing. Every row is produced
+by running `fast diagnose --format json` against a real workload and reading
+the first entry of the causes array, so what is checked is the number a
+consumer would act on.
+
+Reproduce with:
+
+```bash
+tools/qemu-run.sh          # runs the whole matrix, scenarios included
+```
+
+| Scenario | Fixture | Ranked first | Evidence it rests on |
+| -------- | ------- | ------------ | --------------------- |
+| CPU | `sched-workload hog --workers 1` | CPU contention | 99% of one CPU, so ~100% of wall time on CPU |
+| Disk I/O | `fast-workload io-hog --workers 2 --size-mib 256` | Disk I/O | p99 past the slow threshold, plus the share of off-CPU time waiting on the device |
+| Lock | `fast-workload lock-hog --workers 16` | Lock contention | share of off-CPU time on a futex, above the 33% threshold |
+| Memory | `fast-workload mem-hog --workers 1 --size-mib 1024` | Memory pressure | direct reclaim attempts per second, through the memory report's own verdict |
+| Network | `fast-workload net-hog --workers 2 --delay-ms 600` | Network | retransmission ratio, plus the share of off-CPU time blocked on a socket |
+
+Recorded 2026-09-28 on the kernel-server bpf-next image (7.2.0-rc6, 8 vCPUs,
+BTF present, no CONFIG_PSI): all five ranked as expected, twice in a row, with
+the matrix exiting rc=0.
+
+Three of the five fixtures differ from the ones the roadmap first suggested,
+because the originals cannot be run on this kernel and a check that cannot run
+is not a check:
+
+- `stress --vm` is replaced by `mem-hog`. The guest is built without
+  `CONFIG_PSI` and has no swap device, so there is no PSI to observe and no
+  swap to fault from. Direct reclaim is the per-process memory signal that is
+  available, and it is the one the memory verdict already uses.
+- The netem-delayed link is replaced by the net-hog receive-window cycle. The
+  kernel has neither netem nor TBF built in, and HTB shapes loopback so hard
+  the connection never gets going. The cycle closes the window repeatedly,
+  which produces both real retransmissions and a round trip stretched from
+  ~43 us to ~1295 us.
+- The I/O fixture reads through O_DIRECT from the ext4 scratch image, because
+  reads served from tmpfs never reach the block tracepoints at all.
+
+Two limits are worth stating plainly rather than hiding behind the passes:
+
+- The CPU row uses a single worker. Several busy workers on eight vCPUs is not
+  contention, and the report should not claim otherwise; multi-worker CPU
+  pressure is a different question and is not what this row tests.
+- The memory row depends on the guest being memory-constrained. An oversized
+  fixture is OOM-killed in a fraction of a second, which produces a run too
+  short to measure and would test the fixture rather than the ranking.
 
 ## Tests
 
@@ -494,8 +827,19 @@ sudo ./target/release/fast sched --pid <TARGET_PID> --duration 10s
 
 ## Scope
 
-The current commands measure runnable-to-running scheduler latency, on-CPU
-activity, block I/O, TCP retransmissions, off-CPU waits, and memory pressure
-for one process at a time. CPU stack symbolization and per-request I/O
-attribution landed in v1.0; connection-level RTT, automatic diagnosis from
-real collectors, and long-running recording are planned for later versions.
+`rand-fast` measures, for one process and its threads at a time:
+
+- runnable-to-running scheduler latency
+- on-CPU usage and hot stacks, symbolized
+- block I/O latency, attributed per request
+- TCP round-trip time, retransmissions, and per-endpoint ranking
+- off-CPU wait time, with the blocking stack captured at switch-out and the wait
+  reason classified from it
+- page faults, direct reclaim, PSI where the kernel provides it, and swap
+- a ranked diagnosis over all of the above, from one eBPF load
+- a long-running flight recorder with multi-signal triggers and incident
+  bundles
+
+All of it is available as text and as one schema of JSON. It runs on one process
+at a time; correlating several is not implemented. See
+[Known limitations](#known-limitations) for what is still not right.

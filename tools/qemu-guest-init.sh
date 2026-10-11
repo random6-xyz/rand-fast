@@ -72,12 +72,61 @@ for event in block_rq_issue block_rq_complete; do
     fi
 done
 
+# Record the TCP tracepoint payload layouts the eBPF network programs rely
+# on. Both events carry the socket 5-tuple in the payload, so the programs
+# need no BTF and no struct offsets: tcp_probe also carries srtt, and
+# tcp_retransmit_skb carries the IPv4 and IPv6 addresses.
+for event in tcp_probe tcp_retransmit_skb; do
+    if [ -e /sys/kernel/tracing/events/tcp/$event/format ]; then
+        echo "=== $event format ==="
+        cat /sys/kernel/tracing/events/tcp/$event/format
+    else
+        echo "=== $event format MISSING ==="
+    fi
+done
+
+# Record the memory tracepoint payload layouts the eBPF memory programs rely
+# on: user page faults, and direct reclaim, which is where a task stalls when
+# memory runs short.
+for spec in exceptions/page_fault_user vmscan/mm_vmscan_direct_reclaim_begin; do
+    event=$(basename "$spec")
+    category=$(dirname "$spec")
+    if [ -e "/sys/kernel/tracing/events/$category/$event/format" ]; then
+        echo "=== $event format ==="
+        cat "/sys/kernel/tracing/events/$category/$event/format"
+    else
+        echo "=== $event format MISSING ==="
+    fi
+done
+
+# PSI is the other half of the memory picture. The verified kernel is built
+# without it, which the memory report has to say out loud rather than quietly
+# reporting zeroes.
+if [ -r /proc/pressure/memory ]; then
+    echo "=== pressure/memory ==="
+    cat /proc/pressure/memory
+else
+    echo "=== pressure/memory MISSING (kernel built without CONFIG_PSI) ==="
+fi
+
 export FAST=/bin/fast
 export SCHED_WORKLOAD=/bin/sched-workload
 export FAST_WORKLOAD=/bin/fast-workload
 export OUT_DIR=/tmp/fast-smoke
-export DURATION=5s
 export IO_HOG_PATH
+
+# The per-run collection window is passed on the kernel command line as
+# fast.duration=<value> so the host helper can change it without rebuilding
+# the initramfs. tools/qemu-run.sh sets it; a hand-built guest keeps 5s.
+export DURATION=5s
+if [ -r /proc/cmdline ]; then
+    for arg in $(cat /proc/cmdline); do
+        case "$arg" in
+        fast.duration=*) DURATION=${arg#fast.duration=} ;;
+        esac
+    done
+fi
+echo "guest: collection duration $DURATION"
 
 sh /tools/qemu-smoke.sh
 rc=$?
@@ -92,6 +141,39 @@ echo "=== reports ==="
 for f in /tmp/fast-smoke/*.txt; do
     echo "----- $f -----"
     cat "$f"
+done
+# The diagnose scenario documents are single-line JSON, so they are dumped
+# wrapped rather than raw, to keep the console log readable.
+for f in /tmp/fast-smoke/scenario-*.json; do
+    [ -f "$f" ] || continue
+    echo "----- $f -----"
+    tr ',' '\n' <"$f"
+done
+# One incident bundle per trigger case, so the bundle layout itself is
+# inspectable from the log rather than only asserted by the checks. The first
+# bundle of each case is the one written for the earliest interval that tripped.
+echo "=== incident bundles ==="
+for dir in /tmp/fast-smoke/trigger-*/incident-*/; do
+    [ -d "$dir" ] || continue
+    case "$dir" in
+    *io/incident-*) first=1 ;;
+    *net/incident-*) first=1 ;;
+    *sched/incident-*) first=1 ;;
+    *) first=0 ;;
+    esac
+    # Only one bundle per case: there are eighteen of them and they are
+    # near-identical, and the point here is the shape of a bundle.
+    if [ "$first" = 1 ]; then
+        first=0
+        echo "----- $dir -----"
+        ls -1 "$dir"
+        for f in "$dir"summary.txt; do
+            [ -f "$f" ] || continue
+            cat "$f"
+        done
+        echo "--- manifest.json ---"
+        tr ',' '\n' <"$dir/manifest.json" 2>/dev/null
+    fi
 done
 sync
 poweroff -f
