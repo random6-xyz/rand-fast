@@ -4,6 +4,7 @@ mod cpu;
 mod daemon;
 mod diagnose;
 mod io;
+mod io_request_layout;
 mod json;
 mod json_payloads;
 mod memory;

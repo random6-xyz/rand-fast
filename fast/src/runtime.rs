@@ -28,7 +28,7 @@ use aya::{
         HashMap as AyaHashMap, MapData, MapError, PerfEventArray,
         perf::{PerfEvent, PerfEventArrayBuffer},
     },
-    programs::TracePoint,
+    programs::{RawTracePoint, TracePoint},
     util::online_cpus,
 };
 use bytemuck::Pod;
@@ -156,6 +156,22 @@ pub fn take_target_map(bpf: &mut Ebpf) -> Result<AyaHashMap<MapData, u32, u8>> {
 
 /// Loads and attaches a tracepoint program. The program name must match the
 /// tracepoint event name, as it does throughout this crate.
+pub fn attach_raw_tracepoint(bpf: &mut Ebpf, name: &str) -> Result<()> {
+    let program = bpf
+        .program_mut(name)
+        .with_context(|| format!("eBPF raw tracepoint program {name} is missing"))?;
+    let program: &mut RawTracePoint = program
+        .try_into()
+        .with_context(|| format!("eBPF program {name} is not a raw tracepoint"))?;
+    program
+        .load()
+        .with_context(|| format!("failed to load eBPF raw tracepoint program {name}"))?;
+    program
+        .attach(name)
+        .with_context(|| format!("failed to attach to raw tracepoint {name}"))?;
+    Ok(())
+}
+
 pub fn attach_tracepoint(bpf: &mut Ebpf, category: &str, name: &str) -> Result<()> {
     crate::tracepoint_layout::validate(category, name)?;
     let program = bpf

@@ -132,7 +132,7 @@ run_case io "$FAST_WORKLOAD" io-hog --duration 30s --workers 2 --path "$IO_HOG_P
 run_case net "$FAST_WORKLOAD" net-hog --duration 30s --workers 4
 run_case off-cpu "$FAST_WORKLOAD" lock-hog --duration 30s --workers 16
 run_case memory "$FAST_WORKLOAD" mem-hog --duration 30s --workers 2
-run_case diagnose "$FAST_WORKLOAD" lock-hog --duration 30s --workers 16
+run_case diagnose "$FAST_WORKLOAD" lock-hog --duration 30s --workers 16 --hold-ms 1
 
 # --- v1.0 accuracy checks ---
 check_cpu_rate_scaling() {
@@ -219,6 +219,55 @@ check_io_pairing() {
     fi
     kill "$hog_pid" 2>/dev/null
     wait "$hog_pid" 2>/dev/null
+}
+
+check_io_request_identity() {
+    # Two target threads issue reads and writes to the same sector while a
+    # separate process writes that sector too. The per-request sample counts
+    # must remain attributed to the target despite identical device/sector
+    # values and completion order being independent of issue order.
+    local target_log="$OUT_DIR/io-identity-target.log"
+    local other_log="$OUT_DIR/io-identity-other.log"
+    local report="$OUT_DIR/io-identity.json"
+    local target_pid other_pid target_reads target_writes samples reads writes other_ops unmatched
+
+    "$FAST_WORKLOAD" io-hog --duration 5s --workers 2 --same-sector --flush \
+        --path "$IO_HOG_PATH" --size-mib 8 >"$target_log" 2>&1 &
+    target_pid=$!
+    sleep 0.2
+    "$FAST_WORKLOAD" io-hog --duration 5s --workers 1 --same-sector --write --flush \
+        --reuse-file --path "$IO_HOG_PATH" --size-mib 8 >"$other_log" 2>&1 &
+    other_pid=$!
+    sleep 0.2
+
+    if "$FAST" io --pid "$target_pid" --duration 5s --threshold 1ns --format json \
+        >"$report" 2>&1; then
+        target_reads=$(sed -n 's/.*completed \([0-9]*\) reads and \([0-9]*\) writes at sector zero.*/\1/p' "$target_log")
+        target_writes=$(sed -n 's/.*completed \([0-9]*\) reads and \([0-9]*\) writes at sector zero.*/\2/p' "$target_log")
+        samples=$(grep -o '"samples":[0-9]*' "$report" | head -n 1 | cut -d: -f2)
+        reads=$(grep -o '"reads":[0-9]*' "$report" | head -n 1 | cut -d: -f2)
+        writes=$(grep -o '"writes":[0-9]*' "$report" | head -n 1 | cut -d: -f2)
+        other_ops=$(grep -o '"other":[0-9]*' "$report" | head -n 1 | cut -d: -f2)
+        unmatched=$(grep -o '"unmatched_requests":[0-9]*' "$report" | head -n 1 | cut -d: -f2)
+        awk -v tr="${target_reads:-0}" -v tw="${target_writes:-0}" \
+            -v s="${samples:-0}" -v r="${reads:-0}" -v w="${writes:-0}" \
+            -v o="${other_ops:-0}" -v u="${unmatched:-0}" \
+            'BEGIN {
+                if (tr+0 < 10 || tw+0 < 10) {
+                    print "io request identity: FAIL (fixture did not issue both operations)"; exit 1
+                }
+                rp = (r+0) / (tr+0) * 100
+                wp = (w+0) / (tw+0) * 100
+                printf "io request identity: %d/%d reads, %d/%d writes, %d other/flush, %d unmatched\n", r, tr, w, tw, o, u
+                exit (rp >= 70 && wp >= 70 && u+0 == 0 && s+0 >= r+0+w+0) ? 0 : 1
+            }' || FAILURES=$((FAILURES + 1))
+    else
+        echo "io request identity: FAIL (collection failed; see $report)"
+        FAILURES=$((FAILURES + 1))
+    fi
+    kill "$other_pid" "$target_pid" 2>/dev/null
+    wait "$other_pid" 2>/dev/null
+    wait "$target_pid" 2>/dev/null
 }
 
 # Proves the RTT distribution actually moves when the link degrades.
@@ -790,8 +839,8 @@ check_diagnose_ranking() {
         FAILURES=$((FAILURES + 1))
         return
     fi
-    # lock-hog spends its off-CPU time on a futex and nothing else, so that has
-    # to be the first named cause.
+    # The lock fixture holds the futex long enough to make lock wait dominate
+    # the short CPU critical section, so it should rank first consistently.
     if [ "$top" != "Lock" ]; then
         echo "diagnose ranking: FAIL (lock-hog ranked '$top' first, expected Lock contention)"
         grep -A 6 '^Ranked causes' "$report" | sed 's/^/    /' >&2
@@ -932,7 +981,7 @@ check_diagnose_scenarios() {
         "$FAST_WORKLOAD" io-hog --duration 30s --workers 2 --path "$IO_HOG_PATH" --size-mib 256
 
     scenario lock "Lock contention" "Lock contention" \
-        "$FAST_WORKLOAD" lock-hog --duration 30s --workers 16
+        "$FAST_WORKLOAD" lock-hog --duration 30s --workers 16 --hold-ms 1
 
     # Large enough to make the process reclaim for itself, which is the only
     # per-process memory signal available on a kernel built without PSI and with
@@ -1184,7 +1233,7 @@ check_daemon_storage() {
     # writes a bundle every interval or two. A run where no trigger fires writes
     # nothing, and a storage check with nothing to store tests nothing.
     local first_log="$OUT_DIR/storage-first.txt"
-    "$FAST_WORKLOAD" lock-hog --duration 300s --workers 16 >/dev/null 2>&1 &
+    "$FAST_WORKLOAD" lock-hog --duration 300s --workers 32 >/dev/null 2>&1 &
     local target_pid=$!
     sleep 0.3
     # The recorder is killed rather than allowed to finish, because that is the
@@ -1240,7 +1289,7 @@ check_daemon_storage() {
     # timeline has to continue rather than restart at zero, otherwise the ring
     # would read as though time ran backwards.
     local second_log="$OUT_DIR/storage-second.txt"
-    "$FAST_WORKLOAD" lock-hog --duration "$TRIGGER_RUN" --workers 16 >/dev/null 2>&1 &
+    "$FAST_WORKLOAD" lock-hog --duration "$TRIGGER_RUN" --workers 32 >/dev/null 2>&1 &
     target_pid=$!
     sleep 0.3
     "$FAST" daemon --pid "$target_pid" --duration "$TRIGGER_RUN" \
@@ -1355,11 +1404,9 @@ trigger_flags() {
         echo "--trigger-psi-some off --trigger-psi-full off --trigger-cpu off"
         ;;
     sched)
-        # Chosen from the two measured regimes rather than picked. An idle
-        # scheduler on this kernel reports a p95 of about 12us; sixteen threads
-        # fighting over one lock report about 504us. 200us sits between them with
-        # room on both sides, so the case separates "watching the scheduler" from
-        # "watching nothing" without depending on a marginal crossing. The
+        # Chosen from the two measured regimes rather than picked. The 32-worker
+        # lock fixture saturates the run queue enough to put p95 above 200us,
+        # while the idle baseline remains well below it. The
         # production default of 10ms is far above what this fixture produces and
         # is deliberately not used here: it would be a threshold the fixture
         # could never reach, which would test nothing.
@@ -1388,12 +1435,13 @@ check_daemon_triggers() {
     # which is why a case built on one would be testing a threshold the fixture
     # can never reach.
     trigger_case sched sched_p95 io_p99 \
-        "$FAST_WORKLOAD" lock-hog --duration "$TRIGGER_RUN" --workers 16
+        "$FAST_WORKLOAD" lock-hog --duration "$TRIGGER_RUN" --workers 32
 }
 
 check_cpu_rate_scaling
 check_cpu_symbolization
 check_io_pairing
+check_io_request_identity
 check_offcpu_shape
 check_offcpu_ranking
 check_memory_fault_counter

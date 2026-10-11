@@ -62,22 +62,12 @@ else
 fi
 
 # Record the scheduler tracepoint payload layouts used by scheduler and
-# off-CPU collection, then the block layout used by I/O collection.
+# off-CPU collection. Block I/O uses raw request pointers and BTF-derived
+# struct offsets rather than tracepoint payload offsets.
 for event in sched_wakeup sched_switch; do
     if [ -e "/sys/kernel/tracing/events/sched/$event/format" ]; then
         echo "=== $event format ==="
         cat "/sys/kernel/tracing/events/sched/$event/format"
-    else
-        echo "=== $event format MISSING ==="
-    fi
-done
-
-# The supported block layout has dev=8, sector=16, nr_sector=24,
-# bytes/error=28, and rwbs=34.
-for event in block_rq_issue block_rq_complete; do
-    if [ -e /sys/kernel/tracing/events/block/$event/format ]; then
-        echo "=== $event format ==="
-        cat /sys/kernel/tracing/events/block/$event/format
     else
         echo "=== $event format MISSING ==="
     fi

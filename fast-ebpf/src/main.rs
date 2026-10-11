@@ -9,17 +9,19 @@ use aya_ebpf::{
     bindings::{BPF_ANY, BPF_F_REUSE_STACKID, BPF_NOEXIST},
     helpers::{
         bpf_get_current_pid_tgid, bpf_get_smp_processor_id, bpf_get_stackid, bpf_ktime_get_ns,
+        bpf_probe_read_kernel,
     },
-    macros::{map, perf_event, tracepoint},
+    macros::{map, perf_event, raw_tracepoint, tracepoint},
     maps::{HashMap, LruHashMap, PerfEventArray, StackTrace},
-    programs::{PerfEventContext, TracePointContext},
+    programs::{PerfEventContext, RawTracePointContext, TracePointContext},
 };
 use fast_common::{
     AF_INET, AF_INET6, COLLECT_CPU_SAMPLE, COLLECT_MEMORY, COLLECT_NET, COLLECT_OFFCPU,
-    COLLECT_SCHEDULER_LATENCY, CpuSampleEvent, IoEvent, IoRequestKey, MAX_MEMORY_THREADS,
-    MAX_PENDING_IO, MAX_STACKS, MAX_TARGET_TIDS, MAX_TCP_SOCKETS, MemoryCounters, OFFCPU_REASON_IO,
-    OFFCPU_REASON_UNKNOWN, OFFCPU_REASON_WAIT, OffCpuEvent, OffCpuPending, PendingIo,
-    PendingWakeup, SchedulerLatencyEvent, TcpEvent,
+    COLLECT_SCHEDULER_LATENCY, CpuSampleEvent, IO_OP_UNMATCHED, IoEvent, IoRequestId,
+    IoRequestLayout, MAX_MEMORY_THREADS, MAX_PENDING_IO, MAX_STACKS, MAX_TARGET_TIDS,
+    MAX_TCP_SOCKETS, MemoryCounters, OFFCPU_REASON_IO, OFFCPU_REASON_UNKNOWN, OFFCPU_REASON_WAIT,
+    OffCpuEvent, OffCpuPending, PendingIo, PendingWakeup, SchedulerLatencyEvent, TcpEvent,
+    io_op_from_request_flags,
 };
 
 // Payload offsets for the supported scheduler tracepoint layouts. The user-space
@@ -40,20 +42,6 @@ const SCHED_SWITCH_NEXT_PID_OFFSET: usize = 56;
 // was minor or major, and the reclaim order says nothing a user acts on, so
 // the programs only need the fact that the event happened. The offsets are
 // recorded here so the layout stays documented if a future report needs one.
-
-// Payload offsets of the block request tracepoints for the supported layouts
-// (Linux 6.12.105 and 7.2.0-rc6). The runtime validates these fields against
-// tracefs before attaching the programs:
-//   issue:    dev=8(4) sector=16(8) nr_sector=24(4) bytes=28(4) ioprio=32(2)
-//             rwbs[10]=34 comm[16]=44 cmd=60
-//   complete: dev=8(4) sector=16(8) nr_sector=24(4) error=28(4) ioprio=32(2)
-//             rwbs[10]=34 cmd=44
-// The operation is the first character of the rwbs string, which is how the
-// kernel renders req_op for the trace (R read, W write, D discard, ...).
-const BLOCK_RQ_DEV_OFFSET: usize = 8;
-const BLOCK_RQ_SECTOR_OFFSET: usize = 16;
-const BLOCK_RQ_NR_SECTOR_OFFSET: usize = 24;
-const BLOCK_RQ_RWBS_OFFSET: usize = 34;
 
 // Payload offsets of the TCP tracepoints, verified against the format files
 // that tools/qemu-guest-init.sh dumps on the target kernel (7.2.0-rc6).
@@ -132,8 +120,10 @@ static STACK_TRACES_USER: StackTrace = StackTrace::with_max_entries(MAX_STACKS, 
 static IO_EVENTS: PerfEventArray<IoEvent> = PerfEventArray::new(0);
 
 #[map]
-static PENDING_IO: LruHashMap<IoRequestKey, PendingIo> =
-    LruHashMap::with_max_entries(MAX_PENDING_IO, 0);
+static IO_REQUEST_LAYOUT: HashMap<u32, IoRequestLayout> = HashMap::with_max_entries(1, 0);
+
+#[map]
+static PENDING_IO: HashMap<IoRequestId, PendingIo> = HashMap::with_max_entries(MAX_PENDING_IO, 0);
 
 #[map]
 static NET_EVENTS: PerfEventArray<TcpEvent> = PerfEventArray::new(0);
@@ -375,87 +365,151 @@ fn try_cpu_sample(ctx: PerfEventContext) -> Result<u32, u32> {
     Ok(0)
 }
 
-// --- I/O: block_rq_issue / block_rq_complete ---
-#[tracepoint(name = "block_rq_issue", category = "block")]
-pub fn block_rq_issue(ctx: TracePointContext) -> u32 {
+// --- I/O: correlate block requests by their unique struct request pointer ---
+#[raw_tracepoint(tracepoint = "block_rq_issue")]
+pub fn block_rq_issue(ctx: RawTracePointContext) -> u32 {
     match try_block_rq_issue(ctx) {
         Ok(ret) => ret,
         Err(ret) => ret,
     }
 }
 
-fn try_block_rq_issue(ctx: TracePointContext) -> Result<u32, u32> {
+fn try_block_rq_issue(ctx: RawTracePointContext) -> Result<u32, u32> {
     let tid = bpf_get_current_pid_tgid() as u32;
     if unsafe { TARGET_TIDS.get(tid) }.is_none() {
         return Ok(0);
     }
 
-    let dev = unsafe { ctx.read_at::<u32>(BLOCK_RQ_DEV_OFFSET) }.map_err(|_| 0u32)?;
-    let sector = unsafe { ctx.read_at::<u64>(BLOCK_RQ_SECTOR_OFFSET) }.map_err(|_| 0u32)?;
-    let rwbs_op = unsafe { ctx.read_at::<u8>(BLOCK_RQ_RWBS_OFFSET) }.map_err(|_| 0u32)?;
-
-    // Key the request by (device, start sector) so the completion can find it
-    // from IRQ/softirq context. BPF_NOEXIST keeps the first outstanding
-    // request on a colliding key instead of letting a second issue overwrite
-    // and misattribute it.
-    let key = IoRequestKey {
-        dev,
-        _pad: 0,
-        sector,
+    let request = ctx.arg::<*const u8>(0);
+    if request.is_null() {
+        emit_unmatched(&ctx, tid, 0);
+        return Ok(0);
+    }
+    let layout = match unsafe { IO_REQUEST_LAYOUT.get(0) } {
+        Some(layout) => *layout,
+        None => {
+            emit_unmatched(&ctx, tid, 0);
+            return Ok(0);
+        }
     };
+    let (dev, _, _, op) = match request_fields(request, layout) {
+        Ok(fields) => fields,
+        Err(_) => {
+            emit_unmatched(&ctx, tid, 0);
+            return Ok(0);
+        }
+    };
+
+    // Raw tracepoint arguments expose the actual request pointer. Different
+    // requests may share a device and start sector, but a live request object
+    // has a unique address until block_rq_complete releases it.
+    let request_id = IoRequestId::from_address(request as u64);
     let pending = PendingIo {
         start_ns: unsafe { bpf_ktime_get_ns() },
         tid,
-        op: match rwbs_op {
-            b'R' => 0,
-            b'W' => 1,
-            _ => 2,
-        },
+        op,
     };
-    let _ = PENDING_IO.insert(key, pending, BPF_NOEXIST as u64);
+    if PENDING_IO
+        .insert(request_id, pending, BPF_NOEXIST as u64)
+        .is_err()
+        // A repeated issue for the same request is a requeue; retain its first
+        // timestamp. If the key is absent, the bounded map is full and this
+        // sample must be reported as unmatched rather than silently evicted.
+        && unsafe { PENDING_IO.get(request_id) }.is_none()
+    {
+        emit_unmatched(&ctx, tid, dev);
+    }
     Ok(0)
 }
 
-#[tracepoint(name = "block_rq_complete", category = "block")]
-pub fn block_rq_complete(ctx: TracePointContext) -> u32 {
+#[raw_tracepoint(tracepoint = "block_rq_complete")]
+pub fn block_rq_complete(ctx: RawTracePointContext) -> u32 {
     match try_block_rq_complete(ctx) {
         Ok(ret) => ret,
         Err(ret) => ret,
     }
 }
 
-fn try_block_rq_complete(ctx: TracePointContext) -> Result<u32, u32> {
-    // The completion usually runs in IRQ/softirq context, so the current TID
-    // says nothing about the issuer: the pending entry, found through the
-    // request key, carries the issuing thread.
-    let dev = unsafe { ctx.read_at::<u32>(BLOCK_RQ_DEV_OFFSET) }.map_err(|_| 0u32)?;
-    let sector = unsafe { ctx.read_at::<u64>(BLOCK_RQ_SECTOR_OFFSET) }.map_err(|_| 0u32)?;
-    let nr_sector = unsafe { ctx.read_at::<u32>(BLOCK_RQ_NR_SECTOR_OFFSET) }.map_err(|_| 0u32)?;
-    let key = IoRequestKey {
-        dev,
-        _pad: 0,
-        sector,
-    };
-
-    let pending = match unsafe { PENDING_IO.get(key) } {
+fn try_block_rq_complete(ctx: RawTracePointContext) -> Result<u32, u32> {
+    let request = ctx.arg::<*const u8>(0);
+    if request.is_null() {
+        return Ok(0);
+    }
+    let request_id = IoRequestId::from_address(request as u64);
+    let pending = match unsafe { PENDING_IO.get(request_id) } {
         Some(pending) => *pending,
         None => return Ok(0),
     };
-    let _ = PENDING_IO.remove(key);
+    let _ = PENDING_IO.remove(request_id);
+
+    let layout = match unsafe { IO_REQUEST_LAYOUT.get(0) } {
+        Some(layout) => *layout,
+        None => {
+            emit_unmatched(&ctx, pending.tid, 0);
+            return Ok(0);
+        }
+    };
+    let (dev, sectors, _, _) = match request_fields(request, layout) {
+        Ok(fields) => fields,
+        Err(_) => {
+            emit_unmatched(&ctx, pending.tid, 0);
+            return Ok(0);
+        }
+    };
 
     let end = unsafe { bpf_ktime_get_ns() };
     if end < pending.start_ns {
+        emit_unmatched(&ctx, pending.tid, dev);
         return Ok(0);
     }
     let event = IoEvent {
         latency_ns: end - pending.start_ns,
         tid: pending.tid,
         dev,
-        sectors: nr_sector,
+        sectors,
         op: pending.op,
     };
     IO_EVENTS.output(&ctx, event, BPF_ANY);
     Ok(0)
+}
+
+fn request_fields(
+    request: *const u8,
+    layout: IoRequestLayout,
+) -> Result<(u32, u32, u64, u32), u32> {
+    let queue = unsafe { read_request_field::<*const u8>(request, layout.request_q) }?;
+    let disk = unsafe { read_request_field::<*const u8>(queue, layout.queue_disk) }?;
+    let major = unsafe { read_request_field::<u32>(disk, layout.gendisk_major) }?;
+    let first_minor = unsafe { read_request_field::<u32>(disk, layout.gendisk_first_minor) }?;
+    let sector = unsafe { read_request_field::<u64>(request, layout.request_sector) }?;
+    let bytes = unsafe { read_request_field::<u32>(request, layout.request_data_len) }?;
+    let flags = unsafe { read_request_field::<u32>(request, layout.request_cmd_flags) }?;
+    let dev = (major << 20) | (first_minor & 0x000f_ffff);
+    let sectors = bytes >> 9;
+    let op = io_op_from_request_flags(flags);
+    Ok((dev, sectors, sector, op))
+}
+
+unsafe fn read_request_field<T: Copy>(base: *const u8, offset: u32) -> Result<T, u32> {
+    if base.is_null() {
+        return Err(0);
+    }
+    let address = base.wrapping_add(offset as usize).cast::<T>();
+    unsafe { bpf_probe_read_kernel(address) }.map_err(|_| 0u32)
+}
+
+fn emit_unmatched(ctx: &impl EbpfContext, tid: u32, dev: u32) {
+    IO_EVENTS.output(
+        ctx,
+        IoEvent {
+            latency_ns: 0,
+            tid,
+            dev,
+            sectors: 0,
+            op: IO_OP_UNMATCHED,
+        },
+        BPF_ANY,
+    );
 }
 
 // --- Network: TCP RTT via tcp_probe ---

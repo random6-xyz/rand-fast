@@ -7,7 +7,7 @@ eBPF.
 
 ## Requirements
 
-- BTF-enabled Linux with tracepoint layouts matching those validated on 6.12.105 and 7.2.0-rc6; startup checks reject unrecognized layouts instead of collecting potentially incorrect data
+- BTF-enabled Linux with scheduler and TCP tracepoint layouts matching those validated on 6.12.105 and 7.2.0-rc6; startup checks reject unrecognized tracepoint or block-request BTF layouts instead of collecting potentially incorrect data
 - Kernel built with `CONFIG_BPF`, `CONFIG_BPF_SYSCALL`, `CONFIG_BPF_EVENTS`, `CONFIG_DEBUG_INFO_BTF`
 - Tracepoints under `/sys/kernel/debug/tracing/events` (or `/sys/kernel/tracing`)
 - Rust nightly with the `rust-src` component

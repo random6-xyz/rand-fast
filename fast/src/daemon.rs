@@ -103,6 +103,8 @@ pub struct RingEntry {
     pub io_p99_us: u64,
     /// Block I/O completions over the interval.
     pub io_samples: u64,
+    /// Target requests that could not be tracked over the interval.
+    pub io_unmatched: u64,
     /// Retransmissions over the interval.
     pub retrans: u64,
     /// Memory PSI some at the end of the interval, in percent. Absent when the
@@ -131,6 +133,7 @@ impl RingEntry {
             "cpu_percent": self.cpu_percent,
             "io_p99_us": self.io_p99_us,
             "io_samples": self.io_samples,
+            "io_unmatched": self.io_unmatched,
             "retrans": self.retrans,
             // Absent rather than zero, so a kernel without PSI is not read as
             // a machine with no memory pressure.
@@ -211,6 +214,7 @@ fn write_incident(
             "sched_samples": entry.sched_samples,
             "io_p99_us": entry.io_p99_us,
             "io_samples": entry.io_samples,
+            "io_unmatched": entry.io_unmatched,
             "retrans": entry.retrans,
             "psi_some_pct": entry.psi_some_pct,
             "psi_full_pct": entry.psi_full_pct,
@@ -455,6 +459,7 @@ fn ring_entry_from_json(value: &Value) -> Option<RingEntry> {
             .unwrap_or_default(),
         io_p99_us: number("io_p99_us").unwrap_or(0),
         io_samples: number("io_samples").unwrap_or(0),
+        io_unmatched: number("io_unmatched").unwrap_or(0),
         retrans: number("retrans").unwrap_or(0),
         psi_some_pct: value
             .get("psi_some_pct")
@@ -490,6 +495,7 @@ fn diagnose_from(entry: &RingEntry, pid: u32, slow: &SlowSamples) -> Value {
         sched_samples: entry.sched_samples as usize,
         sched_p95_us: entry.sched_p95_us,
         io_samples: entry.io_samples as usize,
+        io_unmatched: entry.io_unmatched,
         io_p99_us: entry.io_p99_us,
         // The recorder knows the p99 but not how many requests crossed the
         // slow threshold, so this signal is left out rather than guessed at.
@@ -620,8 +626,8 @@ fn incident_text(entry: &RingEntry, triggers: &Triggers, diagnosis: &Value) -> S
         entry.sched_p95_us, entry.sched_samples
     ));
     text.push_str(&format!(
-        "  block I/O p99  {} us over {} completions\n",
-        entry.io_p99_us, entry.io_samples
+        "  block I/O p99  {} us over {} completions, {} unmatched\n",
+        entry.io_p99_us, entry.io_samples, entry.io_unmatched
     ));
     text.push_str(&format!("  retransmissions {}\n", entry.retrans));
     match (entry.psi_some_pct, entry.psi_full_pct) {
@@ -796,6 +802,8 @@ struct Cumulative {
     io_samples: u64,
     /// Records dropped so far.
     io_lost: u64,
+    /// Target requests that could not be tracked so far.
+    io_unmatched: u64,
     /// Retransmissions so far.
     retrans: u64,
 }
@@ -834,11 +842,12 @@ pub fn run(args: DaemonArgs) -> Result<()> {
         "/fast-ebpf"
     )))
     .context("failed to load eBPF object; run as root or grant CAP_BPF and CAP_PERFMON")?;
+    crate::io_request_layout::configure(&mut bpf)?;
     let after_object_rss = read_self_rss_bytes().unwrap_or(0);
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_wakeup")?;
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_switch")?;
-    runtime::attach_tracepoint(&mut bpf, "block", "block_rq_issue")?;
-    runtime::attach_tracepoint(&mut bpf, "block", "block_rq_complete")?;
+    runtime::attach_raw_tracepoint(&mut bpf, "block_rq_issue")?;
+    runtime::attach_raw_tracepoint(&mut bpf, "block_rq_complete")?;
     runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_probe")?;
     runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_retransmit_skb")?;
 
@@ -938,6 +947,7 @@ pub fn run(args: DaemonArgs) -> Result<()> {
                             "p99_us": summary.map_or(0, |s| s.p99_ns / 1_000),
                             "samples": stats.sample_count(),
                             "lost": stats.lost(),
+                            "unmatched": stats.unmatched(),
                             "slowest_us": stats
                                 .slowest_samples(SLOW_SAMPLE_COUNT)
                                 .iter()
@@ -1140,6 +1150,7 @@ fn tick(
                 current.io_p99_us = number("p99_us");
                 current.io_samples = number("samples");
                 current.io_lost = number("lost");
+                current.io_unmatched = number("unmatched");
             }
             "net" => current.retrans = number("retrans"),
             _ => {}
@@ -1198,6 +1209,7 @@ fn tick(
         cpu_percent: (target_cpu_pct - previous.target_cpu_pct).max(0.0),
         io_p99_us: current.io_p99_us,
         io_samples: current.io_samples.saturating_sub(before.io_samples),
+        io_unmatched: current.io_unmatched.saturating_sub(before.io_unmatched),
         retrans: current.retrans.saturating_sub(before.retrans),
         psi_some_pct: psi.available.then_some(psi.some_pct),
         psi_full_pct: psi.available.then_some(psi.full_pct),
@@ -1907,6 +1919,7 @@ mod tests {
             cpu_percent: 87.5,
             io_p99_us: 40,
             io_samples: 7,
+            io_unmatched: 2,
             retrans: 3,
             psi_some_pct: Some(2.5),
             psi_full_pct: None,

@@ -6,10 +6,11 @@ use std::{
 
 use anyhow::{Context, Result};
 use aya::{Ebpf, include_bytes_aligned};
-use fast_common::{IoEvent, io_op_name};
+use fast_common::{IO_OP_UNMATCHED, IoEvent, io_op_name};
 
 use crate::{
     cli::IoArgs,
+    io_request_layout,
     json::{self, Envelope, Format},
     process, runtime,
 };
@@ -113,6 +114,8 @@ pub struct IoStats {
     /// The `SLOW_TABLE_ROWS` slowest I/Os above the threshold.
     slow_top: std::collections::BinaryHeap<std::cmp::Reverse<SlowEntry>>,
     lost: u64,
+    /// Target requests that could not be tracked because the in-flight map was full.
+    unmatched: u64,
 }
 
 impl IoStats {
@@ -125,10 +128,15 @@ impl IoStats {
             slow: 0,
             slow_top: std::collections::BinaryHeap::new(),
             lost: 0,
+            unmatched: 0,
         }
     }
 
     fn record(&mut self, event: IoEvent) {
+        if event.op == IO_OP_UNMATCHED {
+            self.unmatched = self.unmatched.saturating_add(1);
+            return;
+        }
         self.latencies.push(event.latency_ns);
         self.by_device.entry(event.dev).or_default().record(&event);
         if event.latency_ns > self.threshold_ns {
@@ -183,6 +191,11 @@ impl IoStats {
     /// Records the kernel's dropped-event count.
     pub fn lost(&self) -> u64 {
         self.lost
+    }
+
+    /// Target requests that could not be tracked due to a full in-flight map.
+    pub fn unmatched(&self) -> u64 {
+        self.unmatched
     }
 
     /// Number of completions above the slow threshold.
@@ -379,8 +392,9 @@ pub fn run(args: IoArgs) -> Result<()> {
         "/fast-ebpf"
     )))
     .context("failed to load eBPF object; run as root or grant CAP_BPF and CAP_PERFMON")?;
-    runtime::attach_tracepoint(&mut bpf, "block", "block_rq_issue")?;
-    runtime::attach_tracepoint(&mut bpf, "block", "block_rq_complete")?;
+    io_request_layout::configure(&mut bpf)?;
+    runtime::attach_raw_tracepoint(&mut bpf, "block_rq_issue")?;
+    runtime::attach_raw_tracepoint(&mut bpf, "block_rq_complete")?;
 
     let mut target_tids = runtime::take_target_map(&mut bpf)?;
 
@@ -390,8 +404,8 @@ pub fn run(args: IoArgs) -> Result<()> {
     let collection = runtime::run_collection(
         &mut bpf,
         &mut target_tids,
-        // Pending I/O lives in a request-keyed LRU map inside the eBPF
-        // program; no TID-keyed pending state needs thread-exit cleanup.
+        // Pending I/O is keyed by the kernel request pointer; no TID-keyed
+        // pending state needs thread-exit cleanup.
         &mut runtime::NoPendingCleanup,
         &mut known_tids,
         &initial_tids,
@@ -420,6 +434,7 @@ pub fn run(args: IoArgs) -> Result<()> {
         }
         println!("Samples: {}", stats.latencies.len());
         println!("Lost events: {}", stats.lost);
+        println!("Unmatched requests: {}", stats.unmatched());
         println!(
             "Slow > {}: {}",
             humantime::format_duration(threshold),
@@ -542,6 +557,18 @@ mod tests {
     }
 
     #[test]
+    fn unmatched_requests_are_counted_without_polluting_latency_samples() {
+        let mut stats = IoStats::new(10_000_000);
+        stats.record(io_event(0, 0x0801, IO_OP_UNMATCHED, 0));
+
+        assert_eq!(stats.unmatched(), 1);
+        assert_eq!(stats.sample_count(), 0);
+        assert!(stats.summary().is_none());
+        assert!(stats.devices().is_empty());
+        assert_eq!(stats.slow_count(), 0);
+    }
+
+    #[test]
     fn summary_computed() {
         let mut s = IoStats::new(100_000_000);
         for i in 1..=10u64 {
@@ -611,5 +638,6 @@ mod tests {
         assert_eq!(io_op_name(0), "read");
         assert_eq!(io_op_name(1), "write");
         assert_eq!(io_op_name(7), "other");
+        assert_eq!(io_op_name(IO_OP_UNMATCHED), "unmatched");
     }
 }

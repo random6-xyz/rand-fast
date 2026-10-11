@@ -58,48 +58,6 @@ const SCHED_SWITCH_FIELDS: &[ExpectedField] = &[
     },
 ];
 
-const BLOCK_RQ_ISSUE_FIELDS: &[ExpectedField] = &[
-    ExpectedField {
-        name: "dev",
-        field_type: "dev_t",
-        offset: 8,
-        size: 4,
-    },
-    ExpectedField {
-        name: "sector",
-        field_type: "sector_t",
-        offset: 16,
-        size: 8,
-    },
-    ExpectedField {
-        name: "rwbs",
-        field_type: "char",
-        offset: 34,
-        size: 10,
-    },
-];
-
-const BLOCK_RQ_COMPLETE_FIELDS: &[ExpectedField] = &[
-    ExpectedField {
-        name: "dev",
-        field_type: "dev_t",
-        offset: 8,
-        size: 4,
-    },
-    ExpectedField {
-        name: "sector",
-        field_type: "sector_t",
-        offset: 16,
-        size: 8,
-    },
-    ExpectedField {
-        name: "nr_sector",
-        field_type: "unsigned int",
-        offset: 24,
-        size: 4,
-    },
-];
-
 const TCP_PROBE_FIELDS: &[ExpectedField] = &[
     ExpectedField {
         name: "saddr",
@@ -222,16 +180,6 @@ const EVENTS: &[ExpectedEvent] = &[
         category: "sched",
         name: "sched_switch",
         fields: SCHED_SWITCH_FIELDS,
-    },
-    ExpectedEvent {
-        category: "block",
-        name: "block_rq_issue",
-        fields: BLOCK_RQ_ISSUE_FIELDS,
-    },
-    ExpectedEvent {
-        category: "block",
-        name: "block_rq_complete",
-        fields: BLOCK_RQ_COMPLETE_FIELDS,
     },
     ExpectedEvent {
         category: "tcp",
@@ -421,20 +369,6 @@ mod tests {
     fn verified_kernel_layout_fixtures_match_all_consumed_fields() {
         assert_fixture_matches(LINUX_6_12_105);
         assert_fixture_matches(LINUX_7_2_RC6);
-    }
-
-    #[test]
-    fn rejects_a_relocated_rwbs_field() {
-        let format = section(LINUX_7_2_RC6, "block_rq_issue")
-            .replace("offset:34; size:10", "offset:32; size:10");
-        let spec = EVENTS
-            .iter()
-            .find(|spec| spec.category == "block" && spec.name == "block_rq_issue")
-            .unwrap();
-        let error = validate_format(spec, &format).unwrap_err().to_string();
-        assert!(error.contains("rwbs"));
-        assert!(error.contains("offset 34"));
-        assert!(error.contains("Linux 6.12.105 and Linux 7.2.0-rc6"));
     }
 
     #[test]
