@@ -450,8 +450,9 @@ fn restore_ring(output: &std::path::Path, window: Duration) -> Restored {
 /// being discarded whole.
 fn ring_entry_from_json(value: &Value) -> Option<RingEntry> {
     let number = |key: &str| value.get(key).and_then(Value::as_u64);
+    let at = Duration::try_from_secs_f64(value.get("at_s")?.as_f64()?).ok()?;
     Some(RingEntry {
-        at: Duration::from_secs_f64(value.get("at_s")?.as_f64()?),
+        at,
         sched_p95_us: number("sched_p95_us").unwrap_or(0),
         sched_samples: number("sched_samples").unwrap_or(0),
         cpu_percent: value
@@ -1932,6 +1933,35 @@ mod tests {
         };
         let restored = ring_entry_from_json(&original.to_json()).expect("round trip");
         assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn restored_intervals_ignore_invalid_timestamps_without_panicking() {
+        for timestamp in [-1.0, f64::MAX] {
+            let value = serde_json::json!({ "at_s": timestamp });
+            assert!(ring_entry_from_json(&value).is_none());
+        }
+    }
+
+    #[test]
+    fn restore_skips_invalid_timestamps_and_keeps_valid_history() {
+        let dir = temp_dir("restore_invalid_timestamps");
+        let bundle = dir.join("incident-with-bad-intervals");
+        std::fs::create_dir_all(&bundle).expect("create bundle");
+        std::fs::write(bundle.join("complete.json"), "{}").expect("write completion marker");
+        let intervals = serde_json::json!([
+            {"at_s": -1.0},
+            {"at_s": 10.0},
+            {"at_s": f64::MAX}
+        ]);
+        std::fs::write(bundle.join("intervals.json"), intervals.to_string())
+            .expect("write intervals");
+
+        let restored = restore_ring(&dir, Duration::from_secs(60));
+        assert_eq!(restored.entries.len(), 1);
+        assert_eq!(restored.entries[0].at, Duration::from_secs(10));
+        assert_eq!(restored.previous_at, Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
