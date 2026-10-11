@@ -61,8 +61,19 @@ else
     echo "guest: tracefs NOT available"
 fi
 
-# Record the block tracepoint payload layout the eBPF I/O programs rely on
-# (7.2.x layout: dev=8, sector=16, nr_sector=24, bytes/error=28, rwbs=34).
+# Record the scheduler tracepoint payload layouts used by scheduler and
+# off-CPU collection, then the block layout used by I/O collection.
+for event in sched_wakeup sched_switch; do
+    if [ -e "/sys/kernel/tracing/events/sched/$event/format" ]; then
+        echo "=== $event format ==="
+        cat "/sys/kernel/tracing/events/sched/$event/format"
+    else
+        echo "=== $event format MISSING ==="
+    fi
+done
+
+# The supported block layout has dev=8, sector=16, nr_sector=24,
+# bytes/error=28, and rwbs=34.
 for event in block_rq_issue block_rq_complete; do
     if [ -e /sys/kernel/tracing/events/block/$event/format ]; then
         echo "=== $event format ==="

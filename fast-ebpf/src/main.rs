@@ -22,8 +22,9 @@ use fast_common::{
     PendingWakeup, SchedulerLatencyEvent, TcpEvent,
 };
 
-// The offsets are the stable payload offsets of the Linux scheduler tracepoints:
-// trace_entry is 8 bytes, followed by the fields declared in include/trace/events/sched.h.
+// Payload offsets for the supported scheduler tracepoint layouts. The user-space
+// runtime validates the active tracefs formats against these expected fields
+// before attaching a program, and rejects a mismatch instead of misreading data.
 const SCHED_WAKEUP_PID_OFFSET: usize = 24;
 const SCHED_SWITCH_PREV_PID_OFFSET: usize = 24;
 const SCHED_SWITCH_PREV_STATE_OFFSET: usize = 32;
@@ -40,9 +41,9 @@ const SCHED_SWITCH_NEXT_PID_OFFSET: usize = 56;
 // the programs only need the fact that the event happened. The offsets are
 // recorded here so the layout stays documented if a future report needs one.
 
-// Payload offsets of the block request tracepoints, verified against the
-// format files that tools/qemu-guest-init.sh dumps on the target kernel
-// (7.2.3-arch1-3):
+// Payload offsets of the block request tracepoints for the supported layouts
+// (Linux 6.12.105 and 7.2.0-rc6). The runtime validates these fields against
+// tracefs before attaching the programs:
 //   issue:    dev=8(4) sector=16(8) nr_sector=24(4) bytes=28(4) ioprio=32(2)
 //             rwbs[10]=34 comm[16]=44 cmd=60
 //   complete: dev=8(4) sector=16(8) nr_sector=24(4) error=28(4) ioprio=32(2)

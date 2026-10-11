@@ -157,6 +157,7 @@ pub fn take_target_map(bpf: &mut Ebpf) -> Result<AyaHashMap<MapData, u32, u8>> {
 /// Loads and attaches a tracepoint program. The program name must match the
 /// tracepoint event name, as it does throughout this crate.
 pub fn attach_tracepoint(bpf: &mut Ebpf, category: &str, name: &str) -> Result<()> {
+    crate::tracepoint_layout::validate(category, name)?;
     let program = bpf
         .program_mut(name)
         .with_context(|| format!("eBPF program {name} is missing"))?;
