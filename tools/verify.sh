@@ -7,7 +7,8 @@
 #   3. cargo build --release  workspace and the embedded eBPF object compile
 #   4. cargo test             unit tests pass
 #   5. test-qemu-smoke.sh     mock verifier/load failures propagate and children stop
-#   6. check-no-cjk.sh        no CJK characters in tracked content
+#   6. test-qemu-run.sh       documented argument forms reach the help path
+#   7. check-no-cjk.sh        no CJK characters in tracked content
 #
 # The eBPF verifier needs a real kernel; tools/qemu-smoke.sh runs that inside
 # the QEMU guest and is a separate, manual step.
@@ -36,6 +37,7 @@ step 'cargo clippy -D warnings' cargo clippy --workspace --all-targets -- -D war
 step 'cargo build --release' cargo build --release
 step 'cargo test' cargo test --workspace
 step 'QEMU smoke failure propagation' tools/test-qemu-smoke.sh
+step 'QEMU runner argument parsing' tools/test-qemu-run.sh
 step 'check-no-cjk' tools/check-no-cjk.sh
 
 printf '\n'
