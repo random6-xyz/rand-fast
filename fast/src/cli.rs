@@ -72,6 +72,10 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
     Ok(duration)
 }
 
+fn parse_daemon_duration(value: &str) -> Result<Duration, String> {
+    humantime::parse_duration(value).map_err(|error| format!("invalid duration `{value}`: {error}"))
+}
+
 /// Is this value the word that turns a trigger off?
 fn is_off(value: &str) -> bool {
     value.eq_ignore_ascii_case("off")
@@ -307,7 +311,7 @@ pub struct DaemonArgs {
     pub pid: u32,
 
     /// Collection duration (0 for infinite).
-    #[arg(long, default_value = "0s", value_parser = parse_duration)]
+    #[arg(long, default_value = "0s", value_parser = parse_daemon_duration)]
     pub duration: Duration,
 
     /// How often an interval is recorded into the rolling window.
@@ -384,6 +388,36 @@ mod tests {
     fn parses_duration() {
         assert_eq!(parse_duration("10s").unwrap(), Duration::from_secs(10));
         assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn daemon_accepts_zero_as_its_infinite_default() {
+        assert_eq!(parse_daemon_duration("0s").unwrap(), Duration::ZERO);
+        assert_eq!(
+            parse_daemon_duration("10s").unwrap(),
+            Duration::from_secs(10)
+        );
+        assert!(parse_duration("0s").is_err());
+
+        let cli = Cli::try_parse_from(["fast", "daemon", "--pid", "123"]).unwrap();
+        let Command::Daemon(args) = cli.command else {
+            panic!("expected daemon command");
+        };
+        assert_eq!(args.duration, Duration::ZERO);
+
+        let cli =
+            Cli::try_parse_from(["fast", "daemon", "--pid", "123", "--duration", "0s"]).unwrap();
+        let Command::Daemon(args) = cli.command else {
+            panic!("expected daemon command");
+        };
+        assert_eq!(args.duration, Duration::ZERO);
+
+        let cli =
+            Cli::try_parse_from(["fast", "daemon", "--pid", "123", "--duration", "10s"]).unwrap();
+        let Command::Daemon(args) = cli.command else {
+            panic!("expected daemon command");
+        };
+        assert_eq!(args.duration, Duration::from_secs(10));
     }
 
     #[test]

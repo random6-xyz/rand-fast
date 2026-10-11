@@ -1071,6 +1071,54 @@ check_diagnose_scenarios() {
         "$FAST_WORKLOAD" net-hog --duration 30s --workers 2 --delay-ms 600
 }
 
+# Proves the documented zero-duration daemon default runs until its target exits.
+check_daemon_infinite_default() {
+    local dir="$OUT_DIR/daemon-infinite"
+    local report="$OUT_DIR/daemon-infinite.txt"
+    rm -rf "$dir"
+    mkdir -p "$dir"
+
+    "$SCHED_WORKLOAD" target --duration 6s --period 5ms >/dev/null 2>&1 &
+    local target_pid=$!
+    sleep 0.3
+    "$FAST" daemon --pid "$target_pid" \
+        --interval 1s --window 10s --output "$dir" \
+        --trigger-sched-p95 off --trigger-io-p99 off --trigger-retrans off \
+        --trigger-psi-some off --trigger-psi-full off --trigger-cpu off \
+        >"$report" 2>&1 &
+    local daemon_pid=$!
+
+    # The old runtime treated zero as an already-expired duration and exited
+    # before recording a tick. Check while the target is still alive, then let
+    # target exit be the natural stopping condition.
+    sleep 1
+    local state
+    state=$(awk '{print $3}' "/proc/$daemon_pid/stat" 2>/dev/null || true)
+    if [ -z "$state" ] || [ "$state" = Z ]; then
+        wait "$daemon_pid" 2>/dev/null || true
+        kill "$target_pid" 2>/dev/null || true
+        wait "$target_pid" 2>/dev/null || true
+        echo "daemon infinite default: FAIL (daemon exited before its live target; see $report)"
+        sed -n '1,8p' "$report" | sed 's/^/    /' >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    local daemon_status=0
+    wait "$daemon_pid" || daemon_status=$?
+    wait "$target_pid" 2>/dev/null || true
+    local intervals
+    intervals=$(awk '/^Intervals recorded:/ {print $3; exit}' "$report")
+    if [ "$daemon_status" -ne 0 ] || [ -z "${intervals:-}" ] || [ "$intervals" -lt 2 ]; then
+        echo "daemon infinite default: FAIL (status=$daemon_status, intervals=${intervals:-0}; see $report)"
+        sed -n '1,8p' "$report" | sed 's/^/    /' >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    echo "daemon infinite default: remained running until target exit and recorded $intervals intervals"
+}
+
 # Proves the flight recorder records real measurements and stays inside its
 # overhead budget.
 #
@@ -1524,6 +1572,7 @@ check_diagnose_parallel
 check_diagnose_ranking
 check_json_document
 check_diagnose_scenarios
+check_daemon_infinite_default
 check_daemon_budget
 check_daemon_triggers
 check_daemon_storage

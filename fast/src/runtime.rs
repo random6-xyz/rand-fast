@@ -53,6 +53,26 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(POLL_INTERVAL_
 /// re-checking the stop flag and the thread refresh deadline.
 const RECV_WAIT: Duration = Duration::from_millis(50);
 
+fn multi_collection_duration_expired(duration: Duration, elapsed: Duration) -> bool {
+    !duration.is_zero() && elapsed >= duration
+}
+
+fn multi_collection_wait(duration: Duration, elapsed: Duration) -> Duration {
+    if duration.is_zero() {
+        RECV_WAIT
+    } else {
+        duration.saturating_sub(elapsed).min(RECV_WAIT)
+    }
+}
+
+fn multi_collection_elapsed(duration: Duration, elapsed: Duration) -> Duration {
+    if duration.is_zero() {
+        elapsed
+    } else {
+        elapsed.min(duration)
+    }
+}
+
 /// Default perf buffer page count per CPU buffer.
 ///
 /// One page is 4 KiB. The scheduler emits at most one event per wakeup of the
@@ -585,7 +605,7 @@ impl<'a> EventStream<'a> {
 pub struct MultiCollectionOptions {
     /// Process (TGID) whose threads are observed.
     pub pid: u32,
-    /// Bounded collection duration.
+    /// Collection duration; zero runs until Ctrl-C or target-process exit.
     pub duration: Duration,
     /// Collector mode bits written into the eBPF `MODE` map.
     pub mode: u32,
@@ -638,8 +658,8 @@ pub struct MultiStreams<'a> {
 /// This is what lets a command observe scheduler latency, CPU sampling, block
 /// I/O and TCP at the same time: the object is loaded once, one reader thread
 /// runs per stream per CPU, and a single loop dispatches each record to the
-/// stream that produced it. Target exit and Ctrl-C are handled once for all of
-/// them rather than per collector.
+/// stream that produced it. A zero duration runs until target exit or Ctrl-C.
+/// Target exit and Ctrl-C are handled once for all streams rather than per collector.
 pub fn run_multi_collection<'a>(
     bpf: &mut Ebpf,
     target_tids: &mut AyaHashMap<MapData, u32, u8>,
@@ -736,13 +756,12 @@ pub fn run_multi_collection<'a>(
     let mut process_exited = false;
     let mut fatal_error = None;
 
-    while started.elapsed() < options.duration {
+    while !multi_collection_duration_expired(options.duration, started.elapsed()) {
         let mut ticked_this_iteration = false;
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        let remaining = options.duration.saturating_sub(started.elapsed());
-        let wait = remaining.min(RECV_WAIT);
+        let wait = multi_collection_wait(options.duration, started.elapsed());
         match receiver.recv_timeout(wait) {
             Ok(MultiMessage::Sample(index, bytes)) => {
                 if let Some(Err(error)) = streams.get_mut(index).map(|s| s.sink.on_event(&bytes)) {
@@ -827,7 +846,7 @@ pub fn run_multi_collection<'a>(
     }
 
     let summary = CollectionSummary {
-        elapsed: started.elapsed().min(options.duration),
+        elapsed: multi_collection_elapsed(options.duration, started.elapsed()),
         interrupted: interrupted.load(Ordering::Relaxed),
         process_exited,
     };
@@ -1215,6 +1234,39 @@ mod tests {
         fn on_lost(&mut self, count: u64) {
             self.lost.set(self.lost.get() + count);
         }
+    }
+
+    #[test]
+    fn zero_multi_collection_duration_is_unbounded_without_busy_waiting() {
+        let elapsed = Duration::from_secs(5);
+        assert!(!multi_collection_duration_expired(Duration::ZERO, elapsed));
+        assert_eq!(multi_collection_wait(Duration::ZERO, elapsed), RECV_WAIT);
+        assert_eq!(multi_collection_elapsed(Duration::ZERO, elapsed), elapsed);
+    }
+
+    #[test]
+    fn positive_multi_collection_duration_remains_bounded() {
+        let duration = Duration::from_secs(2);
+        assert!(!multi_collection_duration_expired(
+            duration,
+            Duration::from_secs(1)
+        ));
+        assert_eq!(
+            multi_collection_wait(duration, Duration::from_secs(1)),
+            RECV_WAIT
+        );
+        assert!(multi_collection_duration_expired(
+            duration,
+            Duration::from_secs(3)
+        ));
+        assert_eq!(
+            multi_collection_wait(duration, Duration::from_secs(3)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            multi_collection_elapsed(duration, Duration::from_secs(3)),
+            duration
+        );
     }
 
     #[test]
