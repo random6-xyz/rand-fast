@@ -230,6 +230,8 @@ pub struct IoJson {
     pub samples: u64,
     /// Records the kernel dropped from the perf buffer.
     pub lost_events: u64,
+    /// Target requests that could not be tracked because the in-flight map was full.
+    pub unmatched_requests: u64,
     /// The slow threshold this run used.
     pub threshold_us: u64,
     /// Median latency.
@@ -274,10 +276,14 @@ pub struct IoDeviceJson {
     pub reads: u64,
     /// Write completions.
     pub writes: u64,
+    /// Completions of operations other than read/write, including flushes.
+    pub other: u64,
     /// Sectors read.
     pub read_sectors: u64,
     /// Sectors written.
     pub write_sectors: u64,
+    /// Sectors transferred by other operations.
+    pub other_sectors: u64,
     /// Median latency on this device.
     pub p50_us: u64,
     /// 95th percentile latency on this device.
@@ -294,6 +300,7 @@ pub fn io_json(stats: &crate::io::IoStats, rchar_bytes: u64, wchar_bytes: u64) -
     IoJson {
         samples: stats.sample_count() as u64,
         lost_events: stats.lost(),
+        unmatched_requests: stats.unmatched(),
         threshold_us: stats.threshold_ns() / 1_000,
         p50_us: summary.map_or(0, |s| s.p50_ns / 1_000),
         p95_us: summary.map_or(0, |s| s.p95_ns / 1_000),
@@ -329,8 +336,10 @@ pub fn io_json(stats: &crate::io::IoStats, rchar_bytes: u64, wchar_bytes: u64) -
                     samples: latencies.len() as u64,
                     reads: device_stats.read.count,
                     writes: device_stats.write.count,
+                    other: device_stats.other.count,
                     read_sectors: device_stats.read.sectors,
                     write_sectors: device_stats.write.sectors,
+                    other_sectors: device_stats.other.sectors,
                     p50_us: pick(50) / 1_000,
                     p95_us: pick(95) / 1_000,
                     p99_us: pick(99) / 1_000,
@@ -350,6 +359,10 @@ pub struct OffCpuJson {
     pub samples: u64,
     /// Records the kernel dropped from the perf buffer.
     pub lost_events: u64,
+    /// Pending thread states remaining after collection stopped.
+    pub pending_at_stop: u64,
+    /// Pending states classified as unknown rather than interruptible/I/O waits.
+    pub pending_unknown_at_stop: u64,
     /// Summed off-CPU time.
     pub total_us: u64,
     /// Median wait.
@@ -403,6 +416,8 @@ pub fn offcpu_json(stats: &OffCpuStats) -> OffCpuJson {
     OffCpuJson {
         samples: stats.sample_count() as u64,
         lost_events: stats.lost(),
+        pending_at_stop: stats.pending_at_stop() as u64,
+        pending_unknown_at_stop: stats.pending_unknown_at_stop() as u64,
         total_us: total / 1_000,
         p50_us: p50 / 1_000,
         p95_us: p95 / 1_000,
@@ -624,8 +639,11 @@ mod tests {
                 WaitReason::Futex,
             );
         }
+        stats.set_pending_at_stop(2, 1);
         let value = value_of(&offcpu_json(&stats));
         assert_eq!(value["samples"], serde_json::json!(3));
+        assert_eq!(value["pending_at_stop"], serde_json::json!(2));
+        assert_eq!(value["pending_unknown_at_stop"], serde_json::json!(1));
         assert_eq!(value["total_us"], serde_json::json!(6));
         assert_eq!(
             value["reasons"][0]["reason"],
@@ -731,13 +749,36 @@ mod tests {
     }
 
     #[test]
-    fn io_json_carries_per_device_rows() {
-        let stats = crate::io::IoStats::new(10_000_000);
+    fn io_json_carries_per_device_rows_and_unmatched_requests() {
+        let mut stats = crate::io::IoStats::new(10_000_000);
+        crate::runtime::EventHandler::on_event(
+            &mut stats,
+            fast_common::IoEvent {
+                latency_ns: 0,
+                tid: 42,
+                dev: 0,
+                sectors: 0,
+                op: fast_common::IO_OP_UNMATCHED,
+            },
+        );
+        crate::runtime::EventHandler::on_event(
+            &mut stats,
+            fast_common::IoEvent {
+                latency_ns: 1_000,
+                tid: 42,
+                dev: 0x0801,
+                sectors: 0,
+                op: 2,
+            },
+        );
         let value = value_of(&io_json(&stats, 100, 200));
+        assert_eq!(value["samples"], serde_json::json!(1));
+        assert_eq!(value["unmatched_requests"], serde_json::json!(1));
+        assert_eq!(value["devices"][0]["other"], serde_json::json!(1));
         assert_eq!(value["rchar_bytes"], serde_json::json!(100));
         assert_eq!(value["wchar_bytes"], serde_json::json!(200));
         assert_eq!(value["threshold_us"], serde_json::json!(10_000));
-        assert_eq!(value["devices"].as_array().unwrap().len(), 0);
+        assert_eq!(value["devices"].as_array().unwrap().len(), 1);
     }
 
     #[test]

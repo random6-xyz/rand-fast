@@ -50,6 +50,8 @@ pub struct Evidence {
     pub cpu_percent: f64,
     /// Block I/O completions collected.
     pub io_samples: usize,
+    /// Target requests that could not be tracked.
+    pub io_unmatched: u64,
     /// Block I/O latency p99, in microseconds.
     pub io_p99_us: u64,
     /// Block I/O samples above the slow threshold.
@@ -132,6 +134,7 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
         "/fast-ebpf"
     )))
     .context("failed to load eBPF object; run as root or grant CAP_BPF and CAP_PERFMON")?;
+    crate::io_request_layout::configure(&mut bpf)?;
 
     // Only the programs this command needs are attached. Both scheduler
     // programs are needed: the off-CPU pairing reads the same switch-out the
@@ -140,10 +143,11 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
     // attributes.
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_wakeup")?;
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_switch")?;
+    runtime::attach_tracepoint(&mut bpf, "sched", "sched_process_exit")?;
     runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_probe")?;
     runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_retransmit_skb")?;
-    runtime::attach_tracepoint(&mut bpf, "block", "block_rq_issue")?;
-    runtime::attach_tracepoint(&mut bpf, "block", "block_rq_complete")?;
+    runtime::attach_raw_tracepoint(&mut bpf, "block_rq_issue")?;
+    runtime::attach_raw_tracepoint(&mut bpf, "block_rq_complete")?;
     runtime::attach_tracepoint(&mut bpf, "exceptions", "page_fault_user")?;
     runtime::attach_tracepoint(&mut bpf, "vmscan", "mm_vmscan_direct_reclaim_begin")?;
 
@@ -317,6 +321,7 @@ fn collect_evidence(
         cpu_samples: cpu_stats.sample_count(),
         cpu_percent: cpu_stats.cpu_percent().unwrap_or(0.0),
         io_samples: io_stats.sample_count(),
+        io_unmatched: io_stats.unmatched(),
         io_p99_us: io_stats.summary().map_or(0, |s| s.p99_ns / 1_000),
         io_slow: io_stats.slow_count(),
         net_samples: net.samples() + net.retrans(),
@@ -379,8 +384,8 @@ fn print_report(name: &str, pid: u32, summary: &runtime::CollectionSummary, evid
         evidence.cpu_samples, evidence.cpu_percent
     );
     println!(
-        "  block io: {} completions, p99 {} us, {} over the slow threshold",
-        evidence.io_samples, evidence.io_p99_us, evidence.io_slow
+        "  block io: {} completions, {} unmatched, p99 {} us, {} over the slow threshold",
+        evidence.io_samples, evidence.io_unmatched, evidence.io_p99_us, evidence.io_slow
     );
     println!(
         "  tcp: {} events, {:.2}% retransmitted",

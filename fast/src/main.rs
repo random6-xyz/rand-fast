@@ -4,6 +4,7 @@ mod cpu;
 mod daemon;
 mod diagnose;
 mod io;
+mod io_request_layout;
 mod json;
 mod json_payloads;
 mod memory;
@@ -15,6 +16,7 @@ mod runtime;
 mod scoring;
 mod stats;
 mod symbolize;
+mod tracepoint_layout;
 mod trigger;
 
 use std::process::ExitCode;

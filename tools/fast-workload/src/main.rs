@@ -1,5 +1,6 @@
 use std::{
     alloc::{Layout, alloc, dealloc},
+    collections::HashSet,
     fs::{File, OpenOptions},
     hint::black_box,
     io::{Read, Seek, SeekFrom, Write},
@@ -8,7 +9,7 @@ use std::{
     path::PathBuf,
     ptr,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
     thread,
@@ -40,6 +41,9 @@ enum Mode {
     /// Futex contention across N threads (validates `fast offcpu`).
     #[command(name = "lock-hog")]
     Lock(LockHogArgs),
+    /// Repeatedly create and exit sleeping threads (validates TID cleanup).
+    #[command(name = "thread-exit-hog")]
+    ThreadExit(ThreadExitArgs),
     /// Allocation and page-fault churn (validates `fast memory`).
     #[command(name = "mem-hog")]
     Mem(MemHogArgs),
@@ -51,11 +55,11 @@ struct IoHogArgs {
     #[arg(long, value_parser = parse_duration)]
     duration: Duration,
 
-    /// Number of reader threads.
+    /// Number of I/O worker threads.
     #[arg(long, default_value_t = 1)]
     workers: usize,
 
-    /// File to read. Created (and overwritten) at startup.
+    /// File to read or write. Created (and overwritten) unless reuse-file is set.
     #[arg(long, default_value = "/tmp/fast-workload-io")]
     path: PathBuf,
 
@@ -66,6 +70,36 @@ struct IoHogArgs {
     /// Read at random offsets instead of sequentially.
     #[arg(long)]
     random: bool,
+
+    /// Repeatedly access sector zero; alternating workers read and write.
+    #[arg(long)]
+    same_sector: bool,
+
+    /// Make all workers write instead of read.
+    #[arg(long)]
+    write: bool,
+
+    /// Flush after each write to generate block flush requests.
+    #[arg(long)]
+    flush: bool,
+
+    /// Reuse an existing file without truncating or rewriting it.
+    #[arg(long)]
+    reuse_file: bool,
+}
+
+struct IoWorkerArgs {
+    path: PathBuf,
+    file_size: u64,
+    random: bool,
+    same_sector: bool,
+    write: bool,
+    flush: bool,
+    worker: usize,
+    deadline: Instant,
+    cursor: Arc<AtomicU64>,
+    bytes_read: Arc<AtomicU64>,
+    bytes_written: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -108,6 +142,25 @@ struct LockHogArgs {
     /// Number of threads contending on one futex word.
     #[arg(long, default_value_t = 4)]
     workers: usize,
+
+    /// Optional time to sleep while holding the lock, in milliseconds.
+    #[arg(long, default_value_t = 0, value_name = "MS")]
+    hold_ms: u64,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ThreadExitArgs {
+    /// How long the churn workload should run.
+    #[arg(long, value_parser = parse_duration)]
+    duration: Duration,
+
+    /// Number of short-lived sleeping threads in each batch.
+    #[arg(long, default_value_t = 64)]
+    workers: usize,
+
+    /// How long each worker sleeps before exiting, in milliseconds.
+    #[arg(long, default_value_t = 200, value_name = "MS")]
+    sleep_ms: u64,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -131,6 +184,7 @@ fn main() -> std::process::ExitCode {
         Mode::Io(args) => run_io_hog(args),
         Mode::Net(args) => run_net_hog(args),
         Mode::Lock(args) => run_lock_hog(args),
+        Mode::ThreadExit(args) => run_thread_exit_hog(args),
         Mode::Mem(args) => run_mem_hog(args),
     };
 
@@ -149,9 +203,28 @@ fn run_io_hog(args: IoHogArgs) -> Result<(), String> {
     if args.size_mib == 0 {
         return Err("size-mib must be greater than zero".to_string());
     }
+    if args.same_sector && args.random {
+        return Err("same-sector and random cannot be used together".to_string());
+    }
+    if args.flush && !(args.write || (args.same_sector && args.workers > 1)) {
+        return Err("flush requires at least one write worker".to_string());
+    }
 
     let file_size = args.size_mib * 1024 * 1024;
-    prepare_file(&args.path, file_size)?;
+    if args.reuse_file {
+        let metadata = std::fs::metadata(&args.path)
+            .map_err(|error| format!("stat {}: {error}", args.path.display()))?;
+        if metadata.len() < file_size {
+            return Err(format!(
+                "{} is {} bytes, shorter than requested {} bytes",
+                args.path.display(),
+                metadata.len(),
+                file_size
+            ));
+        }
+    } else {
+        prepare_file(&args.path, file_size)?;
+    }
 
     println!(
         "io-hog pid: {} file: {} size: {} MiB workers: {} pattern: {}",
@@ -159,41 +232,59 @@ fn run_io_hog(args: IoHogArgs) -> Result<(), String> {
         args.path.display(),
         args.size_mib,
         args.workers,
-        if args.random { "random" } else { "sequential" },
+        if args.same_sector {
+            "same-sector"
+        } else if args.random {
+            "random"
+        } else {
+            "sequential"
+        },
     );
 
     let cursor = Arc::new(AtomicU64::new(0));
     let bytes_read = Arc::new(AtomicU64::new(0));
+    let bytes_written = Arc::new(AtomicU64::new(0));
     let deadline = Instant::now() + args.duration;
     let mut handles = Vec::with_capacity(args.workers);
     for worker in 0..args.workers {
-        let cursor = Arc::clone(&cursor);
-        let bytes_read = Arc::clone(&bytes_read);
-        let path = args.path.clone();
+        let write = args.write || (args.same_sector && worker % 2 == 1);
+        let worker_args = IoWorkerArgs {
+            path: args.path.clone(),
+            file_size,
+            random: args.random,
+            same_sector: args.same_sector,
+            write,
+            flush: args.flush && write,
+            worker,
+            deadline,
+            cursor: Arc::clone(&cursor),
+            bytes_read: Arc::clone(&bytes_read),
+            bytes_written: Arc::clone(&bytes_written),
+        };
         handles.push(
             thread::Builder::new()
                 .name(format!("io-hog-{worker}"))
-                .spawn(move || {
-                    io_worker(
-                        &path,
-                        file_size,
-                        args.random,
-                        worker,
-                        deadline,
-                        &cursor,
-                        &bytes_read,
-                    )
-                })
+                .spawn(move || io_worker(worker_args))
                 .map_err(|error| format!("failed to spawn io worker: {error}"))?,
         );
     }
 
     join_workers(handles)?;
-    println!(
-        "io-hog: read {} bytes in {} reads",
-        bytes_read.load(Ordering::Relaxed),
-        bytes_read.load(Ordering::Relaxed) / CHUNK_SIZE as u64,
-    );
+    let reads = bytes_read.load(Ordering::Relaxed) / CHUNK_SIZE as u64;
+    let writes = bytes_written.load(Ordering::Relaxed) / CHUNK_SIZE as u64;
+    if args.same_sector {
+        println!("io-hog: completed {reads} reads and {writes} writes at sector zero");
+    } else if args.write {
+        println!(
+            "io-hog: wrote {} bytes in {writes} writes",
+            bytes_written.load(Ordering::Relaxed)
+        );
+    } else {
+        println!(
+            "io-hog: read {} bytes in {reads} reads",
+            bytes_read.load(Ordering::Relaxed),
+        );
+    }
     Ok(())
 }
 
@@ -213,16 +304,21 @@ fn prepare_file(path: &PathBuf, size: u64) -> Result<(), String> {
     Ok(())
 }
 
-fn io_worker(
-    path: &PathBuf,
-    file_size: u64,
-    random: bool,
-    worker: usize,
-    deadline: Instant,
-    cursor: &AtomicU64,
-    bytes_read: &AtomicU64,
-) -> Result<(), String> {
-    let file = open_direct(path)?;
+fn io_worker(args: IoWorkerArgs) -> Result<(), String> {
+    let IoWorkerArgs {
+        path,
+        file_size,
+        random,
+        same_sector,
+        write,
+        flush,
+        worker,
+        deadline,
+        cursor,
+        bytes_read,
+        bytes_written,
+    } = args;
+    let file = open_direct(&path, write)?;
     let fd = file.as_raw_fd();
 
     // O_DIRECT requires page-aligned buffers and offsets.
@@ -230,41 +326,62 @@ fn io_worker(
         .map_err(|error| format!("buffer layout: {error}"))?;
     let buffer = unsafe { alloc(layout) };
     if buffer.is_null() {
-        return Err("failed to allocate the read buffer".to_string());
+        return Err("failed to allocate the I/O buffer".to_string());
+    }
+    if write {
+        unsafe { ptr::write_bytes(buffer, 0, CHUNK_SIZE) };
     }
 
     let mut seed = (worker as u64 + 1).wrapping_mul(0x9E3779B97F4A7C15);
     let mut offset;
     let chunk = CHUNK_SIZE as u64;
     while Instant::now() < deadline {
-        if random {
+        if same_sector {
+            offset = 0;
+        } else if random {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
-            // O_DIRECT requires sector-aligned offsets; keep reads on chunk
+            // O_DIRECT requires sector-aligned offsets; keep I/O on chunk
             // boundaries.
             offset = (seed % (file_size / chunk)) * chunk;
         } else {
             offset = cursor.fetch_add(chunk, Ordering::Relaxed) % file_size;
         }
 
-        let n = unsafe { libc::pread(fd, buffer.cast(), CHUNK_SIZE, offset as libc::off_t) };
+        let n = unsafe {
+            if write {
+                libc::pwrite(fd, buffer.cast(), CHUNK_SIZE, offset as libc::off_t)
+            } else {
+                libc::pread(fd, buffer.cast(), CHUNK_SIZE, offset as libc::off_t)
+            }
+        };
         if n < 0 {
             let error = std::io::Error::last_os_error();
             unsafe { dealloc(buffer, layout) };
-            return Err(format!("pread at offset {offset}: {error}"));
+            return Err(format!("I/O at offset {offset}: {error}"));
+        }
+        if flush && unsafe { libc::fdatasync(fd) } < 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe { dealloc(buffer, layout) };
+            return Err(format!("fdatasync after write at offset {offset}: {error}"));
         }
         black_box(unsafe { buffer.read_volatile() });
-        bytes_read.fetch_add(n as u64, Ordering::Relaxed);
+        if write {
+            bytes_written.fetch_add(n as u64, Ordering::Relaxed);
+        } else {
+            bytes_read.fetch_add(n as u64, Ordering::Relaxed);
+        }
     }
 
     unsafe { dealloc(buffer, layout) };
     Ok(())
 }
 
-fn open_direct(path: &PathBuf) -> Result<File, String> {
+fn open_direct(path: &PathBuf, write: bool) -> Result<File, String> {
     match OpenOptions::new()
         .read(true)
+        .write(write)
         .custom_flags(libc::O_DIRECT)
         .open(path)
     {
@@ -272,11 +389,15 @@ fn open_direct(path: &PathBuf) -> Result<File, String> {
         Err(direct_error) => {
             // tmpfs and some overlays reject O_DIRECT; fall back loudly.
             eprintln!(
-                "warning: O_DIRECT unsupported on {} ({}); falling back to buffered reads",
+                "warning: O_DIRECT unsupported on {} ({}); falling back to buffered I/O",
                 path.display(),
                 direct_error
             );
-            let mut file = File::open(path).map_err(|error| format!("open: {error}"))?;
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(write)
+                .open(path)
+                .map_err(|error| format!("open: {error}"))?;
             file.seek(SeekFrom::Start(0))
                 .map_err(|error| format!("seek: {error}"))?;
             Ok(file)
@@ -512,6 +633,7 @@ fn run_lock_hog(args: LockHogArgs) -> Result<(), String> {
     let futex_word: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
     let acquisitions = Arc::new(AtomicU64::new(0));
     let deadline = Instant::now() + args.duration;
+    let hold = Duration::from_millis(args.hold_ms);
 
     let mut handles = Vec::with_capacity(args.workers);
     for worker in 0..args.workers {
@@ -519,7 +641,7 @@ fn run_lock_hog(args: LockHogArgs) -> Result<(), String> {
         handles.push(
             thread::Builder::new()
                 .name(format!("lock-hog-{worker}"))
-                .spawn(move || lock_worker(futex_word, deadline, &acquisitions))
+                .spawn(move || lock_worker(futex_word, deadline, hold, &acquisitions))
                 .map_err(|error| format!("failed to spawn lock worker: {error}"))?,
         );
     }
@@ -532,9 +654,61 @@ fn run_lock_hog(args: LockHogArgs) -> Result<(), String> {
     Ok(())
 }
 
+fn run_thread_exit_hog(args: ThreadExitArgs) -> Result<(), String> {
+    if args.workers == 0 {
+        return Err("workers must be greater than zero".to_string());
+    }
+    if args.sleep_ms == 0 {
+        return Err("sleep-ms must be greater than zero".to_string());
+    }
+
+    let seen_tids = Arc::new(Mutex::new(HashSet::new()));
+    let created = Arc::new(AtomicU64::new(0));
+    let reused = Arc::new(AtomicU64::new(0));
+    let deadline = Instant::now() + args.duration;
+    let sleep = Duration::from_millis(args.sleep_ms);
+
+    while Instant::now() < deadline {
+        let mut handles = Vec::with_capacity(args.workers);
+        for worker in 0..args.workers {
+            let seen_tids = Arc::clone(&seen_tids);
+            let created = Arc::clone(&created);
+            let reused = Arc::clone(&reused);
+            handles.push(
+                thread::Builder::new()
+                    .name(format!("thread-exit-{worker}"))
+                    .spawn(move || {
+                        let tid = u32::try_from(unsafe { libc::syscall(libc::SYS_gettid) })
+                            .map_err(|error| format!("gettid returned an invalid id: {error}"))?;
+                        created.fetch_add(1, Ordering::Relaxed);
+                        let mut seen = seen_tids
+                            .lock()
+                            .map_err(|_| "TID reuse tracker was poisoned".to_string())?;
+                        if !seen.insert(tid) {
+                            reused.fetch_add(1, Ordering::Relaxed);
+                        }
+                        drop(seen);
+                        thread::sleep(sleep);
+                        Ok(())
+                    })
+                    .map_err(|error| format!("failed to spawn exit worker: {error}"))?,
+            );
+        }
+        join_workers(handles)?;
+    }
+
+    println!(
+        "thread-exit-hog: created {} threads, reused {} TIDs",
+        created.load(Ordering::Relaxed),
+        reused.load(Ordering::Relaxed)
+    );
+    Ok(())
+}
+
 fn lock_worker(
     futex_word: &'static AtomicU32,
     deadline: Instant,
+    hold: Duration,
     acquisitions: &AtomicU64,
 ) -> Result<(), String> {
     let word = futex_word as *const AtomicU32 as *mut u32;
@@ -563,6 +737,11 @@ fn lock_worker(
             }
         }
 
+        // Optional hold time makes a deliberate lock bottleneck rank ahead of
+        // CPU use in deterministic diagnostic scenarios.
+        if !hold.is_zero() {
+            thread::sleep(hold);
+        }
         // Critical section: brief busy work while holding the lock.
         value = value.wrapping_mul(31).wrapping_add(1);
         black_box(value);

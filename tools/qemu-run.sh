@@ -31,18 +31,40 @@ OUT_DIR=${OUT_DIR:-/tmp/fast-qemu}
 DURATION=${DURATION:-5s}
 KEEP=0
 
-for arg in "$@"; do
-    case "$arg" in
-    --keep) KEEP=1 ;;
-    --duration) shift; DURATION=$1 ;;
-    --duration=*) DURATION=${arg#--duration=} ;;
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+    --keep)
+        KEEP=1
+        shift
+        ;;
+    --duration)
+        if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+            echo "qemu-run: --duration requires a value" >&2
+            exit 2
+        fi
+        case "$2" in
+        -*) echo "qemu-run: invalid --duration value: $2" >&2; exit 2 ;;
+        esac
+        DURATION=$2
+        shift 2
+        ;;
+    --duration=*)
+        DURATION=${1#--duration=}
+        if [ -z "$DURATION" ]; then
+            echo "qemu-run: --duration requires a value" >&2
+            exit 2
+        fi
+        case "$DURATION" in
+        -*) echo "qemu-run: invalid --duration value: $DURATION" >&2; exit 2 ;;
+        esac
+        shift
+        ;;
     -h|--help)
         sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
         exit 0
         ;;
-    *) echo "qemu-run: unknown argument: $arg" >&2; exit 2 ;;
+    *) echo "qemu-run: unknown argument: $1" >&2; exit 2 ;;
     esac
-    [ "$#" -gt 0 ] && shift || true
 done
 
 log() { printf 'qemu-run: %s\n' "$*"; }

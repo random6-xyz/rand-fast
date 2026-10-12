@@ -32,9 +32,27 @@ DURATION=${DURATION:-5s}
 OUT_DIR=${OUT_DIR:-/tmp/fast-smoke}
 IO_HOG_PATH=${IO_HOG_PATH:-/tmp/fast-workload-io}
 FAILURES=0
+PID_MAX_ORIGINAL=
+
+finish() {
+    if [ "$FAILURES" -gt 0 ]; then
+        echo "smoke matrix: FAILED ($FAILURES failure(s))"
+        exit 1
+    fi
+    echo "smoke matrix: all cases passed"
+    exit 0
+}
+
+restore_pid_max() {
+    if [ -n "$PID_MAX_ORIGINAL" ]; then
+        printf '%s\n' "$PID_MAX_ORIGINAL" > /proc/sys/kernel/pid_max 2>/dev/null || true
+        PID_MAX_ORIGINAL=
+    fi
+}
 
 cleanup() {
     kill $(jobs -p) 2>/dev/null
+    restore_pid_max
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -126,13 +144,19 @@ run_sched_case() {
     echo
 }
 
+# Host-side stub tests exercise the same case/failure accounting without QEMU.
+if [ "${QEMU_SMOKE_TEST_CASE:-}" = "single-io" ]; then
+    run_case io "$FAST_WORKLOAD" io-hog --duration 1s --workers 1
+    finish
+fi
+
 run_sched_case
 run_case cpu "$SCHED_WORKLOAD" hog --duration 30s --workers 8
 run_case io "$FAST_WORKLOAD" io-hog --duration 30s --workers 2 --path "$IO_HOG_PATH"
 run_case net "$FAST_WORKLOAD" net-hog --duration 30s --workers 4
 run_case off-cpu "$FAST_WORKLOAD" lock-hog --duration 30s --workers 16
 run_case memory "$FAST_WORKLOAD" mem-hog --duration 30s --workers 2
-run_case diagnose "$FAST_WORKLOAD" lock-hog --duration 30s --workers 16
+run_case diagnose "$FAST_WORKLOAD" lock-hog --duration 30s --workers 16 --hold-ms 1
 
 # --- v1.0 accuracy checks ---
 check_cpu_rate_scaling() {
@@ -219,6 +243,55 @@ check_io_pairing() {
     fi
     kill "$hog_pid" 2>/dev/null
     wait "$hog_pid" 2>/dev/null
+}
+
+check_io_request_identity() {
+    # Two target threads issue reads and writes to the same sector while a
+    # separate process writes that sector too. The per-request sample counts
+    # must remain attributed to the target despite identical device/sector
+    # values and completion order being independent of issue order.
+    local target_log="$OUT_DIR/io-identity-target.log"
+    local other_log="$OUT_DIR/io-identity-other.log"
+    local report="$OUT_DIR/io-identity.json"
+    local target_pid other_pid target_reads target_writes samples reads writes other_ops unmatched
+
+    "$FAST_WORKLOAD" io-hog --duration 5s --workers 2 --same-sector --flush \
+        --path "$IO_HOG_PATH" --size-mib 8 >"$target_log" 2>&1 &
+    target_pid=$!
+    sleep 0.2
+    "$FAST_WORKLOAD" io-hog --duration 5s --workers 1 --same-sector --write --flush \
+        --reuse-file --path "$IO_HOG_PATH" --size-mib 8 >"$other_log" 2>&1 &
+    other_pid=$!
+    sleep 0.2
+
+    if "$FAST" io --pid "$target_pid" --duration 5s --threshold 1ns --format json \
+        >"$report" 2>&1; then
+        target_reads=$(sed -n 's/.*completed \([0-9]*\) reads and \([0-9]*\) writes at sector zero.*/\1/p' "$target_log")
+        target_writes=$(sed -n 's/.*completed \([0-9]*\) reads and \([0-9]*\) writes at sector zero.*/\2/p' "$target_log")
+        samples=$(grep -o '"samples":[0-9]*' "$report" | head -n 1 | cut -d: -f2)
+        reads=$(grep -o '"reads":[0-9]*' "$report" | head -n 1 | cut -d: -f2)
+        writes=$(grep -o '"writes":[0-9]*' "$report" | head -n 1 | cut -d: -f2)
+        other_ops=$(grep -o '"other":[0-9]*' "$report" | head -n 1 | cut -d: -f2)
+        unmatched=$(grep -o '"unmatched_requests":[0-9]*' "$report" | head -n 1 | cut -d: -f2)
+        awk -v tr="${target_reads:-0}" -v tw="${target_writes:-0}" \
+            -v s="${samples:-0}" -v r="${reads:-0}" -v w="${writes:-0}" \
+            -v o="${other_ops:-0}" -v u="${unmatched:-0}" \
+            'BEGIN {
+                if (tr+0 < 10 || tw+0 < 10) {
+                    print "io request identity: FAIL (fixture did not issue both operations)"; exit 1
+                }
+                rp = (r+0) / (tr+0) * 100
+                wp = (w+0) / (tw+0) * 100
+                printf "io request identity: %d/%d reads, %d/%d writes, %d other/flush, %d unmatched\n", r, tr, w, tw, o, u
+                exit (rp >= 70 && wp >= 70 && u+0 == 0 && s+0 >= r+0+w+0) ? 0 : 1
+            }' || FAILURES=$((FAILURES + 1))
+    else
+        echo "io request identity: FAIL (collection failed; see $report)"
+        FAILURES=$((FAILURES + 1))
+    fi
+    kill "$other_pid" "$target_pid" 2>/dev/null
+    wait "$other_pid" 2>/dev/null
+    wait "$target_pid" 2>/dev/null
 }
 
 # Proves the RTT distribution actually moves when the link degrades.
@@ -602,6 +675,55 @@ check_offcpu_shape() {
     fi
 }
 
+check_offcpu_thread_exit_cleanup() {
+    # Lower the disposable guest's pid_max so rapid thread churn deterministically
+    # reuses TIDs. The workload sleeps in the kernel, then exits each TID while
+    # off-CPU state may be pending.
+    local fixture="$OUT_DIR/thread-exit-fixture.log"
+    local report="$OUT_DIR/thread-exit.json"
+    local reused pending pending_unknown samples
+    if [ ! -w /proc/sys/kernel/pid_max ]; then
+        echo "off-CPU thread-exit cleanup: FAIL (guest pid_max is not writable)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    PID_MAX_ORIGINAL=$(cat /proc/sys/kernel/pid_max 2>/dev/null || true)
+    if [ -z "$PID_MAX_ORIGINAL" ] || ! printf '1024\n' > /proc/sys/kernel/pid_max; then
+        echo "off-CPU thread-exit cleanup: FAIL (could not set guest pid_max to 1024)"
+        FAILURES=$((FAILURES + 1))
+        restore_pid_max
+        return
+    fi
+
+    "$FAST_WORKLOAD" thread-exit-hog --duration 12s --workers 64 --sleep-ms 200 \
+        >"$fixture" 2>&1 &
+    local target_pid=$!
+    sleep 0.3
+    if "$FAST" off-cpu --pid "$target_pid" --duration 13s --format json >"$report" 2>&1; then
+        reused=$(sed -n 's/.*reused \([0-9]*\) TIDs.*/\1/p' "$fixture")
+        pending=$(grep -o '"pending_at_stop":[0-9]*' "$report" | head -n 1 | cut -d: -f2)
+        pending_unknown=$(grep -o '"pending_unknown_at_stop":[0-9]*' "$report" | head -n 1 | cut -d: -f2)
+        samples=$(grep -o '"samples":[0-9]*' "$report" | head -n 1 | cut -d: -f2)
+        if awk -v r="${reused:-0}" -v p="${pending:-999999}" \
+            -v pu="${pending_unknown:-999999}" -v s="${samples:-0}" \
+            'BEGIN {
+                printf "off-CPU thread-exit cleanup: %s reused TIDs, %s waits, %s pending (%s unknown) at stop\n", r, s, p, pu
+                exit (r+0 > 0 && s+0 > 0 && p+0 == 0) ? 0 : 1
+            }'; then
+            :
+        else
+            FAILURES=$((FAILURES + 1))
+        fi
+    else
+        echo "off-CPU thread-exit cleanup: FAIL (collection failed; see $report)"
+        head -5 "$report" 2>/dev/null | sed 's/^/    /'
+        FAILURES=$((FAILURES + 1))
+    fi
+    kill "$target_pid" 2>/dev/null
+    wait "$target_pid" 2>/dev/null
+    restore_pid_max
+}
+
 # Proves the off-CPU report answers the question it exists for: which wait is
 # costing this process the most time, and where is it waiting.
 #
@@ -790,8 +912,8 @@ check_diagnose_ranking() {
         FAILURES=$((FAILURES + 1))
         return
     fi
-    # lock-hog spends its off-CPU time on a futex and nothing else, so that has
-    # to be the first named cause.
+    # The lock fixture holds the futex long enough to make lock wait dominate
+    # the short CPU critical section, so it should rank first consistently.
     if [ "$top" != "Lock" ]; then
         echo "diagnose ranking: FAIL (lock-hog ranked '$top' first, expected Lock contention)"
         grep -A 6 '^Ranked causes' "$report" | sed 's/^/    /' >&2
@@ -932,7 +1054,7 @@ check_diagnose_scenarios() {
         "$FAST_WORKLOAD" io-hog --duration 30s --workers 2 --path "$IO_HOG_PATH" --size-mib 256
 
     scenario lock "Lock contention" "Lock contention" \
-        "$FAST_WORKLOAD" lock-hog --duration 30s --workers 16
+        "$FAST_WORKLOAD" lock-hog --duration 30s --workers 16 --hold-ms 1
 
     # Large enough to make the process reclaim for itself, which is the only
     # per-process memory signal available on a kernel built without PSI and with
@@ -947,6 +1069,54 @@ check_diagnose_scenarios() {
     # retransmissions out of a loopback link that never loses a packet.
     scenario network "Network" "Network" \
         "$FAST_WORKLOAD" net-hog --duration 30s --workers 2 --delay-ms 600
+}
+
+# Proves the documented zero-duration daemon default runs until its target exits.
+check_daemon_infinite_default() {
+    local dir="$OUT_DIR/daemon-infinite"
+    local report="$OUT_DIR/daemon-infinite.txt"
+    rm -rf "$dir"
+    mkdir -p "$dir"
+
+    "$SCHED_WORKLOAD" target --duration 6s --period 5ms >/dev/null 2>&1 &
+    local target_pid=$!
+    sleep 0.3
+    "$FAST" daemon --pid "$target_pid" \
+        --interval 1s --window 10s --output "$dir" \
+        --trigger-sched-p95 off --trigger-io-p99 off --trigger-retrans off \
+        --trigger-psi-some off --trigger-psi-full off --trigger-cpu off \
+        >"$report" 2>&1 &
+    local daemon_pid=$!
+
+    # The old runtime treated zero as an already-expired duration and exited
+    # before recording a tick. Check while the target is still alive, then let
+    # target exit be the natural stopping condition.
+    sleep 1
+    local state
+    state=$(awk '{print $3}' "/proc/$daemon_pid/stat" 2>/dev/null || true)
+    if [ -z "$state" ] || [ "$state" = Z ]; then
+        wait "$daemon_pid" 2>/dev/null || true
+        kill "$target_pid" 2>/dev/null || true
+        wait "$target_pid" 2>/dev/null || true
+        echo "daemon infinite default: FAIL (daemon exited before its live target; see $report)"
+        sed -n '1,8p' "$report" | sed 's/^/    /' >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    local daemon_status=0
+    wait "$daemon_pid" || daemon_status=$?
+    wait "$target_pid" 2>/dev/null || true
+    local intervals
+    intervals=$(awk '/^Intervals recorded:/ {print $3; exit}' "$report")
+    if [ "$daemon_status" -ne 0 ] || [ -z "${intervals:-}" ] || [ "$intervals" -lt 2 ]; then
+        echo "daemon infinite default: FAIL (status=$daemon_status, intervals=${intervals:-0}; see $report)"
+        sed -n '1,8p' "$report" | sed 's/^/    /' >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    echo "daemon infinite default: remained running until target exit and recorded $intervals intervals"
 }
 
 # Proves the flight recorder records real measurements and stays inside its
@@ -1184,7 +1354,7 @@ check_daemon_storage() {
     # writes a bundle every interval or two. A run where no trigger fires writes
     # nothing, and a storage check with nothing to store tests nothing.
     local first_log="$OUT_DIR/storage-first.txt"
-    "$FAST_WORKLOAD" lock-hog --duration 300s --workers 16 >/dev/null 2>&1 &
+    "$FAST_WORKLOAD" lock-hog --duration 300s --workers 32 >/dev/null 2>&1 &
     local target_pid=$!
     sleep 0.3
     # The recorder is killed rather than allowed to finish, because that is the
@@ -1240,7 +1410,7 @@ check_daemon_storage() {
     # timeline has to continue rather than restart at zero, otherwise the ring
     # would read as though time ran backwards.
     local second_log="$OUT_DIR/storage-second.txt"
-    "$FAST_WORKLOAD" lock-hog --duration "$TRIGGER_RUN" --workers 16 >/dev/null 2>&1 &
+    "$FAST_WORKLOAD" lock-hog --duration "$TRIGGER_RUN" --workers 32 >/dev/null 2>&1 &
     target_pid=$!
     sleep 0.3
     "$FAST" daemon --pid "$target_pid" --duration "$TRIGGER_RUN" \
@@ -1355,11 +1525,9 @@ trigger_flags() {
         echo "--trigger-psi-some off --trigger-psi-full off --trigger-cpu off"
         ;;
     sched)
-        # Chosen from the two measured regimes rather than picked. An idle
-        # scheduler on this kernel reports a p95 of about 12us; sixteen threads
-        # fighting over one lock report about 504us. 200us sits between them with
-        # room on both sides, so the case separates "watching the scheduler" from
-        # "watching nothing" without depending on a marginal crossing. The
+        # Chosen from the two measured regimes rather than picked. The 32-worker
+        # lock fixture saturates the run queue enough to put p95 above 200us,
+        # while the idle baseline remains well below it. The
         # production default of 10ms is far above what this fixture produces and
         # is deliberately not used here: it would be a threshold the fixture
         # could never reach, which would test nothing.
@@ -1388,13 +1556,15 @@ check_daemon_triggers() {
     # which is why a case built on one would be testing a threshold the fixture
     # can never reach.
     trigger_case sched sched_p95 io_p99 \
-        "$FAST_WORKLOAD" lock-hog --duration "$TRIGGER_RUN" --workers 16
+        "$FAST_WORKLOAD" lock-hog --duration "$TRIGGER_RUN" --workers 32
 }
 
 check_cpu_rate_scaling
 check_cpu_symbolization
 check_io_pairing
+check_io_request_identity
 check_offcpu_shape
+check_offcpu_thread_exit_cleanup
 check_offcpu_ranking
 check_memory_fault_counter
 check_memory_verdict
@@ -1402,6 +1572,7 @@ check_diagnose_parallel
 check_diagnose_ranking
 check_json_document
 check_diagnose_scenarios
+check_daemon_infinite_default
 check_daemon_budget
 check_daemon_triggers
 check_daemon_storage
@@ -1433,8 +1604,4 @@ print_metrics diagnose 'scheduler:|cpu:|block io:|tcp:|off-cpu:|memory:|lost eve
 echo
 echo "Raw reports saved under $OUT_DIR"
 
-if [ "$FAILURES" -gt 0 ]; then
-    echo "smoke matrix: FAILED ($FAILURES failure(s))"
-    exit 1
-fi
-echo "smoke matrix: all cases passed"
+finish

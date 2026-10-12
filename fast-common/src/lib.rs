@@ -8,15 +8,16 @@ use bytemuck::{Pod, Zeroable};
 #[cfg(feature = "aya")]
 mod aya_pod {
     unsafe impl aya::Pod for crate::PendingIo {}
-    unsafe impl aya::Pod for crate::IoRequestKey {}
+    unsafe impl aya::Pod for crate::IoRequestId {}
+    unsafe impl aya::Pod for crate::IoRequestLayout {}
     unsafe impl aya::Pod for crate::OffCpuPending {}
     unsafe impl aya::Pod for crate::MemoryCounters {}
 }
 
 pub const MAX_TARGET_TIDS: u32 = 4096;
-/// Upper bound for in-flight per-request I/O entries. Only target-issued
-/// requests enter the map, so this is generous headroom over any realistic
-/// queue depth.
+/// Upper bound for in-flight target I/O requests keyed by kernel request
+/// identity. If the map fills, the collector reports an unmatched request
+/// instead of silently evicting a pending measurement.
 pub const MAX_PENDING_IO: u32 = 8192;
 /// Upper bound for remembered TCP sockets. Entries are added only for sockets
 /// a target thread is seen using, so this is generous headroom over the
@@ -84,8 +85,8 @@ pub struct PendingWakeup {
 }
 
 /// Pending block I/O request state carried from `block_rq_issue` to
-/// `block_rq_complete`. `op` is the operation code derived from the trace's
-/// rwbs field: 0 read, 1 write, 2 anything else (see [`io_op_name`]).
+/// `block_rq_complete`. `op` is derived from the request's REQ_OP bits: 0 read,
+/// 1 write, 2 anything else (see [`io_op_name`]).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct PendingIo {
@@ -94,28 +95,65 @@ pub struct PendingIo {
     pub op: u32,
 }
 
-/// Identity of one in-flight block request: the device and its start sector.
-///
-/// `block_rq_issue` and `block_rq_complete` both carry these fields in their
-/// tracepoint payloads, which makes the pair a portable request key. The
-/// request pointer is not reachable from `BPF_PROG_TYPE_TRACEPOINT` programs
-/// (only raw/BTF tracepoints expose TP_PROTO arguments), so the pair stands
-/// in for it: an in-flight request is uniquely identified by where it starts.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
-pub struct IoRequestKey {
-    pub dev: u32,
-    pub _pad: u32,
-    pub sector: u64,
+/// Unique identity of a live kernel block request, taken from its struct
+/// request pointer. This remains distinct even when requests share device and
+/// sector values or complete out of issue order.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Pod, Zeroable)]
+pub struct IoRequestId(pub u64);
+
+impl IoRequestId {
+    /// Builds an identity from the raw address passed by a block tracepoint.
+    pub const fn from_address(address: u64) -> Self {
+        Self(address)
+    }
 }
 
-/// Human-readable name for the operation code stored in I/O events. The
-/// eBPF side derives it from the rwbs field's first character: 0 read,
-/// 1 write, 2 anything else (discard, zone ops, ...).
+/// BTF-derived byte offsets used to read the kernel request associated with a
+/// block raw tracepoint. Userspace verifies the required fields from the
+/// running kernel's BTF before attaching the I/O programs.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+pub struct IoRequestLayout {
+    pub request_q: u32,
+    pub request_sector: u32,
+    pub request_data_len: u32,
+    pub request_cmd_flags: u32,
+    pub queue_disk: u32,
+    pub gendisk_major: u32,
+    pub gendisk_first_minor: u32,
+}
+
+/// Operation code used for an I/O event whose request could not be tracked.
+pub const IO_OP_UNMATCHED: u32 = 3;
+
+/// Exit-state bits reported by sched_switch's prev_state field.
+///
+/// The tracepoint reports EXIT_DEAD/EXIT_ZOMBIE rather than TASK_DEAD itself.
+pub const SCHED_EXIT_STATE_MASK: u64 = 0x10 | 0x20;
+
+/// Whether sched_switch reports an exiting task rather than a wait.
+pub fn scheduler_state_is_exiting(state: u64) -> bool {
+    state & SCHED_EXIT_STATE_MASK != 0
+}
+
+/// Maps the low REQ_OP bits of request flags to rand-fast's operation codes.
+pub fn io_op_from_request_flags(flags: u32) -> u32 {
+    match flags & 0xff {
+        0 => 0,
+        1 => 1,
+        _ => 2,
+    }
+}
+
+/// Human-readable name for the operation code stored in I/O events. Read and
+/// write use 0 and 1; 2 means any other block operation. `IO_OP_UNMATCHED` is
+/// a diagnostic record, not a latency sample.
 pub fn io_op_name(op: u32) -> &'static str {
     match op {
         0 => "read",
         1 => "write",
+        IO_OP_UNMATCHED => "unmatched",
         _ => "other",
     }
 }
@@ -141,7 +179,9 @@ pub struct CpuUsageSnapshot {
     pub total_ticks: u64,
 }
 
-/// I/O latency event attributed to a thread and block device.
+/// I/O latency event attributed to a thread and block device. An event with
+/// `op == IO_OP_UNMATCHED` is a diagnostic indicating that an in-flight target
+/// request could not be tracked; it must not be included in latency samples.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct IoEvent {
@@ -271,9 +311,10 @@ mod tests {
     }
 
     #[test]
-    fn io_request_key_layout_is_stable() {
-        assert_eq!(size_of::<IoRequestKey>(), 16);
-        assert_eq!(align_of::<IoRequestKey>(), 8);
+    fn io_request_id_layout_is_stable() {
+        assert_eq!(size_of::<IoRequestId>(), 8);
+        assert_eq!(align_of::<IoRequestId>(), 8);
+        assert_eq!(IoRequestId::from_address(0x1234).0, 0x1234);
     }
 
     #[test]
@@ -281,6 +322,26 @@ mod tests {
         assert_eq!(io_op_name(0), "read");
         assert_eq!(io_op_name(1), "write");
         assert_eq!(io_op_name(2), "other");
+        assert_eq!(io_op_name(IO_OP_UNMATCHED), "unmatched");
+    }
+
+    #[test]
+    fn request_flags_keep_read_write_and_flush_operation_semantics() {
+        assert_eq!(io_op_from_request_flags(0), 0);
+        assert_eq!(io_op_from_request_flags(1), 1);
+        assert_eq!(io_op_from_request_flags(2), 2);
+        assert_eq!(io_op_from_request_flags(3), 2);
+        assert_eq!(io_op_from_request_flags(0x101), 1);
+    }
+
+    #[test]
+    fn scheduler_exit_state_is_not_classified_as_an_off_cpu_wait() {
+        assert!(!scheduler_state_is_exiting(0));
+        assert!(!scheduler_state_is_exiting(1));
+        assert!(!scheduler_state_is_exiting(2));
+        assert!(scheduler_state_is_exiting(0x10));
+        assert!(scheduler_state_is_exiting(0x20));
+        assert!(scheduler_state_is_exiting(0x10 | 1));
     }
 
     #[test]

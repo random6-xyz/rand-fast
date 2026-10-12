@@ -179,6 +179,8 @@ pub struct OffCpuStats {
     by_stack: BTreeMap<i64, WaitStack>,
     by_reason: BTreeMap<WaitReason, ReasonTotals>,
     lost: u64,
+    pending_at_stop: usize,
+    pending_unknown_at_stop: usize,
 }
 
 /// Waits and total time for one reason.
@@ -251,6 +253,22 @@ impl OffCpuStats {
     /// Records the kernel's dropped-event count.
     pub fn lost(&self) -> u64 {
         self.lost
+    }
+
+    /// Records the number of pending TID-keyed states left when collection stopped.
+    pub fn set_pending_at_stop(&mut self, count: usize, unknown: usize) {
+        self.pending_at_stop = count;
+        self.pending_unknown_at_stop = unknown;
+    }
+
+    /// Pending switch-out states left after reader and thread-exit cleanup.
+    pub fn pending_at_stop(&self) -> usize {
+        self.pending_at_stop
+    }
+
+    /// Pending states whose task state could not be classified as a wait.
+    pub fn pending_unknown_at_stop(&self) -> usize {
+        self.pending_unknown_at_stop
     }
 
     /// Summed off-CPU time in nanoseconds.
@@ -364,6 +382,7 @@ pub fn run(args: OffCpuArgs) -> Result<()> {
     // off-CPU event, so both must attach.
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_switch")?;
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_wakeup")?;
+    runtime::attach_tracepoint(&mut bpf, "sched", "sched_process_exit")?;
 
     let mut target_tids = runtime::take_target_map(&mut bpf)?;
     // Pending waits live in OFFCPU_START; clearing it when a target thread
@@ -391,6 +410,20 @@ pub fn run(args: OffCpuArgs) -> Result<()> {
             mode: COLLECT_OFFCPU,
         },
     )?;
+    let (pending_at_stop, pending_unknown_at_stop) = offcpu_start
+        .iter()
+        .try_fold((0usize, 0usize), |(count, unknown), entry| {
+            entry.map(|(_, pending)| {
+                (
+                    count.saturating_add(1),
+                    unknown.saturating_add(usize::from(
+                        pending.reason == fast_common::OFFCPU_REASON_UNKNOWN,
+                    )),
+                )
+            })
+        })
+        .context("failed to count pending off-CPU state at collection stop")?;
+    stats.set_pending_at_stop(pending_at_stop, pending_unknown_at_stop);
 
     // The stack maps are only needed for the report, and reading them costs
     // nothing once collection has stopped.
@@ -439,6 +472,11 @@ fn print_report(
     }
     println!("Samples: {}", stats.sample_count());
     println!("Lost: {}", stats.lost());
+    println!(
+        "Pending at stop: {} ({} unknown)",
+        stats.pending_at_stop(),
+        stats.pending_unknown_at_stop()
+    );
     println!("Total off-CPU: {}", format_ns(stats.total_ns()));
 
     let (p50, p95, p99) = stats.percentiles();
@@ -708,6 +746,14 @@ mod tests {
         s.record_lost(3);
         s.record_lost(4);
         assert_eq!(s.lost(), 7);
+    }
+
+    #[test]
+    fn records_pending_states_at_collection_stop() {
+        let mut stats = OffCpuStats::default();
+        stats.set_pending_at_stop(2, 1);
+        assert_eq!(stats.pending_at_stop(), 2);
+        assert_eq!(stats.pending_unknown_at_stop(), 1);
     }
 
     #[test]

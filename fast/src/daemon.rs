@@ -54,9 +54,10 @@ const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 /// Documented CPU budget, as a fraction of one CPU.
 ///
 /// Revised from an aspirational 2% once the recorder could measure itself.
-/// The cost is the kernel invoking six tracepoint programs on every matching
-/// event across every CPU, and it does not move when the user-space side is
-/// made cheaper: a five-fold increase in the poll interval changed the peak
+/// The cost is the kernel invoking six hot tracepoint programs on every
+/// matching scheduler/block/TCP event across every CPU, plus one cleanup
+/// program only when a target thread exits. It does not move when the user-space
+/// side is made cheaper: a five-fold increase in the poll interval changed the peak
 /// not at all. Watching the scheduler, block I/O and TCP continuously is what
 /// costs, so 2% was not reachable while watching what this recorder is
 /// specified to watch. The figure is the measured peak with headroom for a
@@ -103,6 +104,8 @@ pub struct RingEntry {
     pub io_p99_us: u64,
     /// Block I/O completions over the interval.
     pub io_samples: u64,
+    /// Target requests that could not be tracked over the interval.
+    pub io_unmatched: u64,
     /// Retransmissions over the interval.
     pub retrans: u64,
     /// Memory PSI some at the end of the interval, in percent. Absent when the
@@ -131,6 +134,7 @@ impl RingEntry {
             "cpu_percent": self.cpu_percent,
             "io_p99_us": self.io_p99_us,
             "io_samples": self.io_samples,
+            "io_unmatched": self.io_unmatched,
             "retrans": self.retrans,
             // Absent rather than zero, so a kernel without PSI is not read as
             // a machine with no memory pressure.
@@ -211,6 +215,7 @@ fn write_incident(
             "sched_samples": entry.sched_samples,
             "io_p99_us": entry.io_p99_us,
             "io_samples": entry.io_samples,
+            "io_unmatched": entry.io_unmatched,
             "retrans": entry.retrans,
             "psi_some_pct": entry.psi_some_pct,
             "psi_full_pct": entry.psi_full_pct,
@@ -445,8 +450,9 @@ fn restore_ring(output: &std::path::Path, window: Duration) -> Restored {
 /// being discarded whole.
 fn ring_entry_from_json(value: &Value) -> Option<RingEntry> {
     let number = |key: &str| value.get(key).and_then(Value::as_u64);
+    let at = Duration::try_from_secs_f64(value.get("at_s")?.as_f64()?).ok()?;
     Some(RingEntry {
-        at: Duration::from_secs_f64(value.get("at_s")?.as_f64()?),
+        at,
         sched_p95_us: number("sched_p95_us").unwrap_or(0),
         sched_samples: number("sched_samples").unwrap_or(0),
         cpu_percent: value
@@ -455,6 +461,7 @@ fn ring_entry_from_json(value: &Value) -> Option<RingEntry> {
             .unwrap_or_default(),
         io_p99_us: number("io_p99_us").unwrap_or(0),
         io_samples: number("io_samples").unwrap_or(0),
+        io_unmatched: number("io_unmatched").unwrap_or(0),
         retrans: number("retrans").unwrap_or(0),
         psi_some_pct: value
             .get("psi_some_pct")
@@ -490,6 +497,7 @@ fn diagnose_from(entry: &RingEntry, pid: u32, slow: &SlowSamples) -> Value {
         sched_samples: entry.sched_samples as usize,
         sched_p95_us: entry.sched_p95_us,
         io_samples: entry.io_samples as usize,
+        io_unmatched: entry.io_unmatched,
         io_p99_us: entry.io_p99_us,
         // The recorder knows the p99 but not how many requests crossed the
         // slow threshold, so this signal is left out rather than guessed at.
@@ -620,8 +628,8 @@ fn incident_text(entry: &RingEntry, triggers: &Triggers, diagnosis: &Value) -> S
         entry.sched_p95_us, entry.sched_samples
     ));
     text.push_str(&format!(
-        "  block I/O p99  {} us over {} completions\n",
-        entry.io_p99_us, entry.io_samples
+        "  block I/O p99  {} us over {} completions, {} unmatched\n",
+        entry.io_p99_us, entry.io_samples, entry.io_unmatched
     ));
     text.push_str(&format!("  retransmissions {}\n", entry.retrans));
     match (entry.psi_some_pct, entry.psi_full_pct) {
@@ -796,6 +804,8 @@ struct Cumulative {
     io_samples: u64,
     /// Records dropped so far.
     io_lost: u64,
+    /// Target requests that could not be tracked so far.
+    io_unmatched: u64,
     /// Retransmissions so far.
     retrans: u64,
 }
@@ -834,11 +844,13 @@ pub fn run(args: DaemonArgs) -> Result<()> {
         "/fast-ebpf"
     )))
     .context("failed to load eBPF object; run as root or grant CAP_BPF and CAP_PERFMON")?;
+    crate::io_request_layout::configure(&mut bpf)?;
     let after_object_rss = read_self_rss_bytes().unwrap_or(0);
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_wakeup")?;
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_switch")?;
-    runtime::attach_tracepoint(&mut bpf, "block", "block_rq_issue")?;
-    runtime::attach_tracepoint(&mut bpf, "block", "block_rq_complete")?;
+    runtime::attach_tracepoint(&mut bpf, "sched", "sched_process_exit")?;
+    runtime::attach_raw_tracepoint(&mut bpf, "block_rq_issue")?;
+    runtime::attach_raw_tracepoint(&mut bpf, "block_rq_complete")?;
     runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_probe")?;
     runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_retransmit_skb")?;
 
@@ -938,6 +950,7 @@ pub fn run(args: DaemonArgs) -> Result<()> {
                             "p99_us": summary.map_or(0, |s| s.p99_ns / 1_000),
                             "samples": stats.sample_count(),
                             "lost": stats.lost(),
+                            "unmatched": stats.unmatched(),
                             "slowest_us": stats
                                 .slowest_samples(SLOW_SAMPLE_COUNT)
                                 .iter()
@@ -1140,6 +1153,7 @@ fn tick(
                 current.io_p99_us = number("p99_us");
                 current.io_samples = number("samples");
                 current.io_lost = number("lost");
+                current.io_unmatched = number("unmatched");
             }
             "net" => current.retrans = number("retrans"),
             _ => {}
@@ -1198,6 +1212,7 @@ fn tick(
         cpu_percent: (target_cpu_pct - previous.target_cpu_pct).max(0.0),
         io_p99_us: current.io_p99_us,
         io_samples: current.io_samples.saturating_sub(before.io_samples),
+        io_unmatched: current.io_unmatched.saturating_sub(before.io_unmatched),
         retrans: current.retrans.saturating_sub(before.retrans),
         psi_some_pct: psi.available.then_some(psi.some_pct),
         psi_full_pct: psi.available.then_some(psi.full_pct),
@@ -1907,6 +1922,7 @@ mod tests {
             cpu_percent: 87.5,
             io_p99_us: 40,
             io_samples: 7,
+            io_unmatched: 2,
             retrans: 3,
             psi_some_pct: Some(2.5),
             psi_full_pct: None,
@@ -1917,6 +1933,35 @@ mod tests {
         };
         let restored = ring_entry_from_json(&original.to_json()).expect("round trip");
         assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn restored_intervals_ignore_invalid_timestamps_without_panicking() {
+        for timestamp in [-1.0, f64::MAX] {
+            let value = serde_json::json!({ "at_s": timestamp });
+            assert!(ring_entry_from_json(&value).is_none());
+        }
+    }
+
+    #[test]
+    fn restore_skips_invalid_timestamps_and_keeps_valid_history() {
+        let dir = temp_dir("restore_invalid_timestamps");
+        let bundle = dir.join("incident-with-bad-intervals");
+        std::fs::create_dir_all(&bundle).expect("create bundle");
+        std::fs::write(bundle.join("complete.json"), "{}").expect("write completion marker");
+        let intervals = serde_json::json!([
+            {"at_s": -1.0},
+            {"at_s": 10.0},
+            {"at_s": f64::MAX}
+        ]);
+        std::fs::write(bundle.join("intervals.json"), intervals.to_string())
+            .expect("write intervals");
+
+        let restored = restore_ring(&dir, Duration::from_secs(60));
+        assert_eq!(restored.entries.len(), 1);
+        assert_eq!(restored.entries[0].at, Duration::from_secs(10));
+        assert_eq!(restored.previous_at, Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
