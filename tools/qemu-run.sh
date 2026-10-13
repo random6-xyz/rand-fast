@@ -14,6 +14,7 @@
 #   DURATION=10s tools/qemu-run.sh    # same, via the environment
 #
 # Environment overrides:
+#   FAST       fast binary to test (default: target/release/fast)
 #   KERNEL     bzImage to boot (default: the kernel-server bpf-next build)
 #   CPUS       guest vCPU count (default 8)
 #   MEM_MB     guest memory in MiB (default 2048)
@@ -24,6 +25,7 @@
 set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+FAST=${FAST:-$ROOT/target/release/fast}
 KERNEL=${KERNEL:-/home/rand/kernel-server/build/bpf-next/arch/x86_64/boot/bzImage}
 CPUS=${CPUS:-8}
 MEM_MB=${MEM_MB:-2048}
@@ -85,7 +87,9 @@ LOG="$OUT_DIR/guest.log"
 # --- release binaries -------------------------------------------------------
 log "building release binaries"
 ( cd "$ROOT" && cargo build --release ) >/dev/null 2>&1 || die "cargo build --release failed"
-for binary in fast sched-workload fast-workload; do
+[ -x "$FAST" ] || die "fast binary is not executable: $FAST"
+log "testing fast binary $FAST"
+for binary in sched-workload fast-workload; do
     [ -x "$ROOT/target/release/$binary" ] || die "missing target/release/$binary"
 done
 
@@ -120,13 +124,14 @@ cp "$OUT_DIR/mount2" "$STAGE/bin/mount2"
 # late: the kernel needs /bin/sh to satisfy the shebang of /init itself.
 # Without this symlink the guest panics with "Failed to execute /init (-2)".
 ln -s busybox "$STAGE/bin/sh"
-for binary in fast sched-workload fast-workload; do
+cp "$FAST" "$STAGE/bin/fast"
+for binary in sched-workload fast-workload; do
     cp "$ROOT/target/release/$binary" "$STAGE/bin/$binary"
 done
 
 # The release binaries are dynamically linked against glibc; the guest has no
 # package manager, so the runtime loader and the needed libraries are staged.
-FAST_BIN="$ROOT/target/release/fast"
+FAST_BIN="$FAST"
 ldd "$FAST_BIN" > "$OUT_DIR/ldd.txt" 2>/dev/null || die "ldd failed on $FAST_BIN"
 LOADER=$(awk '/ld-linux/{print $1; exit}' "$OUT_DIR/ldd.txt")
 [ -n "$LOADER" ] || die "could not locate the dynamic loader for $FAST_BIN"

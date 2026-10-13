@@ -1,0 +1,15 @@
+# Third-party licenses
+
+This file is generated from the Cargo dependency graph for the rand-fast Linux
+x86_64 release. It lists the crates in that graph and their license texts.
+
+{{#each licenses}}
+## {{{name}}}
+
+Used by:
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}
+{{/each}}
+
+{{{text}}}
+{{/each}}
