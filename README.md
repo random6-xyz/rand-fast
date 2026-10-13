@@ -5,19 +5,60 @@ latency, CPU usage, disk I/O latency, network retransmissions, off-CPU wait
 time, and memory pressure for a single process and its threads, using Aya and
 eBPF.
 
-## Requirements
+## Install from GitHub Releases
+
+Prebuilt releases currently target Linux x86_64. Choose a version from the
+[GitHub Releases page](https://github.com/random6-xyz/rand-fast/releases/latest)
+and replace `v0.1.0` below with that release tag. The archive contains the
+`fast` executable, this README, both project license texts, and the Rust
+third-party license report.
+
+```bash
+VERSION=v0.1.0
+BASE_URL="https://github.com/random6-xyz/rand-fast/releases/download/${VERSION}"
+ARCHIVE="rand-fast-${VERSION}-linux-x86_64.tar.gz"
+
+curl --fail --location --remote-name "${BASE_URL}/${ARCHIVE}"
+curl --fail --location --remote-name "${BASE_URL}/SHA256SUMS"
+sha256sum --check SHA256SUMS
+tar -xzf "$ARCHIVE"
+cd "rand-fast-${VERSION}"
+./fast --help
+
+TARGET_PID=1234 # replace with the PID to diagnose
+sudo ./fast diagnose --pid "$TARGET_PID" --duration 10s
+```
+
+The prebuilt binary embeds the eBPF object. Running a release does not require
+Rust, `rust-src`, or `bpf-linker`; those are needed only to build from source.
+
+## Runtime requirements
 
 - BTF-enabled Linux with scheduler and TCP tracepoint layouts matching those validated on 6.12.105 and 7.2.0-rc6; startup checks reject unrecognized tracepoint or block-request BTF layouts instead of collecting potentially incorrect data
 - Kernel built with `CONFIG_BPF`, `CONFIG_BPF_SYSCALL`, `CONFIG_BPF_EVENTS`, `CONFIG_DEBUG_INFO_BTF`
 - Tracepoints under `/sys/kernel/debug/tracing/events` (or `/sys/kernel/tracing`)
-- Rust nightly with the `rust-src` component
-- `bpf-linker` (0.9.x, e.g. `LLVM_SYS_191_PREFIX=/usr/lib/llvm-19 cargo install bpf-linker --version 0.9.14`)
 - Permission to load eBPF programs and open perf events: `root`, or `CAP_BPF` + `CAP_PERFMON` (kernel 5.8+), or `CAP_SYS_ADMIN` on older kernels
-- QEMU 7.2+ with KVM (`/dev/kvm`) for verifier and privileged smoke tests without host `sudo` (uses `kernel-server` `bpf-next` `bzImage` and `~/.bpf_selftests/root.img`)
 
-The build script compiles the eBPF object with `bpfel-unknown-none` and embeds it in the userspace binary.
+## Build from source
 
-## Build
+Source builds require Rust nightly with the `rust-src` component and `bpf-linker`
+0.9.x. With LLVM 19, install the linker with:
+
+```bash
+LLVM_SYS_191_PREFIX=/usr/lib/llvm-19 cargo install bpf-linker --version 0.9.14
+```
+
+The build script compiles the eBPF object with `bpfel-unknown-none` and embeds
+it in the userspace binary.
+
+Release packaging also uses `cargo-about` 0.9.2 to generate third-party license
+notices:
+
+```bash
+cargo install cargo-about --version 0.9.2 --locked --features cli
+```
+
+### Compile
 
 ```bash
 cargo build --release
@@ -794,6 +835,17 @@ Both commands also build the eBPF object. CI must keep clippy clean with
 
 ### Privileged smoke test (QEMU, no host sudo)
 
+To test a downloaded release candidate rather than the locally built CLI, set
+`FAST` to the extracted executable. The helper builds the workload generators
+from the checkout and boots the release executable in its QEMU guest:
+
+```bash
+FAST="$PWD/rand-fast-v0.1.0/fast" tools/qemu-run.sh
+```
+
+The QEMU helper requires QEMU 7.2+ and uses the configured `bzImage` (by
+default the kernel-server `bpf-next` build). It runs without host `sudo`.
+
 Validated in QEMU (`qemu-system-x86_64 -enable-kvm -smp 8 -kernel build/bpf-next/arch/x86/boot/bzImage -drive file=~/.bpf_selftests/root.img`) with the guest running as `root`:
 
 ```bash
@@ -843,3 +895,9 @@ sudo ./target/release/fast sched --pid <TARGET_PID> --duration 10s
 All of it is available as text and as one schema of JSON. It runs on one process
 at a time; correlating several is not implemented. See
 [Known limitations](#known-limitations) for what is still not right.
+
+## License
+
+rand-fast is dual-licensed. You may use it under either the
+[MIT License](LICENSE-MIT) or the [Apache License, Version 2.0](LICENSE-APACHE).
+The release archive also includes third-party Rust dependency license texts.
