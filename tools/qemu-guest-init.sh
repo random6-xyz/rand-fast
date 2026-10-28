@@ -18,10 +18,18 @@
 # Optional virtio disk: an ext4 scratch device for the io-hog fixture
 # (tmpfs reads never reach the block_rq_* tracepoints).
 /bin/busybox --install -s /bin 2>/dev/null
+umask 022
 
 # Mount-point directories must exist before the mounts below; fresh staging
 # trees do not carry them.
 mkdir -p /proc /sys /dev /tmp /mnt/io
+# The initramfs is packed by an unprivileged user, so the staged /tmp keeps
+# that uid. The incident store trusts a sticky /tmp only when its owner is
+# root or the recorder's own user, because a sticky directory's owner can
+# still rename entries they do not own. Restore the ownership and mode a
+# normal Linux /tmp has before any daemon case runs.
+chown 0:0 /tmp
+chmod 1777 /tmp
 
 /bin/mount2 none proc /proc
 /bin/mount2 none sysfs /sys
@@ -113,7 +121,7 @@ fi
 export FAST=/bin/fast
 export SCHED_WORKLOAD=/bin/sched-workload
 export FAST_WORKLOAD=/bin/fast-workload
-export OUT_DIR=/tmp/fast-smoke
+export OUT_DIR=/fast-smoke
 export IO_HOG_PATH
 
 # The per-run collection window is passed on the kernel command line as

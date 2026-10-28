@@ -23,6 +23,10 @@
 #
 # Exit status: 0 when the guest smoke run succeeded, 1 otherwise.
 set -u
+# The guest rootfs must look like a normal Linux rootfs: the incident store
+# rejects ancestors that group/others can rewrite, and a permissive caller
+# umask would otherwise leak into every staged directory.
+umask 022
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 FAST=${FAST:-$ROOT/target/release/fast}
@@ -173,7 +177,11 @@ cp "$ROOT/tools/qemu-smoke.sh" "$STAGE/tools/qemu-smoke.sh"
 cp "$ROOT/tools/qemu-guest-init.sh" "$STAGE/init"
 
 log "packing the initramfs"
-( cd "$STAGE" && find . | cpio -o -H newc 2>/dev/null | gzip -1 ) > "$INITRAMFS" \
+# The initramfs is packed by an unprivileged user, but the guest runs as
+# root on a root-owned rootfs. Without --owner the archive preserves the
+# host uid, and the incident store correctly refuses to write under an
+# ancestor that belongs to a different unprivileged user.
+( cd "$STAGE" && find . | cpio -o -H newc --owner=0:0 2>/dev/null | gzip -1 ) > "$INITRAMFS" \
     || die "failed to pack the initramfs"
 
 # --- boot -------------------------------------------------------------------

@@ -439,8 +439,17 @@ which is what makes the interval length cancel out.
 
 ```bash
 sudo ./target/release/fast daemon --pid 1234 --duration 300s \
-    --interval 1s --window 120s --output ./incidents
+    --interval 1s --window 120s
 ```
+
+For root, the default output is `/var/lib/rand-fast/incidents`, independent of
+current directory and `HOME`. For non-root, it is
+`$HOME/.local/state/rand-fast/incidents` when `HOME` is absolute, otherwise
+`/tmp/rand-fast-UID/incidents`. An explicit `--output` must have trusted owners
+and permissions and no symlink path components; a root recorder rejects a
+relative output under a normal user's home. Existing `./incidents` directories
+can be retained as archives. See [incident output migration](fast/INCIDENT-MIGRATION.md)
+for the trust requirements, migration steps, and restore implications.
 
 #### Triggers
 
@@ -485,13 +494,14 @@ each threshold the measurement went.
 Each incident is a directory, named so that `ls` is a timeline:
 
 ```text
-incidents/incident-10s_43ms_42us_561ns/
+incidents/incident-000000010000s/
+  .rand-fast-incident ownership marker for rotation
   manifest.json       what tripped it, the measured value, the threshold, the unit
   intervals.json      the rolling window that led up to it
   slow-samples.json   the slowest latencies themselves, longest first
   diagnosis.json      the ranking fast diagnose uses, plus what it did not collect
   summary.txt         the same, without a JSON parser
-  complete.json       written last: a bundle is complete or absent, never partial
+  complete.json       written last to mark a complete bundle
 ```
 
 `slow-samples.json` holds the measurements rather than the percentiles that
@@ -514,11 +524,14 @@ window does not read as though time ran backwards. Restored entries carry no
 trigger record, because that incident has already been written.
 
 `--max-disk-bytes` (default `512m`) is checked after every incident rather than
-on a timer, because the thing that fills a directory is incidents and a recorder
-that is not firing is not filling anything. The oldest bundles go first.
+on a timer. Eligible marked bundles are removed oldest first; legacy bundles
+and unrelated data are retained. Countable regular files, including preserved
+data, count toward the cap. The cap is not a hard guarantee: unreadable data,
+symlinks, special files, or deletion failures can make the total unknown, and
+preserved data can leave it over the cap. The recorder warns when the total
+cannot be verified or remains over the cap.
 
-The directory stays within the cap. Two decisions make that true rather than
-nearly true:
+Two decisions limit how much space the recorder needs:
 
 - **A bundle is a bounded size.** The ring holds as many intervals as `--window`
   asks for, but a bundle carries at most 60 — the most recent, which is the run-up
@@ -532,10 +545,9 @@ nearly true:
   incident it was called to save leaves a recorder that reports incidents and
   stores none.
 
-The one incident is the floor, so the cap has to leave room for it. If it does
-not, the recorder says so on stderr for every incident rather than absorbing the
-overage quietly, because only the operator can decide whether to widen the cap,
-narrow the window, or accept it.
+The current incident and any preserved data can together exceed the cap. The
+operator can archive or remove verified old data, widen the cap, narrow the
+window, or accept the overage.
 
 #### What a restart recovers
 
@@ -543,9 +555,8 @@ narrow the window, or accept it.
 timeline, so the window does not read as though time ran backwards. Two
 properties that are easy to get wrong and are both tested:
 
-- Only the newest bundle is read. Older ones are there to be rotated away, and
-  stitching several together would produce a window with gaps in it that look
-  exactly like a quiet machine.
+- Only the newest complete readable bundle is read. Stitching several together
+  would produce a window with gaps in it that look exactly like a quiet machine.
 - Bundle names sort in time order, because rotation deletes the oldest first and
   a restart recovers from the newest. The stamp is a zero-padded millisecond
   count, not a formatted duration: `10s` sorts after `2s`, which would make a
@@ -657,11 +668,11 @@ papered over in the tool:
   reachable. The budget now covers the ongoing recording, and the fixed cost
   is reported beside it. This is stated rather than worked around because it is
   a property of the loader, not of this tool.
-- A single incident is never deleted to satisfy `--max-disk-bytes`, so a cap
-  below one incident's size cannot be honoured. The recorder reports the overage
-  on stderr every time rather than losing the incident. With a cap above one
-  incident the directory does stay within it, which the QEMU run checks with the
-  recorder killed mid-write: 20 bundles, 256441 bytes, under a 262144-byte cap.
+- The current incident and unrelated or legacy data are never deleted to
+  satisfy `--max-disk-bytes`, so the cap can be exceeded. The recorder warns if
+  it remains exceeded or cannot be verified. One earlier QEMU storage run with
+  a 262144-byte cap held 20 bundles and 256441 bytes after a mid-write kill;
+  that result is not a guarantee for other output directories.
 - A bundle carries at most the 60 most recent intervals, not the whole ring
   window. A restart therefore restores 60 intervals and the live ring refills
   from the next tick, so a very wide `--window` costs the bundle's history

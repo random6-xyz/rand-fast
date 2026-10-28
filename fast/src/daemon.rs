@@ -20,6 +20,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "daemon_storage.rs"]
+mod storage;
 use anyhow::{Context, Result};
 use aya::{Ebpf, include_bytes_aligned};
 use fast_common::{
@@ -171,9 +173,8 @@ fn write_incident(
     args: &DaemonArgs,
     slow: &SlowSamples,
 ) -> Result<IncidentWrite> {
-    let directory = incident_dir(&args.output, entry.at)?;
-    fs::create_dir_all(&directory)
-        .with_context(|| format!("create incident directory {}", directory.display()))?;
+    let output = storage::Output::open(&args.output)?;
+    let directory = output.create(&stamp(entry.at))?;
 
     // The most recent intervals, not all of them: see BUNDLE_MAX_INTERVALS.
     // Taken from the end, because the newest is what leads to the trigger.
@@ -228,15 +229,15 @@ fn write_incident(
             "recorder_memory_bytes": entry.memory_bytes,
         },
     });
-    write_json(&directory.join("manifest.json"), &manifest)?;
+    directory.json("manifest.json", &manifest)?;
 
     let intervals: Vec<Value> = ring
         .entries()
         .skip(total_entries - carried)
         .map(RingEntry::to_json)
         .collect();
-    write_json(&directory.join("intervals.json"), &Value::Array(intervals))?;
-    write_json(&directory.join("slow-samples.json"), &slow.to_json())?;
+    directory.json("intervals.json", &Value::Array(intervals))?;
+    directory.json("slow-samples.json", &slow.to_json())?;
 
     // The diagnosis is the same ranking `fast diagnose` prints, fed with what
     // the recorder has measured. It is not a second, weaker copy of that
@@ -244,16 +245,13 @@ fn write_incident(
     // uncollected, so "no lock contention found" cannot be read as "lock
     // contention was looked for and not found".
     let diagnosis = diagnose_from(&entry, args.pid, slow);
-    write_json(&directory.join("diagnosis.json"), &diagnosis)?;
-    write_text(
-        &directory.join("summary.txt"),
-        &incident_text(&entry, triggers, &diagnosis),
-    )?;
+    directory.json("diagnosis.json", &diagnosis)?;
+    directory.write("summary.txt", &incident_text(&entry, triggers, &diagnosis))?;
 
     // Written last, and on its own, so a bundle is either complete or absent
     // rather than a directory that looks finished and is not.
-    write_json(
-        &directory.join("complete.json"),
+    directory.json(
+        "complete.json",
         &serde_json::json!({
             "schema": crate::json::SCHEMA,
             "files": [
@@ -265,16 +263,21 @@ fn write_incident(
             ],
         }),
     )?;
-    let rotation_error = match rotate(&args.output, args.max_disk_bytes, &directory) {
-        Ok(Some(total)) => {
-            eprintln!(
-                "warning: incident directory holds {total} bytes, over the {} byte cap; a single incident is {} bytes and is never deleted",
-                args.max_disk_bytes,
-                directory_size(&directory).unwrap_or(0)
-            );
+    let rotation_error = match output.rotate(args.max_disk_bytes, directory.name()) {
+        Ok(state) => {
+            if state.unknown {
+                eprintln!(
+                    "warning: incident output size cannot be fully verified; the {} byte cap may be exceeded (counted regular file bytes: {})",
+                    args.max_disk_bytes, state.total
+                );
+            } else if state.total > args.max_disk_bytes {
+                eprintln!(
+                    "warning: incident output holds {} regular file bytes, over the {} byte cap; the current incident and unrecognized data are retained",
+                    state.total, args.max_disk_bytes
+                );
+            }
             None
         }
-        Ok(None) => None,
         Err(error) => Some(error),
     };
     Ok(IncidentWrite { rotation_error })
@@ -301,90 +304,24 @@ impl SlowSamples {
     }
 }
 
-/// Deletes the oldest bundles until the output directory fits its budget.
-///
-/// Called after every incident rather than on a timer, because the thing that
-/// fills a directory is incidents, and a recorder that is not firing is not
-/// filling anything. Oldest first, because the newest bundle is the one being
-/// written and the least likely to be superseded.
-///
-/// A partial bundle is removed along with a complete one: a directory left
-/// behind by a recorder that was killed mid-write is dead weight, and the
-/// `complete.json` marker is what tells the two apart.
-///
-/// A single incident is never deleted to satisfy the cap, so the cap is a soft
-/// ceiling with a floor of one incident's size.
-///
-/// Work is bounded even if the output directory is externally modified.
-/// A scan or removal failure disables further incident writes, while the
-/// in-memory recorder continues and reports the error.
-const MAX_ROTATION_ENTRIES: usize = 8192;
-const MAX_BUNDLE_FILES: usize = 64;
-const MAX_RESTORE_BYTES: u64 = 1024 * 1024;
-
-fn rotate(
-    output: &std::path::Path,
-    max_bytes: u64,
-    just_written: &std::path::Path,
-) -> Result<Option<u64>> {
-    let entries =
-        std::fs::read_dir(output).with_context(|| format!("scan {}", output.display()))?;
-    let mut bundles = Vec::new();
-    let mut entry_count = 0usize;
-    for (index, entry) in entries.enumerate() {
-        if index >= MAX_ROTATION_ENTRIES {
-            anyhow::bail!("incident rotation exceeds {MAX_ROTATION_ENTRIES} directory entries");
-        }
-        entry_count += 1;
-        let path = entry.context("read incident directory entry")?.path();
-        if path.is_dir() {
-            bundles.push(path);
-        }
-    }
-    bundles.sort();
-
-    let mut total = 0u64;
-    for path in &bundles {
-        let size = directory_size(path).with_context(|| {
-            format!("cannot bound or read incident directory {}", path.display())
-        })?;
-        total = total.saturating_add(size);
-    }
-    for bundle in bundles {
-        if total <= max_bytes && entry_count < MAX_ROTATION_ENTRIES {
-            break;
-        }
-        // The bundle that was just written is never removed. A cap exists to
-        // keep a recorder from filling a disk, and a version that deletes the
-        // incident it was called to save leaves a recorder that reports
-        // incidents and stores none, which is worse than a directory slightly
-        // over budget. The floor is therefore one incident, and BUNDLE_MAX_
-        // INTERVALS is what keeps that incident small enough for the cap to
-        // still mean something. When the cap is below that floor, the returned
-        // value says so instead of the recorder absorbing the overage quietly.
-        if bundle == just_written {
-            continue;
-        }
-        let size =
-            directory_size(&bundle).with_context(|| format!("cannot read {}", bundle.display()))?;
-        fs::remove_dir_all(&bundle).with_context(|| format!("remove {}", bundle.display()))?;
-        total = total.saturating_sub(size);
-        entry_count -= 1;
-    }
-    if entry_count >= MAX_ROTATION_ENTRIES {
-        anyhow::bail!("incident rotation cannot make room below {MAX_ROTATION_ENTRIES} entries");
-    }
-    Ok((total > max_bytes).then_some(total))
-}
-
-/// Sum of the regular files under every bundle in the output directory.
 #[cfg(test)]
 fn directory_total(dir: &std::path::Path) -> Option<u64> {
-    let mut total = 0;
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        total += directory_size(&entry.path())?;
+    fn size(dir: &std::path::Path) -> Option<u64> {
+        let mut total = 0;
+        for entry in fs::read_dir(dir).ok()? {
+            let entry = entry.ok()?;
+            let m = entry.metadata().ok()?;
+            total += if m.is_dir() {
+                size(&entry.path())?
+            } else if m.is_file() {
+                m.len()
+            } else {
+                0
+            };
+        }
+        Some(total)
     }
-    Some(total)
+    size(dir)
 }
 
 /// A byte count in the largest unit that leaves the number readable.
@@ -403,25 +340,6 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-/// Total size of the regular files under a directory.
-fn directory_size(path: &std::path::Path) -> Option<u64> {
-    let mut total = 0u64;
-    for (index, entry) in std::fs::read_dir(path).ok()?.enumerate() {
-        if index >= MAX_BUNDLE_FILES {
-            return None;
-        }
-        let entry = entry.ok()?;
-        if !entry.file_type().ok()?.is_file() {
-            return None;
-        }
-        let metadata = entry.metadata().ok()?;
-        if metadata.is_file() {
-            total = total.saturating_add(metadata.len());
-        }
-    }
-    Some(total)
-}
-
 /// Reads the rolling window back from the most recent bundle on disk.
 ///
 /// A recorder that restarts is least useful immediately after whatever made it
@@ -433,37 +351,21 @@ fn directory_size(path: &std::path::Path) -> Option<u64> {
 /// stitching several together would produce a window with gaps in it that look
 /// exactly like a quiet machine.
 ///
+/// History is read with a hard byte bound, so a corrupted or hostile bundle
+/// cannot make the recorder allocate without limit.
+const MAX_RESTORE_BYTES: u64 = 1024 * 1024;
+
 /// A bundle that cannot be read is skipped rather than fatal: a recorder must
 /// start even when the disk it is about to write to is in a strange state, and
 /// a missing history is a far smaller problem than a recorder that will not
 /// run.
 fn restore_ring(output: &std::path::Path, window: Duration) -> Restored {
-    let newest = match std::fs::read_dir(output) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.is_dir() && path.join("complete.json").is_file())
-            .max(),
-        Err(_) => None,
-    };
-    let Some(newest) = newest else {
+    let Ok(output) = storage::Output::open(output) else {
         return Restored::default();
     };
-    let Ok(file) = fs::File::open(newest.join("intervals.json")) else {
+    let Ok(Some(text)) = output.read_latest(MAX_RESTORE_BYTES) else {
         return Restored::default();
     };
-    let mut text = String::new();
-    if file
-        .take(MAX_RESTORE_BYTES + 1)
-        .read_to_string(&mut text)
-        .is_err()
-        || text.len() as u64 > MAX_RESTORE_BYTES
-    {
-        eprintln!(
-            "warning: restored interval history is unreadable or exceeds {MAX_RESTORE_BYTES} bytes"
-        );
-        return Restored::default();
-    }
     let Ok(Value::Array(entries)) = serde_json::from_str::<Value>(&text) else {
         return Restored::default();
     };
@@ -615,25 +517,6 @@ fn diagnose_from(entry: &RingEntry, pid: u32, slow: &SlowSamples) -> Value {
 fn stamp(at: Duration) -> String {
     format!("{:012}s", at.as_millis())
 }
-fn incident_dir(output: &std::path::Path, at: Duration) -> Result<std::path::PathBuf> {
-    let base = output.join(format!("incident-{}", stamp(at)));
-    let mut candidate = base.clone();
-    let mut suffix = 2;
-    while candidate.exists() {
-        candidate = base.with_file_name(format!(
-            "{}-{suffix}",
-            base.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("incident")
-        ));
-        suffix += 1;
-        if suffix > 1000 {
-            return Err(anyhow::anyhow!("too many incidents within one second"));
-        }
-    }
-    Ok(candidate)
-}
-
 /// The measurement a signal fired on, in the signal's own unit.
 impl RingEntry {
     fn measured(&self, signal: Signal) -> Option<f64> {
@@ -718,15 +601,6 @@ fn incident_text(entry: &RingEntry, triggers: &Triggers, diagnosis: &Value) -> S
         entry.memory_bytes / 1024
     ));
     text
-}
-
-fn write_json(path: &std::path::Path, value: &Value) -> Result<()> {
-    let text = serde_json::to_string_pretty(value).context("render incident JSON")?;
-    write_text(path, &text)
-}
-
-fn write_text(path: &std::path::Path, text: &str) -> Result<()> {
-    fs::write(path, text).with_context(|| format!("write {}", path.display()))
 }
 
 /// The recorder's own resource use, read from `/proc/self`.
@@ -1032,6 +906,12 @@ struct PreviousTick {
 }
 
 pub fn run(args: DaemonArgs) -> Result<()> {
+    storage::Output::open(&args.output).with_context(|| {
+        format!(
+            "unsafe incident output {}; use a trusted directory (see fast/INCIDENT-MIGRATION.md)",
+            args.output.display()
+        )
+    })?;
     // Read before anything else happens, so the report can separate the
     // program's own footprint from what setting the recording up costs. A
     // budget that counts the interpreter's own text is not a budget anyone can
@@ -2138,6 +2018,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fast-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create scratch dir");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         dir
     }
 
@@ -2460,6 +2342,8 @@ mod tests {
         let size = directory_total(dir).expect("size");
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("recreate scratch dir");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
         size
     }
 
@@ -2512,6 +2396,8 @@ mod tests {
         let dir = temp_dir("restore_invalid_timestamps");
         let bundle = dir.join("incident-with-bad-intervals");
         std::fs::create_dir_all(&bundle).expect("create bundle");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&bundle, fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(bundle.join("complete.json"), "{}").expect("write completion marker");
         let intervals = serde_json::json!([
             {"at_s": -1.0},
