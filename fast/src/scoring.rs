@@ -26,7 +26,7 @@
 //! | Scheduler latency | runnable-to-running p95 | run-queue wait |
 //! | Disk I/O | completion p99 against the slow threshold | slow completions |
 //! | Lock contention | futex share of off-CPU time | waiting on a futex |
-//! | Network | retransmission ratio | lost segments |
+//! | Network | socket wait share | off-CPU time waiting on sockets |
 //! | Memory | major faults, reclaim, PSI, swap growth | memory pressure |
 
 use crate::{diagnose::Evidence, memory::Verdict as MemoryVerdict};
@@ -61,10 +61,6 @@ pub mod threshold {
     /// than ordinary sleeping. A third is the point where waiting on other
     /// threads stops being incidental.
     pub const FUTEX_SHARE: f64 = 0.33;
-
-    /// Retransmission ratio that counts as a network problem. One segment in
-    /// fifty is well above a healthy path and low enough to catch a lossy one.
-    pub const RETRANS_RATIO: f64 = 0.02;
 
     /// Share of off-CPU time spent blocked on a socket that counts as a network
     /// problem. Half the time is deliberate: past that the process is waiting on
@@ -245,37 +241,23 @@ fn score_lock(evidence: &Evidence) -> Option<Severity> {
     })
 }
 
-/// Scores packet loss.
+/// Scores socket waiting; retransmission counts have no valid rate denominator.
 fn score_network(evidence: &Evidence) -> Option<Severity> {
-    if evidence.net_samples == 0 && evidence.offcpu_samples == 0 {
+    if evidence.offcpu_samples == 0 {
         return None;
-    }
-    let ratio = evidence.retrans_ratio.clamp(0.0, 1.0);
-    let loss = ramp(ratio, 0.0, threshold::RETRANS_RATIO * 10.0);
-    // A process blocked on a socket is a network problem whether or not a
-    // segment was lost, so the wait share counts alongside the loss.
-    let wait = wait_severity(
-        evidence.offcpu_network_ratio,
-        threshold::NETWORK_WAIT_SHARE,
-        evidence,
-    );
-    let mut detail = format!(
-        "{:.2}% of {} TCP events retransmitted, threshold {:.2}%",
-        ratio * 100.0,
-        evidence.net_samples,
-        threshold::RETRANS_RATIO * 100.0
-    );
-    if evidence.offcpu_samples > 0 {
-        detail.push_str(&format!(
-            ", {:.0}% of {} us off-CPU waiting on a socket",
-            evidence.offcpu_network_ratio.clamp(0.0, 1.0) * 100.0,
-            evidence.offcpu_total_us
-        ));
     }
     Some(Severity {
         cause: "Network",
-        severity: loss.max(wait),
-        evidence: detail,
+        severity: wait_severity(
+            evidence.offcpu_network_ratio,
+            threshold::NETWORK_WAIT_SHARE,
+            evidence,
+        ),
+        evidence: format!(
+            "{:.0}% of {} us off-CPU waiting on a socket; retransmission rate unavailable (transmitted segment count not collected)",
+            evidence.offcpu_network_ratio.clamp(0.0, 1.0) * 100.0,
+            evidence.offcpu_total_us
+        ),
     })
 }
 
@@ -535,14 +517,27 @@ mod tests {
     }
 
     #[test]
-    fn a_lossy_link_ranks_network_first() {
+    fn retransmissions_alone_do_not_rank_network_but_socket_waits_do() {
         let evidence = Evidence {
             net_samples: 20_000,
-            retrans_ratio: 0.08,
+            retransmissions: 20_000,
             ..idle()
+        };
+        assert!(score(&evidence).is_empty());
+        let evidence = Evidence {
+            offcpu_samples: 10_000,
+            offcpu_total_us: 1_000_000,
+            offcpu_network_ratio: 0.8,
+            ..evidence
         };
         let ranked = score(&evidence);
         assert_eq!(ranked[0].cause, "Network");
+        assert!(
+            ranked[0]
+                .evidence
+                .iter()
+                .any(|item| item.contains("rate unavailable"))
+        );
     }
 
     #[test]
@@ -638,7 +633,7 @@ mod tests {
             offcpu_total_us: 800_000,
             offcpu_futex_ratio: 0.7,
             net_samples: 10_000,
-            retrans_ratio: 0.05,
+            retransmissions: 500,
             major_faults_per_s: 5.0,
             minor_faults_per_s: 2_000.0,
             psi_available: true,
@@ -840,7 +835,6 @@ mod tests {
         // comparisons are runtime checks rather than folded-away constants.
         let bounds: Vec<(f64, f64)> = vec![
             (threshold::FUTEX_SHARE, 1.0),
-            (threshold::RETRANS_RATIO, 1.0),
             (threshold::CPU_BUSY_SHARE, 1.0),
             (threshold::NETWORK_WAIT_SHARE, 1.0),
             (threshold::IO_WAIT_SHARE, 1.0),

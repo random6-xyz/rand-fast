@@ -73,20 +73,6 @@ impl Endpoint {
         }
     }
 
-    /// Total number of observed segments: RTT samples plus retransmissions.
-    pub fn segments(&self) -> u64 {
-        self.rtts.len() as u64 + self.retrans
-    }
-
-    /// Retransmissions as a fraction of observed segments, from 0.0 to 1.0.
-    pub fn retrans_ratio(&self) -> f64 {
-        let total = self.segments();
-        if total == 0 {
-            return 0.0;
-        }
-        self.retrans as f64 / total as f64
-    }
-
     /// p50, p95 and p99 of this endpoint's RTT samples, in microseconds.
     pub fn rtt_percentiles(&self) -> (u32, u32, u32) {
         crate::stats::percentiles_us(&self.rtts)
@@ -278,23 +264,22 @@ pub fn run(args: NetArgs) -> Result<()> {
 
         // The table leads with the slowest endpoint so the connection worth
         // looking at is the first thing on screen. All latencies are in
-        // microseconds, and the ratio is retransmissions over observed segments.
+        // microseconds. Transmitted segment counts are not collected.
         println!(
             "Slow endpoints by RTT p95 ({} of {} shown)",
             ranked.len().min(MAX_REPORTED_ENDPOINTS),
             ranked.len()
         );
         println!(
-            "  {:>8} {:>8} {:>8} {:>8} {:>8} {:>7}  endpoint",
-            "p95", "p50", "p99", "samples", "retrans", "ratio"
+            "  {:>8} {:>8} {:>8} {:>8} {:>8}  endpoint",
+            "p95", "p50", "p99", "samples", "retrans"
         );
         for endpoint in ranked.iter().take(MAX_REPORTED_ENDPOINTS) {
             let (p50, p95, p99) = endpoint.rtt_percentiles();
             println!(
-                "  {p95:>8} {p50:>8} {p99:>8} {:>8} {:>8} {:>6.1}%  {}",
+                "  {p95:>8} {p50:>8} {p99:>8} {:>8} {:>8}  {}",
                 endpoint.rtts.len(),
                 endpoint.retrans,
-                endpoint.retrans_ratio() * 100.0,
                 format_endpoint(endpoint),
             );
         }
@@ -313,14 +298,8 @@ pub fn run(args: NetArgs) -> Result<()> {
         println!("Slowest endpoint");
         println!("  {} us p95", worst_p95);
         println!("  {}", format_endpoint(worst));
-        if worst.retrans > 0 {
-            println!(
-                "  {} retransmissions, {:.1}% of {} observed segments",
-                worst.retrans,
-                worst.retrans_ratio() * 100.0,
-                worst.segments()
-            );
-        }
+        println!("  {} retransmissions", worst.retrans);
+        println!("  retransmission rate unavailable (transmitted segment count not collected)");
         // A closed congestion window with retransmissions on top is what a
         // struggling path looks like, so both are always named here.
         println!(
@@ -428,33 +407,40 @@ mod tests {
     }
 
     #[test]
-    fn computes_retrans_ratio() {
-        let mut s = NetStats::default();
-        for _ in 0..3 {
-            s.record(probe(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 1), 100));
+    fn network_json_keeps_counts_and_unavailable_rate_for_mixed_events() {
+        let mut stats = NetStats::default();
+        let src = v4(127, 0, 0, 1);
+        let zero = v4(10, 0, 0, 1);
+        let retrans_only = v4(10, 0, 0, 2);
+        let mixed = v4(10, 0, 0, 3);
+        stats.record(probe(AF_INET, src, zero, 0));
+        stats.record(retrans(AF_INET, src, retrans_only));
+        stats.record(probe(AF_INET, src, mixed, 100));
+        stats.record(probe(AF_INET, src, mixed, 0));
+        stats.record(retrans(AF_INET, src, mixed));
+        let json = serde_json::to_value(crate::json_payloads::network_json(&stats)).unwrap();
+        assert_eq!(json["samples"], 3);
+        assert_eq!(json["retransmissions"], 2);
+        let rows = json["endpoints"].as_array().unwrap();
+        assert_eq!(rows[0]["destination"], "10.0.0.3");
+        for row in rows {
+            assert_eq!(row.get("retrans_ratio"), Some(&serde_json::Value::Null));
+            match row["destination"].as_str().unwrap() {
+                "10.0.0.1" => {
+                    assert_eq!(row["samples"], 0);
+                    assert_eq!(row["retransmissions"], 0);
+                }
+                "10.0.0.2" => {
+                    assert_eq!(row["samples"], 0);
+                    assert_eq!(row["retransmissions"], 1);
+                }
+                "10.0.0.3" => {
+                    assert_eq!(row["samples"], 1);
+                    assert_eq!(row["retransmissions"], 1);
+                }
+                _ => panic!("unexpected endpoint"),
+            }
         }
-        s.record(retrans(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 1)));
-
-        let endpoint = &s.slowest_endpoints()[0];
-        assert_eq!(endpoint.segments(), 4);
-        assert!((endpoint.retrans_ratio() - 0.25).abs() < 1e-9);
-    }
-
-    #[test]
-    fn retrans_ratio_is_zero_without_segments() {
-        let endpoint = Endpoint {
-            family: AF_INET,
-            saddr: v4(127, 0, 0, 1),
-            daddr: v4(10, 0, 0, 1),
-            sport: 1,
-            dport: 2,
-            rtts: Vec::new(),
-            retrans: 0,
-            max_cwnd: 0,
-            max_rcv_wnd: 0,
-        };
-        assert_eq!(endpoint.segments(), 0);
-        assert_eq!(endpoint.retrans_ratio(), 0.0);
     }
 
     #[test]

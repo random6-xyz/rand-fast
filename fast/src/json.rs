@@ -25,8 +25,9 @@
 //!   readability; JSON does not, because a consumer should never have to parse
 //!   "1.5 ms".
 //! - All byte counts are bytes, named with a `_bytes` suffix.
-//! - In v1, optional fields are absent rather than null when unknown. Daemon
-//!   v2 interval CPU usage is an exception: it is null when unavailable.
+//! - In v1, optional fields are absent rather than null when unknown. In v2,
+//!   unavailable measurements are explicitly null: daemon interval CPU usage,
+//!   and `net`/`diagnose` retransmission ratios (no transmitted segment count).
 //! - `lost_events` is present on every eBPF-backed command, so a consumer can
 //!   decide how far to trust the rest.
 //!
@@ -35,7 +36,9 @@
 //! The `schema` field is the contract. Within a major version, fields are only
 //! added, never removed or retyped; a breaking change bumps the number. A
 //! consumer should ignore fields it does not recognise, which is what makes
-//! adding one safe.
+//! adding one safe. `net` and `diagnose` use v2 because the invalid v1
+//! retransmission ratio is now null instead of a number. Other commands remain
+//! on v1. Consumers must dispatch on both schema and command.
 
 use std::time::Duration;
 
@@ -43,6 +46,9 @@ use serde::Serialize;
 
 /// The default schema identifier for v1 JSON documents.
 pub const SCHEMA: &str = "rand-fast/v1";
+
+/// Schema for reports whose retransmission ratio was corrected.
+pub const NETWORK_SCHEMA: &str = "rand-fast/v2";
 
 /// The output format a command was asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -91,7 +97,11 @@ impl<T: Serialize> Envelope<T> {
         data: T,
     ) -> Self {
         Self {
-            schema: SCHEMA,
+            schema: if matches!(command, "net" | "diagnose") {
+                NETWORK_SCHEMA
+            } else {
+                SCHEMA
+            },
             command,
             pid,
             process,
@@ -341,6 +351,18 @@ mod schema_tests {
                 .unwrap_or_else(|| panic!("missing field {name} in {document}"));
         }
         current
+    }
+
+    #[test]
+    fn corrected_network_reports_use_v2_without_changing_other_commands() {
+        for (command, schema) in [
+            ("net", NETWORK_SCHEMA),
+            ("diagnose", NETWORK_SCHEMA),
+            ("sched", SCHEMA),
+        ] {
+            let envelope = Envelope::new(command, 1, None, Duration::ZERO, false, false, ());
+            assert_eq!(envelope.schema, schema);
+        }
     }
 
     #[test]

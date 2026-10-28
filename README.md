@@ -78,15 +78,15 @@ while the collection runs; the report is printed when the collection ends or
 the process exits.
 
 Every subcommand also accepts `--format json` and prints one line of JSON.
-`daemon` uses `rand-fast/v2`; the other commands use `rand-fast/v1`. See
-[JSON output](#json-output).
+`net`, `diagnose`, and `daemon` use `rand-fast/v2`; the other commands use
+`rand-fast/v1`. See [JSON output](#json-output).
 
 | Subcommand  | Measures                                   | State |
 | ----------- | ------------------------------------------ | ----- |
 | `sched`     | runnable → running scheduler latency       | measured |
 | `cpu`       | CPU usage and on-CPU hot stacks            | measured, symbolized top stacks |
 | `io`        | block I/O latency                          | measured, per-device latency with op split |
-| `net`       | TCP RTT, retransmissions, endpoint ranking | measured from `tcp_probe`, attributed by socket |
+| `net`       | TCP RTT, retransmissions, endpoint ranking | measured from TCP tracepoints, attributed by socket |
 | `off-cpu`   | off-CPU wait time                          | measured, blocking stack captured at switch-out, symbolized |
 | `memory`    | page faults, direct reclaim, PSI, swap     | measured from eBPF counters and `/proc` |
 | `diagnose`  | ranked likely causes                       | measured, from one eBPF load with every signal in parallel |
@@ -272,13 +272,25 @@ Sample output (target transferring through a closing receive window):
 ```text
 PID: fast-workload (1030)
 Duration: 5s
-TCP events: 412
-Retransmitted: 4 (1.0% of segments seen)
+Samples: 408
+Retransmissions: 4
+Lost events: 0
 
-Endpoints, ranked by p95 round trip
-  127.0.0.1:41882 -> 127.0.0.1:8080   p95  31476us  median     1198us  retrans 2
-  127.0.0.1:41884 -> 127.0.0.1:8080   p95  31011us  median     1196us  retrans 2
+Slow endpoints by RTT p95 (2 of 2 shown)
+       p95      p50      p99  samples  retrans  endpoint
+     31476     1198    32000      204        2  127.0.0.1:41882 -> 127.0.0.1:8080
+     31011     1196    31500      204        2  127.0.0.1:41884 -> 127.0.0.1:8080
+
+Slowest endpoint
+  31476 us p95
+  127.0.0.1:41882 -> 127.0.0.1:8080
+  2 retransmissions
+  retransmission rate unavailable (transmitted segment count not collected)
+  congestion window 10 segments, receive window 65535 bytes
 ```
+
+The retransmission count is not a rate: receive probe events do not count
+transmitted segments, and the transmitted segment count is not collected.
 
 Verification, from the recorded QEMU run:
 
@@ -410,8 +422,8 @@ Duration: 4s
 Measured
   scheduler: 138826 samples, p95 500 us
   cpu: 2657 samples, 88.3% of one CPU
-  block io: 0 completions, p99 0 us, 0 over the slow threshold
-  tcp: 0 events, 0.00% retransmitted
+  block io: 0 completions, 0 unmatched, p99 0 us, 0 over the slow threshold
+  tcp: 0 events, 0 retransmissions; retransmission rate unavailable (transmitted segment count not collected)
   off-cpu: 138133 waits, p95 12 us, 1457536 us total, 100% of it on a futex
   memory: 42 minor and 0.0 major faults/s, 0.0 direct reclaims/s
   memory psi: unavailable (kernel built without CONFIG_PSI)
@@ -425,7 +437,9 @@ Ranked causes
 Every ranked line carries the measurement behind it and the threshold it
 crossed, so a ranking can be argued with. The thresholds live in one place
 rather than being scattered through the scoring, which is what makes them
-readable enough to argue with.
+readable enough to argue with. Network scoring uses sufficiently sampled
+socket waits, not retransmission counts or the unavailable retransmission
+rate. Retransmissions alone cannot establish a Network ranking.
 
 Verification: five scenarios, each with exactly one thing wrong, each checked
 by reading the first entry of the causes array from real JSON. See
@@ -764,11 +778,12 @@ run shows the expected signal delta.
 ## JSON output
 
 Every subcommand takes `--format json` and prints a single line of JSON, so the
-output can be piped into a tool that reads lines without a wrapper. Commands
-other than `daemon` use `rand-fast/v1`, for example:
+output can be piped into a tool that reads lines without a wrapper. The
+`net`, `diagnose`, and `daemon` commands use `rand-fast/v2`; other commands use
+`rand-fast/v1`. For example:
 
 ```json
-{"schema":"rand-fast/v1","command":"diagnose","pid":691,"process":"sched-workload","duration_s":4.0,"interrupted":false,"process_exited":false,"data":{...}}
+{"schema":"rand-fast/v2","command":"diagnose","pid":691,"process":"sched-workload","duration_s":4.0,"interrupted":false,"process_exited":false,"data":{...}}
 ```
 
 `daemon` uses `rand-fast/v2`, with the same envelope shape. Its
@@ -786,9 +801,17 @@ Two rules the documents follow:
 - **Units are in the field names.** `sched_p95_us`, `io_p99_us`,
   `retrans`, `psi_some_pct`, `recorder_memory_bytes`. A number without a unit is
   a number nobody can check.
-- **A measurement that was not taken is not zero.** For example, unavailable
-  daemon interval CPU usage is `null`, not zero; consumers must distinguish the
-  two. Other optional fields may be absent when unavailable.
+- **A measurement that was not taken is not zero.** Unavailable daemon
+  interval CPU usage is `null`, not zero. A kernel without `CONFIG_PSI` omits
+  the daemon interval's `psi_some_pct` rather than reporting zero pressure. The
+  v2 `net` endpoint and `diagnose` measured `retrans_ratio` fields are
+  explicitly `null`: transmitted segment counts are unavailable. `null` must
+  not be interpreted as zero.
+
+The previous v1 retransmission ratio was invalid; consumers should dispatch on
+both schema and command and update their parsers. See the
+[network v2 migration guide](docs/network-v2-migration.md) and the
+[daemon v2 migration guide](docs/daemon-json-v2.md) for details.
 
 ```bash
 sudo ./target/release/fast diagnose --pid 1234 --duration 10s --format json
@@ -816,11 +839,12 @@ tools/qemu-run.sh          # runs the whole matrix, scenarios included
 | Disk I/O | `fast-workload io-hog --workers 2 --size-mib 256` | Disk I/O | p99 past the slow threshold, plus the share of off-CPU time waiting on the device |
 | Lock | `fast-workload lock-hog --workers 16` | Lock contention | share of off-CPU time on a futex, above the 33% threshold |
 | Memory | `fast-workload mem-hog --workers 1 --size-mib 1024` | Memory pressure | direct reclaim attempts per second, through the memory report's own verdict |
-| Network | `fast-workload net-hog --workers 2 --delay-ms 600` | Network | retransmission ratio, plus the share of off-CPU time blocked on a socket |
+| Network | `fast-workload net-hog --workers 2 --delay-ms 600` | Network | share of off-CPU time blocked on a socket |
 
 Recorded 2026-09-28 on the kernel-server bpf-next image (7.2.0-rc6, 8 vCPUs,
 BTF present, no CONFIG_PSI): all five ranked as expected, twice in a row, with
-the matrix exiting rc=0.
+the matrix exiting rc=0. This historical run predates the removal of the
+invalid retransmission ratio from Network scoring.
 
 Three of the five fixtures differ from the ones the roadmap first suggested,
 because the originals cannot be run on this kernel and a check that cannot run

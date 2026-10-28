@@ -379,7 +379,7 @@ done
 # Median of the per-endpoint p50 column, in microseconds.
 #
 # The endpoint table is printed with fixed-width numeric columns, so the
-# columns are positional: p95, p50, p99, samples, retrans, ratio, endpoint.
+# columns are positional: p95, p50, p99, samples, retrans, endpoint.
 # Data rows are recognised by a leading integer, which the header and the
 # surrounding prose never have.
 median_p50_us() {
@@ -531,6 +531,11 @@ check_net_retransmit_attribution() {
         kernel_bytes=$(awk '/bytes_retrans:/ {for(i=1;i<=NF;i++) if($i ~ /^bytes_retrans:/){split($i,p,":"); if(p[2]+0>m) m=p[2]}} END{print m+0}' "$OUT_DIR/net-retrans-ss.txt")
         kernel_segs=$(awk '/retrans:/ {for(i=1;i<=NF;i++) if($i ~ /^retrans:/){split($i,p,"/"); if(p[2]+0>m) m=p[2]}} END{print m+0}' "$OUT_DIR/net-retrans-ss.txt")
         echo "    kernel ss on port ${port:-?}: $kernel_bytes bytes_retrans, $kernel_segs retrans segs"
+    fi
+
+    if ! grep -Fq 'retransmission rate unavailable (transmitted segment count not collected)' "$OUT_DIR/net-retrans.txt"; then
+        echo "net retransmit attribution: FAIL (unavailable rate was not reported)"
+        FAILURES=$((FAILURES + 1))
     fi
 
     local total endpoints
@@ -938,8 +943,7 @@ check_diagnose_ranking() {
 # single-line guarantee. The parsing itself is covered by the round-trip tests
 # in fast/src/json.rs, which use a real parser.
 #
-# Two commands are checked rather than one, because a format that works for
-# `sched` and not for `diagnose` is not a format.
+# Check both schema versions and the unavailable retransmission rate.
 check_json_document() {
     local target="$OUT_DIR/json-sched.txt"
     "$SCHED_WORKLOAD" target --duration 10s --period 1ms >/dev/null 2>&1 &
@@ -948,6 +952,8 @@ check_json_document() {
     "$FAST" sched --pid "$target_pid" --duration 2s --format json >"$target" 2>/dev/null || true
     "$FAST" diagnose --pid "$target_pid" --duration 2s --format json \
         >"$OUT_DIR/json-diagnose.txt" 2>/dev/null || true
+    "$FAST" net --pid "$target_pid" --duration 2s --format json \
+        >"$OUT_DIR/json-net.txt" 2>/dev/null || true
     kill "$target_pid" 2>/dev/null
     wait "$target_pid" 2>/dev/null
 
@@ -967,10 +973,21 @@ check_json_document() {
         problems="$problems <not-a-single-line>"
     fi
     if [ -s "$OUT_DIR/json-diagnose.txt" ]; then
-        grep -q -- '"causes"' "$OUT_DIR/json-diagnose.txt" \
-            || problems="$problems causes-in-diagnose"
-        grep -q -- '"measured"' "$OUT_DIR/json-diagnose.txt" \
-            || problems="$problems measured-in-diagnose"
+        for field in '"schema":"rand-fast/v2"' '"command":"diagnose"' '"causes"' \
+            '"measured"' '"retrans_ratio":null' '"retransmissions":'; do
+            grep -q -- "$field" "$OUT_DIR/json-diagnose.txt" \
+                || problems="$problems diagnose:$field"
+        done
+    else
+        problems="$problems missing-diagnose"
+    fi
+    if [ -s "$OUT_DIR/json-net.txt" ]; then
+        for field in '"schema":"rand-fast/v2"' '"command":"net"' '"retransmissions":'; do
+            grep -q -- "$field" "$OUT_DIR/json-net.txt" \
+                || problems="$problems net:$field"
+        done
+    else
+        problems="$problems missing-net"
     fi
 
     if [ -n "$problems" ]; then
@@ -979,7 +996,7 @@ check_json_document() {
         echo >&2
         FAILURES=$((FAILURES + 1))
     else
-        echo "json document: one line, schema and fields present, diagnose carries measured and causes"
+        echo "json document: sched v1, net and diagnose v2, unavailable diagnose rate is null"
     fi
 }
 
@@ -1065,8 +1082,8 @@ check_diagnose_scenarios() {
     scenario memory "Memory pressure" "Memory pressure" \
         "$FAST_WORKLOAD" mem-hog --duration 30s --workers 1 --size-mib 1024
 
-    # The cycling receive window, which is the only way to get real
-    # retransmissions out of a loopback link that never loses a packet.
+    # The cycling receive window creates socket waits; the Network ranking
+    # now depends on those waits, not on retransmission counts.
     scenario network "Network" "Network" \
         "$FAST_WORKLOAD" net-hog --duration 30s --workers 2 --delay-ms 600
 }
