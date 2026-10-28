@@ -23,6 +23,10 @@
 #
 # Exit status: 0 when the guest smoke run succeeded, 1 otherwise.
 set -u
+# The guest rootfs must look like a normal Linux rootfs: the incident store
+# rejects ancestors that group/others can rewrite, and a permissive caller
+# umask would otherwise leak into every staged directory.
+umask 022
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 FAST=${FAST:-$ROOT/target/release/fast}

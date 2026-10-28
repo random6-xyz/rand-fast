@@ -18,6 +18,7 @@
 # Optional virtio disk: an ext4 scratch device for the io-hog fixture
 # (tmpfs reads never reach the block_rq_* tracepoints).
 /bin/busybox --install -s /bin 2>/dev/null
+umask 022
 
 # Mount-point directories must exist before the mounts below; fresh staging
 # trees do not carry them.
