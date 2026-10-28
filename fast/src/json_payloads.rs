@@ -123,6 +123,18 @@ pub struct DaemonJson {
     pub within_memory_budget: bool,
     /// Where incidents are written.
     pub output_dir: String,
+    /// Completed incident bundles, even if later rotation failed.
+    pub incidents_written: u64,
+    /// Failed bundle writes before completion.
+    pub incident_write_failures: u64,
+    /// Rotation failures after a bundle completed.
+    pub incident_rotation_failures: u64,
+    /// Fired intervals skipped because incident writing was disabled.
+    pub incidents_skipped: u64,
+    /// Whether incident writing is disabled for the remainder of this run.
+    pub incident_writes_disabled: bool,
+    /// Semantics for newly collected interval values.
+    pub measurement_semantics: &'static str,
     /// The most recent intervals, oldest first.
     pub intervals_detail: Vec<serde_json::Value>,
 }
@@ -133,6 +145,11 @@ pub fn daemon_json(
     peak_cpu_pct: f64,
     peak_memory_bytes: u64,
     ticks: u64,
+    incidents_written: u64,
+    incident_write_failures: u64,
+    incident_rotation_failures: u64,
+    incidents_skipped: u64,
+    incident_writes_disabled: bool,
 ) -> DaemonJson {
     let window = ring.window();
     let entry = ring.entries().next();
@@ -158,6 +175,12 @@ pub fn daemon_json(
         budget_recording_bytes: crate::daemon::BUDGET_RECORDING_BYTES,
         within_memory_budget: peak_memory_bytes <= crate::daemon::BUDGET_RECORDING_BYTES,
         output_dir: String::new(),
+        incidents_written,
+        incident_write_failures,
+        incident_rotation_failures,
+        incidents_skipped,
+        incident_writes_disabled,
+        measurement_semantics: crate::daemon::MEASUREMENT_SEMANTICS,
         intervals_detail: ring
             .entries()
             .rev()
