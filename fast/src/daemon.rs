@@ -93,6 +93,14 @@ pub const BUDGET_RECORDING_BYTES: u64 = 4 * 1024 * 1024;
 /// except history older than the trigger.
 pub const BUNDLE_MAX_INTERVALS: usize = 60;
 
+/// Per-stream dropped records for an interval.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LostByStream {
+    pub sched: u64,
+    pub io: u64,
+    pub net: u64,
+}
+
 /// One interval of the rolling window.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RingEntry {
@@ -121,6 +129,8 @@ pub struct RingEntry {
     pub lost: u64,
     /// Subset of lost records dropped by the bounded userspace queue.
     pub queue_lost: u64,
+    /// Per-stream losses, absent for history written by older versions.
+    pub lost_by_stream: Option<LostByStream>,
     /// Peak recorder CPU cost over the interval, as a percentage of one CPU.
     pub cpu_cost_pct: f64,
     /// Peak recorder resident set over the interval, in bytes.
@@ -148,6 +158,7 @@ impl RingEntry {
             "psi_full_pct": self.psi_full_pct,
             "lost_events": self.lost,
             "queue_lost_events": self.queue_lost,
+            "lost_events_by_stream": self.lost_by_stream,
             "recorder_cpu_pct": self.cpu_cost_pct,
             "recorder_memory_bytes": self.memory_bytes,
             // Which trigger fired, so a bundle says what tripped it rather
@@ -227,6 +238,7 @@ fn write_incident(
             "psi_full_pct": entry.psi_full_pct,
             "lost_events": entry.lost,
             "queue_lost_events": entry.queue_lost,
+            "lost_events_by_stream": entry.lost_by_stream,
             "measurement_semantics": MEASUREMENT_SEMANTICS,
             "recorder_cpu_pct": entry.cpu_cost_pct,
             "recorder_memory_bytes": entry.memory_bytes,
@@ -420,6 +432,9 @@ fn ring_entry_from_json(value: &Value) -> Option<RingEntry> {
             .map(|value| value as f32),
         lost: number("lost_events").unwrap_or(0),
         queue_lost: number("queue_lost_events").unwrap_or(0),
+        lost_by_stream: value
+            .get("lost_events_by_stream")
+            .and_then(|value| serde_json::from_value(value.clone()).ok()),
         cpu_cost_pct: value
             .get("recorder_cpu_pct")
             .and_then(Value::as_f64)
@@ -889,7 +904,9 @@ struct Cumulative {
     io_unmatched: u64,
     /// Retransmissions so far.
     retrans: u64,
+    /// Network records dropped so far.
     net_lost: u64,
+    /// Queue records dropped in the latest interval.
     queue_lost: u64,
 }
 
@@ -1310,12 +1327,18 @@ fn tick_with_target_cpu(
     let memory = usage.rss_bytes.max(previous.usage.rss_bytes);
 
     let before = previous.totals;
-    let queue_lost = current.queue_lost.saturating_sub(before.queue_lost);
-    let lost = current
-        .sched_lost
-        .saturating_sub(before.sched_lost)
-        .saturating_add(current.io_lost.saturating_sub(before.io_lost))
-        .saturating_add(current.net_lost.saturating_sub(before.net_lost))
+    // The queue counter is already an interval count: the runtime swaps it to
+    // zero before each snapshot. The per-stream perf counters are cumulative.
+    let queue_lost = current.queue_lost;
+    let lost_by_stream = LostByStream {
+        sched: current.sched_lost.saturating_sub(before.sched_lost),
+        io: current.io_lost.saturating_sub(before.io_lost),
+        net: current.net_lost.saturating_sub(before.net_lost),
+    };
+    let lost = lost_by_stream
+        .sched
+        .saturating_add(lost_by_stream.io)
+        .saturating_add(lost_by_stream.net)
         .saturating_add(queue_lost);
 
     if lost != 0 {
@@ -1338,6 +1361,7 @@ fn tick_with_target_cpu(
         psi_full_pct: psi.available.then_some(psi.full_pct),
         lost,
         queue_lost,
+        lost_by_stream: Some(lost_by_stream),
         cpu_cost_pct: cost,
         memory_bytes: memory,
         fired: Vec::new(),
@@ -2180,6 +2204,121 @@ mod tests {
     }
 
     #[test]
+    fn tick_records_all_stream_loss_deltas_and_restores_them() {
+        use crate::runtime::EventHandler;
+
+        let dir = temp_dir("stream_loss_deltas");
+        let mut args = default_args(&dir);
+        args.trigger_sched_p95 = "off".parse().unwrap();
+        args.trigger_io_p99 = "off".parse().unwrap();
+        args.trigger_retrans = "off".parse().unwrap();
+        args.trigger_psi_some = "off".parse().unwrap();
+        args.trigger_psi_full = "off".parse().unwrap();
+        let mut state = RecorderState {
+            ring: Ring::new(args.window, args.interval),
+            previous: PreviousTick::default(),
+            peak_cpu_pct: 0.0,
+            peak_memory_bytes: 0,
+            ticks: 0,
+            incidents: Incidents::default(),
+            slow_sched: Vec::new(),
+            slow_io: Vec::new(),
+            restored: Restored::default(),
+            time_offset: Duration::ZERO,
+        };
+        let mut net = network::NetStats::default();
+        let started = Instant::now();
+        for (second, sched, io, net_increment) in [(1, 5, 7, 11), (2, 8, 12, 13), (3, 9, 12, 2)] {
+            EventHandler::<TcpEvent>::on_lost(&mut net, net_increment);
+            let summary = vec![
+                ("sched", serde_json::json!({"lost": sched})),
+                ("io", serde_json::json!({"lost": io})),
+                ("net", net_snapshot(&net)),
+            ];
+            tick(
+                std::process::id(),
+                started,
+                Duration::from_secs(second),
+                summary,
+                &mut state,
+                &args,
+            )
+            .unwrap();
+        }
+        let entries: Vec<_> = state.ring.entries().collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].lost_by_stream,
+            Some(LostByStream {
+                sched: 3,
+                io: 5,
+                net: 13
+            })
+        );
+        assert_eq!(entries[0].lost, 21);
+        assert_eq!(
+            entries[1].lost_by_stream,
+            Some(LostByStream {
+                sched: 1,
+                io: 0,
+                net: 2
+            })
+        );
+        assert_eq!(entries[1].lost, 3);
+        let json = entries[0].to_json();
+        assert_eq!(json["lost_events"], 21);
+        assert_eq!(json["lost_events_by_stream"]["net"], 13);
+        assert_eq!(ring_entry_from_json(&json).unwrap(), *entries[0]);
+        let legacy =
+            ring_entry_from_json(&serde_json::json!({"at_s": 1, "lost_events": 9})).unwrap();
+        assert_eq!(legacy.lost, 9);
+        assert_eq!(legacy.lost_by_stream, None);
+
+        // A reset in one stream must not cancel losses in another stream.
+        for (second, sched, io, net) in [
+            (4, 100, 0, 0),
+            (5, 0, 50, 0),
+            (6, 0, 0, 0),
+            (7, u64::MAX, 1, 1),
+        ] {
+            let summary = vec![
+                ("sched", serde_json::json!({"lost": sched})),
+                ("io", serde_json::json!({"lost": io})),
+                ("net", serde_json::json!({"lost": net})),
+            ];
+            tick(
+                std::process::id(),
+                started,
+                Duration::from_secs(second),
+                summary,
+                &mut state,
+                &args,
+            )
+            .unwrap();
+        }
+        let entries: Vec<_> = state.ring.entries().collect();
+        assert_eq!(entries[3].lost, 50);
+        assert_eq!(
+            entries[3].lost_by_stream,
+            Some(LostByStream {
+                sched: 0,
+                io: 50,
+                net: 0
+            })
+        );
+        assert_eq!(entries[5].lost, u64::MAX);
+        assert_eq!(
+            entries[5].lost_by_stream,
+            Some(LostByStream {
+                sched: u64::MAX,
+                io: 1,
+                net: 1
+            })
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn the_ring_evicts_the_oldest_entry() {
         let mut ring = Ring::new(Duration::from_secs(1), Duration::from_millis(100));
         assert_eq!(ring.max_entries(), 10);
@@ -2698,7 +2837,11 @@ mod tests {
             psi_some_pct: Some(2.5),
             psi_full_pct: None,
             lost: 1,
-            queue_lost: 0,
+            lost_by_stream: Some(LostByStream {
+                sched: 0,
+                io: 0,
+                net: 1,
+            }),
             cpu_cost_pct: 0.5,
             memory_bytes: 4096,
             fired: vec![],
