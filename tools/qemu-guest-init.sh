@@ -22,10 +22,12 @@
 # Mount-point directories must exist before the mounts below; fresh staging
 # trees do not carry them.
 mkdir -p /proc /sys /dev /tmp /mnt/io
-# The initramfs has no tmpfiles daemon, so /tmp gets the mode every Linux
-# system gives it. The incident store deliberately rejects group/world
-# writable ancestors without the sticky bit; a non-sticky /tmp would make
-# every documented daemon invocation fail inside this smoke guest.
+# The initramfs is packed by an unprivileged user, so the staged /tmp keeps
+# that uid. The incident store trusts a sticky /tmp only when its owner is
+# root or the recorder's own user, because a sticky directory's owner can
+# still rename entries they do not own. Restore the ownership and mode a
+# normal Linux /tmp has before any daemon case runs.
+chown 0:0 /tmp
 chmod 1777 /tmp
 
 /bin/mount2 none proc /proc
