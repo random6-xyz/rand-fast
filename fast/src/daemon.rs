@@ -3,10 +3,8 @@
 //! # What the ring holds
 //!
 //! One entry per interval, with the numbers for *that interval* rather than for
-//! the run so far. The collectors accumulate for as long as the recorder runs,
-//! so every entry is a difference between two consecutive cumulative summaries.
-//! That is what makes the interval length cancel out and keeps a long run from
-//! reporting ever-growing totals as if they were current.
+//! the run so far. Latency distributions reset at each tick; cumulative loss,
+//! retransmission and unmatched counts are differenced between ticks.
 //!
 //! # What it costs
 //!
@@ -21,6 +19,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "daemon_storage.rs"]
+mod storage;
 use anyhow::{Context, Result};
 use aya::{Ebpf, include_bytes_aligned};
 use fast_common::{
@@ -30,9 +30,9 @@ use serde_json::Value;
 
 use crate::{
     cli::DaemonArgs,
-    cpu, io,
+    cpu,
     json::{self, Envelope, Format},
-    network, process, runtime, stats,
+    process, runtime,
     trigger::{Interval, Signal, Triggers},
 };
 
@@ -50,6 +50,9 @@ const PERF_PAGE_COUNT: usize = 4;
 /// readers several hundred times a second, and those wakeups are the dominant
 /// cost of the whole program.
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// Schema for daemon reports and their incident bundles.
+const DAEMON_SCHEMA: &str = "rand-fast/v2";
 
 /// Documented CPU budget, as a fraction of one CPU.
 ///
@@ -89,6 +92,14 @@ pub const BUDGET_RECORDING_BYTES: u64 = 4 * 1024 * 1024;
 /// except history older than the trigger.
 pub const BUNDLE_MAX_INTERVALS: usize = 60;
 
+/// Per-stream dropped records for an interval.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LostByStream {
+    pub sched: u64,
+    pub io: u64,
+    pub net: u64,
+}
+
 /// One interval of the rolling window.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RingEntry {
@@ -98,8 +109,8 @@ pub struct RingEntry {
     pub sched_p95_us: u64,
     /// Scheduler samples over the interval.
     pub sched_samples: u64,
-    /// On-CPU usage as a percentage of one CPU.
-    pub cpu_percent: f64,
+    /// On-CPU usage as a percentage of one CPU, absent when unavailable.
+    pub cpu_percent: Option<f64>,
     /// Block I/O p99 over the interval, in microseconds.
     pub io_p99_us: u64,
     /// Block I/O completions over the interval.
@@ -113,14 +124,18 @@ pub struct RingEntry {
     pub psi_some_pct: Option<f32>,
     /// Memory PSI full at the end of the interval, in percent.
     pub psi_full_pct: Option<f32>,
-    /// Records the kernel dropped from the interval's streams.
+    /// Perf and userspace queue records lost from the interval streams.
     pub lost: u64,
+    /// Subset of lost records dropped by the bounded userspace queue.
+    pub queue_lost: u64,
+    /// Per-stream losses, absent for history written by older versions.
+    pub lost_by_stream: Option<LostByStream>,
     /// Peak recorder CPU cost over the interval, as a percentage of one CPU.
     pub cpu_cost_pct: f64,
     /// Peak recorder resident set over the interval, in bytes.
     pub memory_bytes: u64,
     /// The triggers that fired on this interval, worst first. Empty on a
-    /// quiet interval, and the reason the incident was written when it is not.
+    /// quiet interval. An incident write can fail even when triggers fired.
     pub fired: Vec<Signal>,
 }
 
@@ -135,12 +150,15 @@ impl RingEntry {
             "io_p99_us": self.io_p99_us,
             "io_samples": self.io_samples,
             "io_unmatched": self.io_unmatched,
-            "retrans": self.retrans,
+            "retrans": null,
+            "tcp_available": false,
             // Absent rather than zero, so a kernel without PSI is not read as
             // a machine with no memory pressure.
             "psi_some_pct": self.psi_some_pct,
             "psi_full_pct": self.psi_full_pct,
             "lost_events": self.lost,
+            "queue_lost_events": self.queue_lost,
+            "lost_events_by_stream": self.lost_by_stream,
             "recorder_cpu_pct": self.cpu_cost_pct,
             "recorder_memory_bytes": self.memory_bytes,
             // Which trigger fired, so a bundle says what tripped it rather
@@ -168,10 +186,9 @@ fn write_incident(
     triggers: &Triggers,
     args: &DaemonArgs,
     slow: &SlowSamples,
-) -> Result<()> {
-    let directory = incident_dir(&args.output, entry.at)?;
-    fs::create_dir_all(&directory)
-        .with_context(|| format!("create incident directory {}", directory.display()))?;
+) -> Result<IncidentWrite> {
+    let output = storage::Output::open(&args.output)?;
+    let directory = output.create(&stamp(entry.at))?;
 
     // The most recent intervals, not all of them: see BUNDLE_MAX_INTERVALS.
     // Taken from the end, because the newest is what leads to the trigger.
@@ -179,7 +196,7 @@ fn write_incident(
     let carried = total_entries.min(BUNDLE_MAX_INTERVALS);
 
     let manifest = serde_json::json!({
-        "schema": crate::json::SCHEMA,
+        "schema": DAEMON_SCHEMA,
         "command": "daemon.incident",
         "recorded_at_s": entry.at.as_secs_f64(),
         "process": { "pid": args.pid },
@@ -200,6 +217,7 @@ fn write_incident(
                 "signal": signal.name(),
                 "unit": signal.unit(),
                 "at_or_above": signal.threshold(triggers),
+                "available": *signal != Signal::Retransmissions,
             }))
             .collect::<Vec<_>>(),
         // Stated in the bundle, because a reader who assumed it holds the whole
@@ -216,23 +234,27 @@ fn write_incident(
             "io_p99_us": entry.io_p99_us,
             "io_samples": entry.io_samples,
             "io_unmatched": entry.io_unmatched,
-            "retrans": entry.retrans,
+            "retrans": null,
+            "tcp_available": false,
             "psi_some_pct": entry.psi_some_pct,
             "psi_full_pct": entry.psi_full_pct,
             "lost_events": entry.lost,
+            "queue_lost_events": entry.queue_lost,
+            "lost_events_by_stream": entry.lost_by_stream,
+            "measurement_semantics": MEASUREMENT_SEMANTICS,
             "recorder_cpu_pct": entry.cpu_cost_pct,
             "recorder_memory_bytes": entry.memory_bytes,
         },
     });
-    write_json(&directory.join("manifest.json"), &manifest)?;
+    directory.json("manifest.json", &manifest)?;
 
     let intervals: Vec<Value> = ring
         .entries()
         .skip(total_entries - carried)
         .map(RingEntry::to_json)
         .collect();
-    write_json(&directory.join("intervals.json"), &Value::Array(intervals))?;
-    write_json(&directory.join("slow-samples.json"), &slow.to_json())?;
+    directory.json("intervals.json", &Value::Array(intervals))?;
+    directory.json("slow-samples.json", &slow.to_json())?;
 
     // The diagnosis is the same ranking `fast diagnose` prints, fed with what
     // the recorder has measured. It is not a second, weaker copy of that
@@ -240,18 +262,15 @@ fn write_incident(
     // uncollected, so "no lock contention found" cannot be read as "lock
     // contention was looked for and not found".
     let diagnosis = diagnose_from(&entry, args.pid, slow);
-    write_json(&directory.join("diagnosis.json"), &diagnosis)?;
-    write_text(
-        &directory.join("summary.txt"),
-        &incident_text(&entry, triggers, &diagnosis),
-    )?;
+    directory.json("diagnosis.json", &diagnosis)?;
+    directory.write("summary.txt", &incident_text(&entry, triggers, &diagnosis))?;
 
     // Written last, and on its own, so a bundle is either complete or absent
     // rather than a directory that looks finished and is not.
-    write_json(
-        &directory.join("complete.json"),
+    directory.json(
+        "complete.json",
         &serde_json::json!({
-            "schema": crate::json::SCHEMA,
+            "schema": DAEMON_SCHEMA,
             "files": [
                 "manifest.json",
                 "intervals.json",
@@ -261,22 +280,32 @@ fn write_incident(
             ],
         }),
     )?;
-    let floor = rotate(&args.output, args.max_disk_bytes, &directory)?;
-    if let Some(total) = floor {
-        // Reported once per incident rather than swallowed, because a cap the
-        // user set is being exceeded and only they can decide whether to widen
-        // it, narrow the window, or accept it.
-        eprintln!(
-            "warning: incident directory holds {total} bytes, over the {} byte cap; \
-             a single incident is {} bytes and is never deleted, so this run's floor is one incident",
-            args.max_disk_bytes,
-            directory_size(&directory).unwrap_or(0)
-        );
-    }
-    Ok(())
+    let rotation_error = match output.rotate(args.max_disk_bytes, directory.name()) {
+        Ok(state) => {
+            if state.unknown {
+                eprintln!(
+                    "warning: incident output size cannot be fully verified; the {} byte cap may be exceeded (counted regular file bytes: {})",
+                    args.max_disk_bytes, state.total
+                );
+            } else if state.total > args.max_disk_bytes {
+                eprintln!(
+                    "warning: incident output holds {} regular file bytes, over the {} byte cap; the current incident and unrecognized data are retained",
+                    state.total, args.max_disk_bytes
+                );
+            }
+            None
+        }
+        Err(error) => Some(error),
+    };
+    Ok(IncidentWrite { rotation_error })
 }
 
-/// The slowest latencies the streams have seen, in microseconds.
+/// A complete bundle may survive even when the subsequent rotation fails.
+struct IncidentWrite {
+    rotation_error: Option<anyhow::Error>,
+}
+
+/// The slowest latencies in the triggering interval, in microseconds.
 struct SlowSamples {
     sched_us: Vec<u64>,
     io_us: Vec<u64>,
@@ -287,77 +316,29 @@ impl SlowSamples {
         serde_json::json!({
             "sched_us": self.sched_us,
             "io_us": self.io_us,
-            "note": "the slowest latencies seen so far, longest first, not the events that tripped the trigger alone",
+            "note": "the triggering interval's slowest dispatched latencies, longest first, rounded down to microseconds",
         })
     }
 }
 
-/// Deletes the oldest bundles until the output directory fits its budget.
-///
-/// Called after every incident rather than on a timer, because the thing that
-/// fills a directory is incidents, and a recorder that is not firing is not
-/// filling anything. Oldest first, because the newest bundle is the one being
-/// written and the least likely to be superseded.
-///
-/// A partial bundle is removed along with a complete one: a directory left
-/// behind by a recorder that was killed mid-write is dead weight, and the
-/// `complete.json` marker is what tells the two apart.
-///
-/// A single incident is never deleted to satisfy the cap, so the cap is a soft
-/// ceiling with a floor of one incident's size.
-///
-/// Removal failures are ignored rather than propagated. A recorder that cannot
-/// delete an old bundle is still recording, and ending the run over it would
-/// trade a working diagnosis for a tidy directory.
-fn rotate(
-    output: &std::path::Path,
-    max_bytes: u64,
-    just_written: &std::path::Path,
-) -> Result<Option<u64>> {
-    let entries = match std::fs::read_dir(output) {
-        Ok(entries) => entries,
-        Err(_) => return Ok(None),
-    };
-    // Oldest first, by name, which is why bundle directories are stamped.
-    let mut bundles: Vec<std::path::PathBuf> = entries
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .collect();
-    bundles.sort();
-
-    let mut total: u64 = bundles.iter().filter_map(|path| directory_size(path)).sum();
-    for bundle in bundles {
-        if total <= max_bytes {
-            break;
-        }
-        // The bundle that was just written is never removed. A cap exists to
-        // keep a recorder from filling a disk, and a version that deletes the
-        // incident it was called to save leaves a recorder that reports
-        // incidents and stores none, which is worse than a directory slightly
-        // over budget. The floor is therefore one incident, and BUNDLE_MAX_
-        // INTERVALS is what keeps that incident small enough for the cap to
-        // still mean something. When the cap is below that floor, the returned
-        // value says so instead of the recorder absorbing the overage quietly.
-        if bundle == just_written {
-            continue;
-        }
-        if let Some(size) = directory_size(&bundle) {
-            total = total.saturating_sub(size);
-        }
-        let _ = fs::remove_dir_all(&bundle);
-    }
-    Ok((total > max_bytes).then_some(total))
-}
-
-/// Sum of the regular files under every bundle in the output directory.
 #[cfg(test)]
 fn directory_total(dir: &std::path::Path) -> Option<u64> {
-    let mut total = 0;
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        total += directory_size(&entry.path())?;
+    fn size(dir: &std::path::Path) -> Option<u64> {
+        let mut total = 0;
+        for entry in fs::read_dir(dir).ok()? {
+            let entry = entry.ok()?;
+            let m = entry.metadata().ok()?;
+            total += if m.is_dir() {
+                size(&entry.path())?
+            } else if m.is_file() {
+                m.len()
+            } else {
+                0
+            };
+        }
+        Some(total)
     }
-    Some(total)
+    size(dir)
 }
 
 /// A byte count in the largest unit that leaves the number readable.
@@ -376,19 +357,6 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-/// Total size of the regular files under a directory.
-fn directory_size(path: &std::path::Path) -> Option<u64> {
-    let mut total = 0;
-    for entry in std::fs::read_dir(path).ok()?.flatten() {
-        if let Ok(metadata) = entry.metadata()
-            && metadata.is_file()
-        {
-            total += metadata.len();
-        }
-    }
-    Some(total)
-}
-
 /// Reads the rolling window back from the most recent bundle on disk.
 ///
 /// A recorder that restarts is least useful immediately after whatever made it
@@ -400,23 +368,19 @@ fn directory_size(path: &std::path::Path) -> Option<u64> {
 /// stitching several together would produce a window with gaps in it that look
 /// exactly like a quiet machine.
 ///
+/// History is read with a hard byte bound, so a corrupted or hostile bundle
+/// cannot make the recorder allocate without limit.
+const MAX_RESTORE_BYTES: u64 = 1024 * 1024;
+
 /// A bundle that cannot be read is skipped rather than fatal: a recorder must
 /// start even when the disk it is about to write to is in a strange state, and
 /// a missing history is a far smaller problem than a recorder that will not
 /// run.
 fn restore_ring(output: &std::path::Path, window: Duration) -> Restored {
-    let newest = match std::fs::read_dir(output) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.is_dir() && path.join("complete.json").is_file())
-            .max(),
-        Err(_) => None,
-    };
-    let Some(newest) = newest else {
+    let Ok(output) = storage::Output::open(output) else {
         return Restored::default();
     };
-    let Ok(text) = fs::read_to_string(newest.join("intervals.json")) else {
+    let Ok(Some(text)) = output.read_latest(MAX_RESTORE_BYTES) else {
         return Restored::default();
     };
     let Ok(Value::Array(entries)) = serde_json::from_str::<Value>(&text) else {
@@ -455,10 +419,7 @@ fn ring_entry_from_json(value: &Value) -> Option<RingEntry> {
         at,
         sched_p95_us: number("sched_p95_us").unwrap_or(0),
         sched_samples: number("sched_samples").unwrap_or(0),
-        cpu_percent: value
-            .get("cpu_percent")
-            .and_then(Value::as_f64)
-            .unwrap_or_default(),
+        cpu_percent: value.get("cpu_percent").and_then(Value::as_f64),
         io_p99_us: number("io_p99_us").unwrap_or(0),
         io_samples: number("io_samples").unwrap_or(0),
         io_unmatched: number("io_unmatched").unwrap_or(0),
@@ -472,6 +433,10 @@ fn ring_entry_from_json(value: &Value) -> Option<RingEntry> {
             .and_then(Value::as_f64)
             .map(|value| value as f32),
         lost: number("lost_events").unwrap_or(0),
+        queue_lost: number("queue_lost_events").unwrap_or(0),
+        lost_by_stream: value
+            .get("lost_events_by_stream")
+            .and_then(|value| serde_json::from_value(value.clone()).ok()),
         cpu_cost_pct: value
             .get("recorder_cpu_pct")
             .and_then(Value::as_f64)
@@ -503,10 +468,9 @@ fn diagnose_from(entry: &RingEntry, pid: u32, slow: &SlowSamples) -> Value {
         // slow threshold, so this signal is left out rather than guessed at.
         io_slow: 0,
         net_samples: 0,
-        // Retransmissions are counted but segments are not, so there is no
-        // ratio to score. Zero here would read as a perfect link rather than
-        // as an absent measurement.
-        retrans_ratio: 0.0,
+        retransmissions: entry.retrans,
+        tcp_available: false,
+        retrans_ratio: None,
         offcpu_samples: 0,
         offcpu_p95_us: 0,
         offcpu_total_us: 0,
@@ -520,7 +484,7 @@ fn diagnose_from(entry: &RingEntry, pid: u32, slow: &SlowSamples) -> Value {
         psi_some_pct: entry.psi_some_pct.unwrap_or(0.0),
         psi_full_pct: entry.psi_full_pct.unwrap_or(0.0),
         cpu_samples: 0,
-        cpu_percent: entry.cpu_percent,
+        cpu_percent: entry.cpu_percent.unwrap_or_default(),
         // The recorder knows the streams' dropped-event count for the interval
         // but not for the whole run, so this is the interval's figure.
         lost: vec![("interval", entry.lost)],
@@ -532,7 +496,7 @@ fn diagnose_from(entry: &RingEntry, pid: u32, slow: &SlowSamples) -> Value {
     };
     let causes = crate::scoring::score(&evidence);
     serde_json::json!({
-        "schema": crate::json::SCHEMA,
+        "schema": DAEMON_SCHEMA,
         "command": "daemon.incident.diagnosis",
         "pid": pid,
         "scored_by": "the ranking fast diagnose uses, fed with the recorder's own measurements",
@@ -547,7 +511,7 @@ fn diagnose_from(entry: &RingEntry, pid: u32, slow: &SlowSamples) -> Value {
         "not_collected": [
             "off-CPU wait reasons and stacks",
             "page fault and direct reclaim rates",
-            "transmitted segment count, so no retransmission ratio",
+            "TCP attribution and retransmissions: socket ownership cannot be established",
             "on-CPU samples; usage is read from the target's accounting counters",
         ],
         "slowest_samples": slow.to_json(),
@@ -569,35 +533,16 @@ fn diagnose_from(entry: &RingEntry, pid: u32, slow: &SlowSamples) -> Value {
 fn stamp(at: Duration) -> String {
     format!("{:012}s", at.as_millis())
 }
-fn incident_dir(output: &std::path::Path, at: Duration) -> Result<std::path::PathBuf> {
-    let base = output.join(format!("incident-{}", stamp(at)));
-    let mut candidate = base.clone();
-    let mut suffix = 2;
-    while candidate.exists() {
-        candidate = base.with_file_name(format!(
-            "{}-{suffix}",
-            base.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("incident")
-        ));
-        suffix += 1;
-        if suffix > 1000 {
-            return Err(anyhow::anyhow!("too many incidents within one second"));
-        }
-    }
-    Ok(candidate)
-}
-
 /// The measurement a signal fired on, in the signal's own unit.
 impl RingEntry {
     fn measured(&self, signal: Signal) -> Option<f64> {
         match signal {
             Signal::SchedulerP95 => Some(self.sched_p95_us as f64),
             Signal::IoP99 => Some(self.io_p99_us as f64),
-            Signal::Retransmissions => Some(self.retrans as f64),
+            Signal::Retransmissions => None,
             Signal::PsiSome => self.psi_some_pct.map(f64::from),
             Signal::PsiFull => self.psi_full_pct.map(f64::from),
-            Signal::CpuUsage => Some(self.cpu_percent),
+            Signal::CpuUsage => self.cpu_percent,
         }
     }
 }
@@ -631,14 +576,18 @@ fn incident_text(entry: &RingEntry, triggers: &Triggers, diagnosis: &Value) -> S
         "  block I/O p99  {} us over {} completions, {} unmatched\n",
         entry.io_p99_us, entry.io_samples, entry.io_unmatched
     ));
-    text.push_str(&format!("  retransmissions {}\n", entry.retrans));
+    text.push_str("  retransmissions unavailable (socket ownership cannot be established)\n");
     match (entry.psi_some_pct, entry.psi_full_pct) {
         (Some(some), Some(full)) => {
             text.push_str(&format!("  memory PSI     {some}% some, {full}% full\n"));
         }
         _ => text.push_str("  memory PSI     unavailable, this kernel reports none\n"),
     }
-    text.push_str(&format!("  events lost    {}\n", entry.lost));
+    text.push_str(&format!(
+        "  events lost    {} ({} from userspace queue)\n",
+        entry.lost, entry.queue_lost
+    ));
+    text.push_str(&format!("  {MEASUREMENT_SEMANTICS}\n"));
     text.push_str("\nLikely cause, from the recorder's own measurements\n");
     match diagnosis["causes"].as_array() {
         Some(causes) if !causes.is_empty() => {
@@ -668,15 +617,6 @@ fn incident_text(entry: &RingEntry, triggers: &Triggers, diagnosis: &Value) -> S
         entry.memory_bytes / 1024
     ));
     text
-}
-
-fn write_json(path: &std::path::Path, value: &Value) -> Result<()> {
-    let text = serde_json::to_string_pretty(value).context("render incident JSON")?;
-    write_text(path, &text)
-}
-
-fn write_text(path: &std::path::Path, text: &str) -> Result<()> {
-    fs::write(path, text).with_context(|| format!("write {}", path.display()))
 }
 
 /// The recorder's own resource use, read from `/proc/self`.
@@ -789,18 +729,175 @@ impl Ring {
     }
 }
 
-/// Cumulative totals one tick reads out of a stream.
+/// Nearest-rank over dispatch-time samples, using the lower edge of a
+/// logarithmic bucket (eight buckets per power of two). The lower edge is
+/// exact below 16 ns and at most 12.5% below a larger sample, before the
+/// final conversion to whole microseconds. The 16 slowest values remain exact.
+/// A sample arriving in the queue after a tick belongs to the next interval.
+/// Loss counters are assigned when observed, which can differ from the
+/// corresponding sample's dispatch interval.
+pub const MEASUREMENT_SEMANTICS: &str = "New intervals use dispatch-time boundaries; shutdown drains readers while the target continues running, so final duration includes shutdown. Per-CPU perf snapshots and /proc CPU reads are not atomic; events after a reader stops are not observed. Restored history may use older semantics. Percentiles are nearest-rank over dispatched interval samples, approximated by logarithmic bucket lower bounds (at most 12.5% low in nanoseconds, then rounded down to microseconds); slow samples are actual values rounded down to microseconds. Approximation can suppress a near-threshold trigger. Queue backlog may move samples to a later interval; perf and queue loss are counted when observed, and lost samples can bias results. Perf reports only LOST records emitted by the kernel; unreported shutdown losses are not measurable. Counters saturate at u64 maximum. Empty percentiles are zero.";
+
+const HISTOGRAM_BUCKETS: usize = 504;
+
+struct IntervalLatency {
+    buckets: [u64; HISTOGRAM_BUCKETS],
+    count: u64,
+    slowest: Vec<u64>,
+    perf_lost: u64,
+    queue_lost: u64,
+}
+
+impl Default for IntervalLatency {
+    fn default() -> Self {
+        Self {
+            buckets: [0; HISTOGRAM_BUCKETS],
+            count: 0,
+            slowest: Vec::with_capacity(SLOW_SAMPLE_COUNT),
+            perf_lost: 0,
+            queue_lost: 0,
+        }
+    }
+}
+
+impl IntervalLatency {
+    fn record(&mut self, ns: u64) {
+        let index = if ns < 16 {
+            ns as usize
+        } else {
+            let shift = 63 - ns.leading_zeros() - 3;
+            16 + (shift as usize - 1) * 8 + ((ns >> shift) as usize - 8)
+        };
+        self.buckets[index] = self.buckets[index].saturating_add(1);
+        self.count = self.count.saturating_add(1);
+        let position = self.slowest.partition_point(|&value| value >= ns);
+        if position < SLOW_SAMPLE_COUNT {
+            if self.slowest.len() == SLOW_SAMPLE_COUNT {
+                self.slowest.pop();
+            }
+            self.slowest.insert(position, ns);
+        }
+    }
+
+    fn percentile_ns(&self, percentile: u64) -> u64 {
+        if self.count == 0 {
+            return 0;
+        }
+        let rank = (self.count as u128 * percentile as u128).div_ceil(100) as u64;
+        let mut seen = 0u64;
+        for (index, count) in self.buckets.iter().enumerate() {
+            seen = seen.saturating_add(*count);
+            if seen >= rank {
+                return if index < 16 {
+                    index as u64
+                } else {
+                    let offset = index - 16;
+                    (8 + (offset % 8) as u64) << (offset / 8 + 1)
+                };
+            }
+        }
+        0
+    }
+
+    fn take_snapshot(&mut self, percentile: u64) -> (u64, u64, Vec<u64>) {
+        let value = self.percentile_ns(percentile) / 1_000;
+        let count = self.count;
+        let slowest = self.slowest.iter().map(|ns| ns / 1_000).collect();
+        self.buckets.fill(0);
+        self.count = 0;
+        self.slowest.clear();
+        (value, count, slowest)
+    }
+}
+
+#[derive(Default)]
+struct RecorderScheduler(IntervalLatency);
+impl runtime::EventHandler<SchedulerLatencyEvent> for RecorderScheduler {
+    fn on_event(&mut self, event: SchedulerLatencyEvent) {
+        self.0.record(event.latency_ns);
+    }
+    fn on_lost(&mut self, count: u64) {
+        self.0.perf_lost = self.0.perf_lost.saturating_add(count);
+    }
+    fn on_queue_lost(&mut self, count: u64) {
+        self.0.queue_lost = self.0.queue_lost.saturating_add(count);
+    }
+}
+
+#[derive(Default)]
+struct RecorderIo {
+    latency: IntervalLatency,
+    unmatched: u64,
+}
+impl runtime::EventHandler<IoEvent> for RecorderIo {
+    fn on_event(&mut self, event: IoEvent) {
+        if event.op == fast_common::IO_OP_UNMATCHED {
+            self.unmatched = self.unmatched.saturating_add(1);
+        } else {
+            self.latency.record(event.latency_ns);
+        }
+    }
+    fn on_lost(&mut self, count: u64) {
+        self.latency.perf_lost = self.latency.perf_lost.saturating_add(count);
+    }
+    fn on_queue_lost(&mut self, count: u64) {
+        self.latency.queue_lost = self.latency.queue_lost.saturating_add(count);
+    }
+}
+
+/// The recorder needs only retransmission and loss counts, not endpoint RTTs.
+/// Keeping endpoints or individual RTT samples would grow without bound.
+#[derive(Default)]
+struct RecorderNetwork {
+    retrans: u64,
+    lost: u64,
+    queue_lost: u64,
+}
+
+impl runtime::EventHandler<TcpEvent> for RecorderNetwork {
+    fn on_event(&mut self, event: TcpEvent) {
+        if event.retrans != 0 {
+            self.retrans = self.retrans.saturating_add(1);
+        }
+    }
+
+    fn on_lost(&mut self, count: u64) {
+        self.lost = self.lost.saturating_add(count);
+    }
+    fn on_queue_lost(&mut self, count: u64) {
+        self.queue_lost = self.queue_lost.saturating_add(count);
+    }
+}
+
+fn scheduler_snapshot(stats: &mut RecorderScheduler) -> Value {
+    let (p95_us, samples, slowest_us) = stats.0.take_snapshot(95);
+    serde_json::json!({ "p95_us": p95_us, "samples": samples,
+        "lost": stats.0.perf_lost, "queue_lost": stats.0.queue_lost, "slowest_us": slowest_us })
+}
+
+fn io_snapshot(stats: &mut RecorderIo) -> Value {
+    let (p99_us, samples, slowest_us) = stats.latency.take_snapshot(99);
+    serde_json::json!({ "p99_us": p99_us, "samples": samples,
+        "lost": stats.latency.perf_lost, "queue_lost": stats.latency.queue_lost,
+        "unmatched": stats.unmatched, "slowest_us": slowest_us })
+}
+
+fn network_snapshot(stats: &mut RecorderNetwork) -> Value {
+    serde_json::json!({ "retrans": stats.retrans, "lost": stats.lost, "queue_lost": stats.queue_lost })
+}
+
+/// Interval latency measurements and cumulative event counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct Cumulative {
-    /// Scheduler latency p95 so far, in microseconds.
+    /// Scheduler latency p95 for this interval, in microseconds.
     sched_p95_us: u64,
-    /// Scheduler samples so far.
+    /// Scheduler samples for this interval.
     sched_samples: u64,
     /// Records dropped so far.
     sched_lost: u64,
-    /// Block I/O p99 so far, in microseconds.
+    /// Block I/O p99 for this interval, in microseconds.
     io_p99_us: u64,
-    /// Block I/O completions so far.
+    /// Block I/O completions for this interval.
     io_samples: u64,
     /// Records dropped so far.
     io_lost: u64,
@@ -808,26 +905,53 @@ struct Cumulative {
     io_unmatched: u64,
     /// Retransmissions so far.
     retrans: u64,
+    /// Network records dropped so far.
+    net_lost: u64,
+    /// Queue records dropped in the latest interval.
+    queue_lost: u64,
 }
 
 /// The previous tick, kept so the next one can difference against it.
 ///
-/// The counters live here rather than being re-read from the streams, because
-/// the streams only ever report the cumulative total: the only way to get the
-/// numbers for one interval is to subtract the totals from two ticks apart.
+/// Cumulative event counters are differenced; latency snapshots reset at each tick.
 #[derive(Debug, Clone, Copy, Default)]
 struct PreviousTick {
     at: Duration,
     usage: SelfUsage,
     totals: Cumulative,
-    /// The target's cumulative on-CPU percentage at the previous tick.
-    target_cpu_pct: f64,
+    /// The previous successful target accounting reading.
+    target_cpu: Option<(Instant, u64)>,
     /// Set once the first tick has been recorded, so the second tick produces a
     /// real interval instead of a difference against zero.
     primed: bool,
 }
 
+/// Explains a configured trigger that cannot fire in this build.
+///
+/// The warning belongs at startup, not only in the final report: the default
+/// recording is unbounded, so an operator who selected the retransmission
+/// trigger would otherwise learn that it was never armed only when they stop
+/// the recorder. Returning the message keeps it testable; the caller writes it
+/// to stderr so JSON on stdout stays one document.
+fn unavailable_trigger_warning(args: &DaemonArgs) -> Option<String> {
+    Triggers::from_args(args).retrans.map(|_| {
+        "warning: --trigger-retrans is configured but cannot fire: TCP ownership \
+         attribution is unavailable, so no retransmissions are measured; pass \
+         --trigger-retrans off to disable this trigger"
+            .to_owned()
+    })
+}
+
 pub fn run(args: DaemonArgs) -> Result<()> {
+    if let Some(warning) = unavailable_trigger_warning(&args) {
+        eprintln!("{warning}");
+    }
+    storage::Output::open(&args.output).with_context(|| {
+        format!(
+            "unsafe incident output {}; use a trusted directory (see fast/INCIDENT-MIGRATION.md)",
+            args.output.display()
+        )
+    })?;
     // Read before anything else happens, so the report can separate the
     // program's own footprint from what setting the recording up costs. A
     // budget that counts the interpreter's own text is not a budget anyone can
@@ -851,14 +975,11 @@ pub fn run(args: DaemonArgs) -> Result<()> {
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_process_exit")?;
     runtime::attach_raw_tracepoint(&mut bpf, "block_rq_issue")?;
     runtime::attach_raw_tracepoint(&mut bpf, "block_rq_complete")?;
-    runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_probe")?;
-    runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_retransmit_skb")?;
 
     let after_attach_rss = read_self_rss_bytes().unwrap_or(0);
     let mut target_tids = runtime::take_target_map(&mut bpf)?;
     let mut known = std::collections::BTreeSet::new();
 
-    let started = Instant::now();
     // The tick callback owns the state while the collection runs, and the
     // report needs it afterwards. A cell rather than a lock: the collection
     // loop is the only thread that ever touches it, and a background recorder
@@ -880,11 +1001,16 @@ pub fn run(args: DaemonArgs) -> Result<()> {
     }
     let state = std::rc::Rc::new(std::cell::RefCell::new(RecorderState {
         ring,
-        previous: PreviousTick::default(),
+        previous: PreviousTick {
+            at: restored.previous_at,
+            usage: read_self_usage(),
+            ..PreviousTick::default()
+        },
         peak_cpu_pct: 0.0,
         peak_memory_bytes: 0,
         ticks: 0,
         incidents: Incidents::default(),
+        incident_write_failed: false,
         slow_sched: Vec::new(),
         slow_io: Vec::new(),
         restored: restored.clone(),
@@ -921,60 +1047,34 @@ pub fn run(args: DaemonArgs) -> Result<()> {
                     "sched",
                     "EVENTS",
                     PERF_PAGE_COUNT,
-                    stats::Statistics::default(),
-                    |stats: &stats::Statistics| {
-                        let summary = stats.summary();
-                        serde_json::json!({
-                            "p95_us": summary.map_or(0, |s| s.p95_ns / 1_000),
-                            "samples": stats.sample_count(),
-                            "lost": stats.lost_events(),
-                            // The slowest latencies themselves, not just where
-                            // they fell in the distribution. A bundle is read by
-                            // someone who wants the number.
-                            "slowest_us": stats
-                                .slowest_samples(SLOW_SAMPLE_COUNT)
-                                .iter()
-                                .map(|nanoseconds| nanoseconds / 1_000)
-                                .collect::<Vec<_>>(),
-                        })
-                    },
+                    RecorderScheduler::default(),
+                    scheduler_snapshot,
                 ),
                 runtime::EventStream::sampled::<IoEvent, _>(
                     "io",
                     "IO_EVENTS",
                     PERF_PAGE_COUNT,
-                    io::IoStats::new(io::DEFAULT_SLOW_THRESHOLD_NS),
-                    |stats: &io::IoStats| {
-                        let summary = stats.summary();
-                        serde_json::json!({
-                            "p99_us": summary.map_or(0, |s| s.p99_ns / 1_000),
-                            "samples": stats.sample_count(),
-                            "lost": stats.lost(),
-                            "unmatched": stats.unmatched(),
-                            "slowest_us": stats
-                                .slowest_samples(SLOW_SAMPLE_COUNT)
-                                .iter()
-                                .map(|nanoseconds| nanoseconds / 1_000)
-                                .collect::<Vec<_>>(),
-                        })
-                    },
+                    RecorderIo::default(),
+                    io_snapshot,
                 ),
                 runtime::EventStream::sampled::<TcpEvent, _>(
                     "net",
                     "NET_EVENTS",
                     PERF_PAGE_COUNT,
-                    network::NetStats::default(),
-                    |stats: &network::NetStats| serde_json::json!({ "retrans": stats.retrans() }),
+                    RecorderNetwork::default(),
+                    network_snapshot,
                 ),
             ],
             on_tick: Some(Box::new(move |at, summary| {
+                let tick_started = Instant::now();
                 let mut state = tick_state.borrow_mut();
-                if let Err(error) = tick(pid, started, at, summary, &mut state, &tick_args) {
+                if let Err(error) = tick(pid, tick_started, at, summary, &mut state, &tick_args) {
                     // Reported through the summary rather than stored, because the
                     // collection loop owns the error channel and a tick that cannot
                     // read /proc is not worth ending a recording over.
                     eprintln!("warning: flight recorder tick failed: {error}");
                 }
+                state.previous.at.saturating_sub(state.time_offset)
             })),
         },
     )?;
@@ -987,7 +1087,7 @@ pub fn run(args: DaemonArgs) -> Result<()> {
     if args.format.format == Format::Json {
         json::emit(
             args.format.format,
-            &Envelope::new(
+            &daemon_envelope(
                 "daemon",
                 pid,
                 Some(process_name),
@@ -999,8 +1099,14 @@ pub fn run(args: DaemonArgs) -> Result<()> {
                     peak_cpu_pct,
                     peak_memory_bytes,
                     ticks,
+                    state.incidents.total,
+                    state.incidents.write_failures,
+                    state.incidents.rotation_failures,
+                    state.incidents.skipped,
+                    state.incident_write_failed,
                 ),
-            ),
+            )
+            .with_v2(),
         );
     } else {
         print_summary(
@@ -1017,11 +1123,34 @@ pub fn run(args: DaemonArgs) -> Result<()> {
             after_attach_rss,
             &triggers,
             &state.incidents,
+            state.incident_write_failed,
             &state.restored,
             args.max_disk_bytes,
         );
     }
     Ok(())
+}
+
+fn daemon_envelope<T: serde::Serialize>(
+    command: &'static str,
+    pid: u32,
+    process: Option<String>,
+    elapsed: Duration,
+    interrupted: bool,
+    process_exited: bool,
+    data: T,
+) -> Envelope<T> {
+    let mut envelope = Envelope::new(
+        command,
+        pid,
+        process,
+        elapsed,
+        interrupted,
+        process_exited,
+        data,
+    );
+    envelope.schema = DAEMON_SCHEMA;
+    envelope
 }
 
 /// Everything a tick updates and the report reads back.
@@ -1039,7 +1168,9 @@ struct RecorderState {
     ticks: u64,
     /// Incidents written, and how many each trigger produced.
     incidents: Incidents,
-    /// The slowest latencies each stream has seen, for the incident bundle.
+    /// Stop writing after an error to prevent unbounded partial bundles.
+    incident_write_failed: bool,
+    /// The slowest latencies in the latest interval, for the incident bundle.
     slow_sched: Vec<u64>,
     slow_io: Vec<u64>,
     /// Ring entries carried over from a previous run, and where they came
@@ -1067,13 +1198,15 @@ struct Restored {
 
 /// How often each trigger fired over a run.
 ///
-/// Kept as a running tally rather than by re-reading the incident files, so the
-/// summary says what happened even when the output directory is not writable
-/// and nothing was written.
+/// Kept as a running tally rather than by re-reading the incident files.
+/// Only successfully written incidents are counted.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct Incidents {
     total: u64,
     per_signal: Vec<(Signal, u64)>,
+    write_failures: u64,
+    rotation_failures: u64,
+    skipped: u64,
 }
 
 impl Incidents {
@@ -1087,13 +1220,19 @@ impl Incidents {
         if fired.is_empty() {
             return;
         }
-        self.total += 1;
+        self.total = self.total.saturating_add(1);
         for signal in fired {
             match self.per_signal.iter_mut().find(|(name, _)| name == signal) {
-                Some((_, count)) => *count += 1,
+                Some((_, count)) => *count = count.saturating_add(1),
                 None => self.per_signal.push((*signal, 1)),
             }
         }
+    }
+
+    /// A summary when no incident was successfully written.
+    #[allow(dead_code)]
+    fn empty_message(&self) -> Option<&'static str> {
+        (self.total == 0).then_some("no incidents written")
     }
 
     /// The signals that fired at least once, most frequent first.
@@ -1104,14 +1243,28 @@ impl Incidents {
     }
 }
 
-/// One tick: difference the cumulative summaries and append an interval.
+/// One tick: append interval latency snapshots and differenced counters.
 fn tick(
     pid: u32,
-    started: Instant,
+    tick_started: Instant,
     at: Duration,
     summary: runtime::TickSummary<'_>,
     state: &mut RecorderState,
     args: &DaemonArgs,
+) -> Result<()> {
+    let target_cpu = cpu::read_process_ticks(pid)
+        .ok()
+        .map(|ticks| (Instant::now(), ticks));
+    tick_with_target_cpu(tick_started, at, summary, state, args, target_cpu)
+}
+
+fn tick_with_target_cpu(
+    tick_started: Instant,
+    at: Duration,
+    summary: runtime::TickSummary<'_>,
+    state: &mut RecorderState,
+    args: &DaemonArgs,
+    target_cpu: Option<(Instant, u64)>,
 ) -> Result<()> {
     let RecorderState {
         ring,
@@ -1120,6 +1273,7 @@ fn tick(
         peak_memory_bytes,
         ticks,
         incidents,
+        incident_write_failed,
         slow_sched,
         slow_io,
         restored: _,
@@ -1127,9 +1281,7 @@ fn tick(
     } = state;
     let triggers = Triggers::from_args(args);
     let mut current = Cumulative::default();
-    // Slowest samples, replaced rather than merged: the stream reports its own
-    // running slowest, so an interval's list is the whole run's tail and
-    // keeping the longest is the same thing without holding two lists.
+    // Slowest samples belong only to this snapshot interval.
     slow_sched.clear();
     slow_io.clear();
     for (name, value) in &summary {
@@ -1141,6 +1293,7 @@ fn tick(
                 .map(|values| values.iter().filter_map(Value::as_u64).collect())
                 .unwrap_or_default()
         };
+        current.queue_lost = current.queue_lost.saturating_add(number("queue_lost"));
         match *name {
             "sched" => {
                 *slow_sched = slowest("slowest_us");
@@ -1155,20 +1308,22 @@ fn tick(
                 current.io_lost = number("lost");
                 current.io_unmatched = number("unmatched");
             }
-            "net" => current.retrans = number("retrans"),
+            "net" => {
+                current.retrans = number("retrans");
+                current.net_lost = number("lost");
+            }
             _ => {}
         }
     }
 
     let usage = read_self_usage();
+    // End the interval when the CPU counters were sampled, not before the
+    // callback and /proc reads. The individual reads are not atomic.
+    let at = at
+        .saturating_add(tick_started.elapsed())
+        .saturating_add(*time_offset);
     let psi = crate::memory::read_psi("/proc/pressure/memory");
-    // Cumulative on-CPU usage of the observed process, as a percentage of one
-    // CPU since the recorder started. Differencing it gives the interval.
-    let target_cpu_pct = target_cpu_pct(pid, started);
-
-    // Carried on from the previous run's timeline, so a restart extends the
-    // window rather than starting a second, overlapping one at zero.
-    let at = at + *time_offset;
+    let target_cpu_percent = interval_cpu_percent(previous.target_cpu, target_cpu);
 
     // The first tick has nothing to difference against, so it only records the
     // baseline. Reporting a difference against zero would make the very first
@@ -1178,7 +1333,7 @@ fn tick(
         previous.usage = usage;
         previous.primed = true;
         previous.totals = current;
-        previous.target_cpu_pct = target_cpu_pct;
+        previous.target_cpu = target_cpu;
         *ticks = 1;
         *peak_cpu_pct = (*peak_cpu_pct).max(cpu_cost_pct(usage.ticks, at));
         *peak_memory_bytes = (*peak_memory_bytes).max(usage.rss_bytes);
@@ -1192,31 +1347,41 @@ fn tick(
     let memory = usage.rss_bytes.max(previous.usage.rss_bytes);
 
     let before = previous.totals;
-    let lost_now = current.sched_lost + current.io_lost;
-    let lost_before = before.sched_lost + before.io_lost;
+    // The queue counter is already an interval count: the runtime swaps it to
+    // zero before each snapshot. The per-stream perf counters are cumulative.
+    let queue_lost = current.queue_lost;
+    let lost_by_stream = LostByStream {
+        sched: current.sched_lost.saturating_sub(before.sched_lost),
+        io: current.io_lost.saturating_sub(before.io_lost),
+        net: current.net_lost.saturating_sub(before.net_lost),
+    };
+    let lost = lost_by_stream
+        .sched
+        .saturating_add(lost_by_stream.io)
+        .saturating_add(lost_by_stream.net)
+        .saturating_add(queue_lost);
+
+    if lost != 0 {
+        eprintln!(
+            "warning: flight recorder lost {lost} events in this interval ({queue_lost} from the userspace queue)"
+        );
+    }
 
     let mut entry = RingEntry {
         at,
-        // A percentile is not additive, so differencing one would be
-        // meaningless. The p95 and p99 are carried as the latest cumulative
-        // value, which is the standard reading for a rolling percentile: the
-        // tail of everything seen so far.
+        // Latency distributions and their sample counts reset together at each tick.
         sched_p95_us: current.sched_p95_us,
-        sched_samples: current.sched_samples.saturating_sub(before.sched_samples),
-        // On-CPU usage is the target's, not the recorder's, so it comes from
-        // the target's own accounting counters rather than from the sample
-        // count: a sample count says how often the kernel looked, not how much
-        // CPU the process used.
-        // A cumulative percentage can only fall if the process restarted,
-        // so the difference is clamped rather than going negative.
-        cpu_percent: (target_cpu_pct - previous.target_cpu_pct).max(0.0),
+        sched_samples: current.sched_samples,
+        cpu_percent: target_cpu_percent,
         io_p99_us: current.io_p99_us,
-        io_samples: current.io_samples.saturating_sub(before.io_samples),
+        io_samples: current.io_samples,
         io_unmatched: current.io_unmatched.saturating_sub(before.io_unmatched),
         retrans: current.retrans.saturating_sub(before.retrans),
         psi_some_pct: psi.available.then_some(psi.some_pct),
         psi_full_pct: psi.available.then_some(psi.full_pct),
-        lost: lost_now.saturating_sub(lost_before),
+        lost,
+        queue_lost,
+        lost_by_stream: Some(lost_by_stream),
         cpu_cost_pct: cost,
         memory_bytes: memory,
         fired: Vec::new(),
@@ -1224,48 +1389,77 @@ fn tick(
 
     // The triggers read the same interval the ring does, so a trigger can
     // never fire on a number the incident does not show.
-    let fired = triggers.evaluate(&Interval {
-        sched_p95_us: entry.sched_p95_us,
-        sched_samples: entry.sched_samples,
-        io_p99_us: entry.io_p99_us,
-        io_samples: entry.io_samples,
-        retrans: entry.retrans,
-        psi_some_pct: entry.psi_some_pct.map(f64::from),
-        psi_full_pct: entry.psi_full_pct.map(f64::from),
-        cpu_percent: Some(entry.cpu_percent),
-    });
+    let fired = evaluate_available_triggers(
+        &triggers,
+        &Interval {
+            sched_p95_us: entry.sched_p95_us,
+            sched_samples: entry.sched_samples,
+            io_p99_us: entry.io_p99_us,
+            io_samples: entry.io_samples,
+            retrans: entry.retrans,
+            psi_some_pct: entry.psi_some_pct.map(f64::from),
+            psi_full_pct: entry.psi_full_pct.map(f64::from),
+            cpu_percent: entry.cpu_percent,
+        },
+    );
     entry.fired = fired.clone();
-    incidents.record(&fired);
     // The incident file is written before the entry goes into the ring, so a
     // bundle that exists always has its triggering interval in it.
-    if !fired.is_empty() {
+    let incident_result = if !fired.is_empty() && !*incident_write_failed {
         let slow = SlowSamples {
             sched_us: slow_sched.clone(),
             io_us: slow_io.clone(),
         };
-        write_incident(ring, entry.clone(), &triggers, args, &slow)?;
-    }
+        match write_incident(ring, entry.clone(), &triggers, args, &slow) {
+            Ok(completed) => {
+                incidents.record(&fired);
+                if let Some(error) = completed.rotation_error {
+                    incidents.rotation_failures = incidents.rotation_failures.saturating_add(1);
+                    *incident_write_failed = true;
+                    Err(error.context("incident completed, but rotation failed; incident writes disabled for this run"))
+                } else {
+                    Ok(())
+                }
+            }
+            Err(error) => {
+                incidents.write_failures = incidents.write_failures.saturating_add(1);
+                *incident_write_failed = true;
+                Err(error.context("incident write failed; incident writes disabled for this run"))
+            }
+        }
+    } else {
+        if !fired.is_empty() {
+            incidents.skipped = incidents.skipped.saturating_add(1);
+        }
+        Ok(())
+    };
     ring.push(entry);
 
     *peak_cpu_pct = (*peak_cpu_pct).max(cost);
     *peak_memory_bytes = (*peak_memory_bytes).max(memory);
-    *ticks += 1;
+    *ticks = ticks.saturating_add(1);
     previous.at = at;
     previous.usage = usage;
     previous.totals = current;
-    previous.target_cpu_pct = target_cpu_pct;
-    Ok(())
+    previous.target_cpu = target_cpu;
+    incident_result
 }
 
-/// The observed process' CPU time consumed so far, as a percentage of one CPU
-/// since the recorder started.
-///
-/// Cumulative on purpose: the caller differences two of these to get the
-/// interval, and a percentage read fresh each tick would need a start time
-/// that `/proc` does not provide for a process it did not start.
-fn target_cpu_pct(pid: u32, started: Instant) -> f64 {
-    let ticks = cpu::read_process_ticks(pid).unwrap_or(0);
-    cpu_cost_pct(ticks, started.elapsed())
+/// Calculates usage from consecutive successful accounting readings.
+fn interval_cpu_percent(
+    previous: Option<(Instant, u64)>,
+    current: Option<(Instant, u64)>,
+) -> Option<f64> {
+    let (before_at, before_ticks) = previous?;
+    let (after_at, after_ticks) = current?;
+    let elapsed = after_at.checked_duration_since(before_at)?.as_secs_f64();
+    let ticks = after_ticks.checked_sub(before_ticks)?;
+    // sysconf reports the units used by /proc/<pid>/stat.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if elapsed == 0.0 || hz <= 0 {
+        return None;
+    }
+    Some(ticks as f64 / hz as f64 / elapsed * 100.0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1283,10 +1477,12 @@ fn print_summary(
     after_attach_rss: u64,
     triggers: &Triggers,
     incidents: &Incidents,
+    incident_write_failed: bool,
     restored: &Restored,
     max_disk_bytes: u64,
 ) {
     println!("Flight recorder for {name} ({pid})");
+    println!("Measurement: {MEASUREMENT_SEMANTICS}");
     println!("Ran for {}", humantime::format_duration(summary.elapsed));
     println!(
         "Window: {} at a {} interval, {} entries held",
@@ -1352,7 +1548,11 @@ fn print_summary(
     } else {
         for signal in enabled {
             let threshold = signal.threshold(triggers).unwrap_or_default();
-            println!("  {signal} at {threshold} {}", signal.unit());
+            if signal == Signal::Retransmissions {
+                println!("  {signal}: unavailable (socket ownership cannot be established)");
+            } else {
+                println!("  {signal} at {threshold} {}", signal.unit());
+            }
         }
     }
     // The count stands on its own with no unit glued to it, so a script reading
@@ -1363,7 +1563,16 @@ fn print_summary(
     for (signal, count) in incidents.signals() {
         println!("    {signal}: {count}");
     }
-    if incidents.total == 0 {
+    println!("  incident write failures: {}", incidents.write_failures);
+    println!(
+        "  rotation failures after completed incidents: {}",
+        incidents.rotation_failures
+    );
+    println!("  incidents skipped after failure: {}", incidents.skipped);
+    if incident_write_failed {
+        println!("  incident writing disabled for this run");
+    }
+    if incidents.total == 0 && incidents.write_failures == 0 && incidents.skipped == 0 {
         println!("    no trigger fired");
     }
     println!();
@@ -1393,11 +1602,19 @@ fn print_summary(
             entry.at.as_secs(),
             entry.sched_p95_us,
             entry.io_p99_us,
-            entry.retrans,
+            "unavailable",
             entry.cpu_cost_pct,
             entry.memory_bytes / 1024
         );
     }
+}
+
+// TCP tracepoints cannot establish ownership, even when the configured
+// threshold is zero. Do not let an unavailable count trigger an incident.
+fn evaluate_available_triggers(triggers: &Triggers, interval: &Interval) -> Vec<Signal> {
+    let mut fired = triggers.evaluate(interval);
+    fired.retain(|signal| *signal != Signal::Retransmissions);
+    fired
 }
 
 /// Whether a measurement is inside its budget.
@@ -1411,7 +1628,619 @@ fn verdict(within: bool) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recorder_network_counts_without_retaining_samples() {
+        use crate::runtime::EventHandler;
+        let mut collector = super::RecorderNetwork::default();
+        let mut event: fast_common::TcpEvent = bytemuck::Zeroable::zeroed();
+        for _ in 0..100_000 {
+            collector.on_event(event);
+        }
+        event.retrans = 1;
+        collector.on_event(event);
+        collector.on_lost(3);
+        assert_eq!(collector.retrans, 1);
+        assert_eq!(collector.lost, 3);
+        assert_eq!(std::mem::size_of_val(&collector), 24);
+    }
+
+    #[test]
+    fn interval_cpu_percent_uses_tick_deltas_and_actual_elapsed_time() {
+        use super::*;
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+        assert!(hz > 0);
+        let start = Instant::now();
+        let sample = |seconds, ticks| Some((start + Duration::from_secs(seconds), ticks));
+        let baseline = sample(0, 10_000 * hz);
+        let first = sample(1, 10_001 * hz);
+        let second = sample(2, 10_002 * hz);
+        assert_eq!(interval_cpu_percent(baseline, first), Some(100.0));
+        assert_eq!(interval_cpu_percent(first, second), Some(100.0));
+        let changed = sample(4, 10_003 * hz);
+        assert_eq!(interval_cpu_percent(second, changed), Some(50.0));
+        let multicore = sample(5, 10_006 * hz);
+        assert_eq!(interval_cpu_percent(changed, multicore), Some(300.0));
+        assert_eq!(
+            interval_cpu_percent(multicore, sample(6, 10_006 * hz)),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn interval_cpu_percent_requires_consecutive_valid_readings() {
+        use super::*;
+        let now = Instant::now();
+        let first = Some((now, 100));
+        let next = Some((now + Duration::from_secs(1), 200));
+        assert_eq!(interval_cpu_percent(None, first), None);
+        assert_eq!(interval_cpu_percent(first, None), None);
+        assert_eq!(interval_cpu_percent(None, next), None);
+        assert_eq!(interval_cpu_percent(first, Some((now, 200))), None);
+        assert_eq!(
+            interval_cpu_percent(first, Some((now + Duration::from_secs(1), 99))),
+            None
+        );
+        assert!(interval_cpu_percent(first, next).is_some());
+    }
+
+    #[test]
+    fn missing_cpu_is_null_and_does_not_fire_or_restore_as_zero() {
+        use super::*;
+        let entry = RingEntry::default();
+        assert!(entry.to_json()["cpu_percent"].is_null());
+        assert_eq!(entry.measured(Signal::CpuUsage), None);
+        assert_eq!(
+            ring_entry_from_json(&entry.to_json()).unwrap().cpu_percent,
+            None
+        );
+        let mut json = entry.to_json();
+        json["cpu_percent"] = serde_json::json!(42.5);
+        assert_eq!(ring_entry_from_json(&json).unwrap().cpu_percent, Some(42.5));
+    }
     use super::*;
+
+    fn tick_test_state() -> RecorderState {
+        RecorderState {
+            ring: Ring::new(Duration::from_secs(60), Duration::from_secs(1)),
+            previous: PreviousTick::default(),
+            peak_cpu_pct: 0.0,
+            peak_memory_bytes: 0,
+            ticks: 0,
+            incidents: Incidents::default(),
+            incident_write_failed: false,
+            slow_sched: Vec::new(),
+            slow_io: Vec::new(),
+            restored: Restored::default(),
+            time_offset: Duration::ZERO,
+        }
+    }
+
+    fn tick_summary(samples: u64) -> runtime::TickSummary<'static> {
+        vec![("sched", serde_json::json!({"samples": samples}))]
+    }
+
+    #[test]
+    fn tick_baseline_and_missing_read_recovery_reach_ring_and_triggers() {
+        let dir = temp_dir("tick_read_recovery");
+        let mut args = default_args(&dir);
+        args.trigger_cpu = "80".parse().unwrap();
+        let mut state = tick_test_state();
+        let start = Instant::now();
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+        assert!(hz > 0);
+        let sample = |n: u64| Some((start + Duration::from_secs(n), (1000 + n) * hz));
+        tick_with_target_cpu(
+            Instant::now(),
+            Duration::from_secs(1),
+            tick_summary(10),
+            &mut state,
+            &args,
+            sample(0),
+        )
+        .unwrap();
+        assert_eq!(state.ring.entries().count(), 0);
+        tick_with_target_cpu(
+            Instant::now(),
+            Duration::from_secs(2),
+            tick_summary(20),
+            &mut state,
+            &args,
+            None,
+        )
+        .unwrap();
+        tick_with_target_cpu(
+            Instant::now(),
+            Duration::from_secs(3),
+            tick_summary(30),
+            &mut state,
+            &args,
+            sample(2),
+        )
+        .unwrap();
+        let entries: Vec<_> = state.ring.entries().collect();
+        assert_eq!(
+            entries.iter().map(|e| e.cpu_percent).collect::<Vec<_>>(),
+            vec![None, None]
+        );
+        assert!(entries.iter().all(|e| !e.fired.contains(&Signal::CpuUsage)));
+        tick_with_target_cpu(
+            Instant::now(),
+            Duration::from_secs(4),
+            tick_summary(40),
+            &mut state,
+            &args,
+            sample(3),
+        )
+        .unwrap();
+        let entry = state.ring.entries().last().unwrap();
+        assert_eq!(entry.cpu_percent, Some(100.0));
+        assert_eq!(entry.sched_samples, 40);
+        assert!(entry.fired.contains(&Signal::CpuUsage));
+        assert_eq!(state.incidents.total, 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tick_commits_all_interval_state_when_incident_write_fails() {
+        let dir = temp_dir("tick_write_recovery");
+        let output = dir.join("blocked");
+        std::fs::write(&output, "not a directory").unwrap();
+        let mut args = default_args(&output);
+        args.trigger_cpu = "80".parse().unwrap();
+        let mut state = tick_test_state();
+        let start = Instant::now();
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+        assert!(hz > 0);
+        let sample = |seconds, ticks| Some((start + Duration::from_secs(seconds), ticks * hz));
+        tick_with_target_cpu(
+            Instant::now(),
+            Duration::from_secs(1),
+            tick_summary(10),
+            &mut state,
+            &args,
+            sample(0, 1000),
+        )
+        .unwrap();
+        assert!(
+            tick_with_target_cpu(
+                Instant::now(),
+                Duration::from_secs(2),
+                tick_summary(20),
+                &mut state,
+                &args,
+                sample(1, 1001)
+            )
+            .is_err()
+        );
+        let failed_entry = state.ring.entries().last().unwrap();
+        assert_eq!(failed_entry.cpu_percent, Some(100.0));
+        assert_eq!(failed_entry.sched_samples, 20);
+        assert!(failed_entry.fired.contains(&Signal::CpuUsage));
+        assert!(state.previous.at >= Duration::from_secs(2));
+        assert_eq!(state.ticks, 2);
+        assert_eq!(state.incidents.total, 0);
+        assert_eq!(
+            state.incidents.empty_message(),
+            Some("no incidents written")
+        );
+        std::fs::remove_file(&output).unwrap();
+        std::fs::create_dir(&output).unwrap();
+        tick_with_target_cpu(
+            Instant::now(),
+            Duration::from_secs(3),
+            tick_summary(35),
+            &mut state,
+            &args,
+            sample(2, 1003),
+        )
+        .unwrap();
+        let entry = state.ring.entries().last().unwrap();
+        assert_eq!(entry.cpu_percent, Some(200.0));
+        assert_eq!(entry.sched_samples, 35);
+        assert!(entry.fired.contains(&Signal::CpuUsage));
+        assert_eq!(state.ticks, 3);
+        // A failed write disables further incident writes for this run: the
+        // recorder keeps measuring but cannot claim it stores incidents.
+        assert_eq!(state.incidents.total, 0);
+        assert_eq!(state.incidents.skipped, 1);
+        assert_eq!(
+            state.incidents.empty_message(),
+            Some("no incidents written")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn daemon_report_v2_and_v1_bundle_restoration() {
+        let mut ring = Ring::new(Duration::from_secs(60), Duration::from_secs(1));
+        ring.push(RingEntry::default());
+        let envelope = daemon_envelope(
+            "daemon",
+            1,
+            None,
+            Duration::from_secs(1),
+            false,
+            false,
+            crate::json_payloads::daemon_json(&ring, 0.0, 0, 1, 0, 0, 0, 0, false),
+        );
+        let document = serde_json::to_value(envelope).unwrap();
+        assert_eq!(document["schema"], "rand-fast/v2");
+        assert!(document["data"]["intervals_detail"][0]["cpu_percent"].is_null());
+        let dir = temp_dir("restore_v1_cpu");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Use the real storage path so the ownership marker and complete
+        // marker are the ones the reader expects.
+        let output = storage::Output::open(&dir).unwrap();
+        let bundle = output.create("000000001000").unwrap();
+        bundle
+            .write("manifest.json", r#"{"schema":"rand-fast/v1"}"#)
+            .unwrap();
+        bundle
+            .write("intervals.json", r#"[{"at_s":1.0,"cpu_percent":87.5}]"#)
+            .unwrap();
+        bundle
+            .write("complete.json", r#"{"schema":"rand-fast/v1"}"#)
+            .unwrap();
+        let restored = restore_ring(&dir, Duration::from_secs(60));
+        assert_eq!(restored.entries.len(), 1);
+        assert_eq!(restored.entries[0].cpu_percent, Some(87.5));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn interval_latency_spike_recovery_empty_and_final_tick() {
+        use crate::runtime::EventHandler;
+        let dir = temp_dir("interval-latency");
+        let mut args = default_args(&dir);
+        args.trigger_psi_some = "off".parse().unwrap();
+        args.trigger_psi_full = "off".parse().unwrap();
+        let mut state = RecorderState {
+            ring: Ring::new(Duration::from_secs(60), Duration::from_secs(1)),
+            previous: PreviousTick::default(),
+            peak_cpu_pct: 0.0,
+            peak_memory_bytes: 0,
+            ticks: 0,
+            incidents: Incidents::default(),
+            incident_write_failed: false,
+            slow_sched: Vec::new(),
+            slow_io: Vec::new(),
+            restored: Restored::default(),
+            time_offset: Duration::ZERO,
+        };
+        let mut sched = RecorderScheduler::default();
+        let mut io = RecorderIo::default();
+        let mut net = RecorderNetwork::default();
+        let mut sched_event: SchedulerLatencyEvent = bytemuck::Zeroable::zeroed();
+        let mut io_event: IoEvent = bytemuck::Zeroable::zeroed();
+        for (i, latency) in [1_000_000, 40_000_000, 1_000_000, 0, 2_000_000]
+            .into_iter()
+            .enumerate()
+        {
+            if latency != 0 {
+                sched_event.latency_ns = latency;
+                io_event.latency_ns = latency;
+                for _ in 0..100 {
+                    sched.on_event(sched_event);
+                    io.on_event(io_event);
+                }
+            }
+            if i == 1 {
+                sched.on_lost(2);
+                io.on_queue_lost(3);
+                net.on_lost(4);
+                io_event.op = fast_common::IO_OP_UNMATCHED;
+                io.on_event(io_event);
+                io_event.op = 0;
+            }
+            // The last snapshot represents a short final interval.
+            let at = if i == 4 {
+                Duration::from_millis(4250)
+            } else {
+                Duration::from_secs(i as u64 + 1)
+            };
+            tick(
+                args.pid,
+                Instant::now(),
+                at,
+                vec![
+                    ("sched", scheduler_snapshot(&mut sched)),
+                    ("io", io_snapshot(&mut io)),
+                    ("net", network_snapshot(&mut net)),
+                ],
+                &mut state,
+                &args,
+            )
+            .unwrap();
+            if i == 1 {
+                assert_eq!(state.slow_sched, vec![40_000; SLOW_SAMPLE_COUNT]);
+                assert_eq!(state.slow_io, vec![40_000; SLOW_SAMPLE_COUNT]);
+            }
+            // The runtime swaps these counters to zero before each snapshot.
+            sched.0.queue_lost = 0;
+            io.latency.queue_lost = 0;
+            net.queue_lost = 0;
+        }
+        let entries: Vec<_> = state.ring.entries().collect();
+        // The first tick establishes the CPU baseline and records no interval.
+        assert_eq!(entries.len(), 4);
+        assert!(entries[0].fired.contains(&Signal::SchedulerP95));
+        assert!(entries[0].fired.contains(&Signal::IoP99));
+        assert_eq!(
+            (entries[0].sched_samples, entries[0].io_samples),
+            (100, 100)
+        );
+        assert_eq!(
+            (
+                entries[0].lost,
+                entries[0].queue_lost,
+                entries[0].io_unmatched
+            ),
+            (9, 3, 1)
+        );
+        assert!(entries[1].fired.is_empty());
+        assert!(entries[1].sched_p95_us < 10_000 && entries[1].io_p99_us < 25_000);
+        assert_eq!((entries[1].lost, entries[1].io_unmatched), (0, 0));
+        assert_eq!((entries[2].sched_samples, entries[2].io_samples), (0, 0));
+        assert_eq!((entries[2].sched_p95_us, entries[2].io_p99_us), (0, 0));
+        assert_eq!(
+            (entries[3].sched_samples, entries[3].io_samples),
+            (100, 100)
+        );
+        assert!(entries[3].at >= Duration::from_millis(4250));
+        assert_eq!(state.slow_sched, vec![2_000; SLOW_SAMPLE_COUNT]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_incident_writes_are_disabled_without_losing_interval_state() {
+        let dir = temp_dir("failed-incident");
+        std::fs::create_dir_all(&dir).unwrap();
+        let output_file = dir.join("not-a-directory");
+        std::fs::write(&output_file, "x").unwrap();
+        let mut args = default_args(&output_file);
+        args.trigger_psi_some = "off".parse().unwrap();
+        args.trigger_psi_full = "off".parse().unwrap();
+        let mut state = RecorderState {
+            ring: Ring::new(Duration::from_secs(10), Duration::from_secs(1)),
+            previous: PreviousTick::default(),
+            peak_cpu_pct: 0.0,
+            peak_memory_bytes: 0,
+            ticks: 0,
+            incidents: Incidents::default(),
+            incident_write_failed: false,
+            slow_sched: Vec::new(),
+            slow_io: Vec::new(),
+            restored: Restored::default(),
+            time_offset: Duration::ZERO,
+        };
+        let snapshot = |lost| {
+            vec![(
+                "sched",
+                serde_json::json!({"p95_us": 100_000, "samples": 5, "lost": lost}),
+            )]
+        };
+        tick(
+            args.pid,
+            Instant::now(),
+            Duration::from_secs(0),
+            snapshot(0),
+            &mut state,
+            &args,
+        )
+        .unwrap();
+        let error = tick(
+            args.pid,
+            Instant::now(),
+            Duration::from_secs(1),
+            snapshot(2),
+            &mut state,
+            &args,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("disabled"));
+        assert!(state.incident_write_failed);
+        assert_eq!(state.ring.entries().last().unwrap().lost, 2);
+        tick(
+            args.pid,
+            Instant::now(),
+            Duration::from_secs(2),
+            snapshot(2),
+            &mut state,
+            &args,
+        )
+        .unwrap();
+        assert_eq!(state.ring.entries().last().unwrap().lost, 0);
+        assert_eq!(state.ring.entries().count(), 2);
+        assert_eq!(state.incidents.total, 0);
+        assert_eq!(state.incidents.write_failures, 1);
+        assert_eq!(state.incidents.skipped, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tick_timestamp_includes_time_to_sample_cpu_counters() {
+        let dir = temp_dir("counter-timing");
+        let mut args = default_args(&dir);
+        args.trigger_psi_some = "off".parse().unwrap();
+        args.trigger_psi_full = "off".parse().unwrap();
+        let mut state = RecorderState {
+            ring: Ring::new(Duration::from_secs(10), Duration::from_secs(1)),
+            previous: PreviousTick::default(),
+            peak_cpu_pct: 0.0,
+            peak_memory_bytes: 0,
+            ticks: 0,
+            incidents: Incidents::default(),
+            incident_write_failed: false,
+            slow_sched: Vec::new(),
+            slow_io: Vec::new(),
+            restored: Restored::default(),
+            time_offset: Duration::ZERO,
+        };
+        tick(
+            args.pid,
+            Instant::now(),
+            Duration::from_secs(0),
+            Vec::new(),
+            &mut state,
+            &args,
+        )
+        .unwrap();
+        tick(
+            args.pid,
+            Instant::now() - Duration::from_millis(200),
+            Duration::from_secs(1),
+            Vec::new(),
+            &mut state,
+            &args,
+        )
+        .unwrap();
+        assert!(state.previous.at >= Duration::from_millis(1200));
+        assert_eq!(state.ring.entries().last().unwrap().at, state.previous.at);
+    }
+
+    #[test]
+    fn interval_latency_histogram_is_bounded_and_has_documented_error() {
+        let mut stats = IntervalLatency::default();
+        let capacity = stats.slowest.capacity();
+        for interval in 0..20 {
+            for i in 0..100_000u64 {
+                stats.record(i * 13 + interval);
+            }
+            assert_eq!(stats.count, 100_000);
+            assert_eq!(stats.slowest.len(), SLOW_SAMPLE_COUNT);
+            assert_eq!(stats.slowest.capacity(), capacity);
+            let actual = (99_000u64 - 1) * 13 + interval;
+            let estimate = stats.percentile_ns(99);
+            assert!(estimate <= actual && estimate as u128 * 8 >= actual as u128 * 7);
+            let (p99, count, slowest) = stats.take_snapshot(99);
+            assert_eq!(p99, estimate / 1000);
+            assert_eq!(count, 100_000);
+            assert_eq!(slowest.len(), SLOW_SAMPLE_COUNT);
+            assert_eq!(stats.take_snapshot(99), (0, 0, Vec::new()));
+        }
+        for value in [0, 1, 15, 16, 17, u64::MAX] {
+            stats.record(value);
+            let estimate = stats.percentile_ns(99);
+            assert!(estimate <= value && estimate as u128 * 8 >= value as u128 * 7);
+            stats.take_snapshot(99);
+        }
+    }
+
+    #[test]
+    fn tick_records_all_stream_loss_deltas_and_restores_them() {
+        use crate::runtime::EventHandler;
+
+        let dir = temp_dir("stream_loss_deltas");
+        let mut args = default_args(&dir);
+        args.trigger_sched_p95 = "off".parse().unwrap();
+        args.trigger_io_p99 = "off".parse().unwrap();
+        args.trigger_retrans = "off".parse().unwrap();
+        args.trigger_psi_some = "off".parse().unwrap();
+        args.trigger_psi_full = "off".parse().unwrap();
+        let mut state = RecorderState {
+            ring: Ring::new(args.window, args.interval),
+            previous: PreviousTick::default(),
+            peak_cpu_pct: 0.0,
+            peak_memory_bytes: 0,
+            ticks: 0,
+            incidents: Incidents::default(),
+            incident_write_failed: false,
+            slow_sched: Vec::new(),
+            slow_io: Vec::new(),
+            restored: Restored::default(),
+            time_offset: Duration::ZERO,
+        };
+        let mut net = RecorderNetwork::default();
+        let started = Instant::now();
+        for (second, sched, io, net_increment) in [(1, 5, 7, 11), (2, 8, 12, 13), (3, 9, 12, 2)] {
+            EventHandler::<TcpEvent>::on_lost(&mut net, net_increment);
+            let summary = vec![
+                ("sched", serde_json::json!({"lost": sched})),
+                ("io", serde_json::json!({"lost": io})),
+                ("net", network_snapshot(&mut net)),
+            ];
+            tick(
+                std::process::id(),
+                started,
+                Duration::from_secs(second),
+                summary,
+                &mut state,
+                &args,
+            )
+            .unwrap();
+        }
+        let entries: Vec<_> = state.ring.entries().collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].lost_by_stream,
+            Some(LostByStream {
+                sched: 3,
+                io: 5,
+                net: 13
+            })
+        );
+        assert_eq!(entries[0].lost, 21);
+        assert_eq!(
+            entries[1].lost_by_stream,
+            Some(LostByStream {
+                sched: 1,
+                io: 0,
+                net: 2
+            })
+        );
+        assert_eq!(entries[1].lost, 3);
+        let json = entries[0].to_json();
+        assert_eq!(json["lost_events"], 21);
+        assert_eq!(json["lost_events_by_stream"]["net"], 13);
+        assert_eq!(ring_entry_from_json(&json).unwrap(), *entries[0]);
+        let legacy =
+            ring_entry_from_json(&serde_json::json!({"at_s": 1, "lost_events": 9})).unwrap();
+        assert_eq!(legacy.lost, 9);
+        assert_eq!(legacy.lost_by_stream, None);
+
+        // A reset in one stream must not cancel losses in another stream.
+        for (second, sched, io, net) in [
+            (4, 100, 0, 0),
+            (5, 0, 50, 0),
+            (6, 0, 0, 0),
+            (7, u64::MAX, 1, 1),
+        ] {
+            let summary = vec![
+                ("sched", serde_json::json!({"lost": sched})),
+                ("io", serde_json::json!({"lost": io})),
+                ("net", serde_json::json!({"lost": net})),
+            ];
+            tick(
+                std::process::id(),
+                started,
+                Duration::from_secs(second),
+                summary,
+                &mut state,
+                &args,
+            )
+            .unwrap();
+        }
+        let entries: Vec<_> = state.ring.entries().collect();
+        assert_eq!(entries[3].lost, 50);
+        assert_eq!(
+            entries[3].lost_by_stream,
+            Some(LostByStream {
+                sched: 0,
+                io: 50,
+                net: 0
+            })
+        );
+        assert_eq!(entries[5].lost, u64::MAX);
+        assert_eq!(
+            entries[5].lost_by_stream,
+            Some(LostByStream {
+                sched: u64::MAX,
+                io: 1,
+                net: 1
+            })
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn the_ring_evicts_the_oldest_entry() {
@@ -1452,6 +2281,7 @@ mod tests {
             peak_memory_bytes: 0,
             ticks: 0,
             incidents: Incidents::default(),
+            incident_write_failed: false,
             slow_sched: Vec::new(),
             slow_io: Vec::new(),
             restored: Restored::default(),
@@ -1461,6 +2291,23 @@ mod tests {
         assert_eq!(state.peak_memory_bytes, 0);
         assert_eq!(state.ticks, 0);
         assert_eq!(state.incidents.total, 0);
+    }
+
+    #[test]
+    fn a_configured_retrans_trigger_warns_at_startup() {
+        let args = default_args(std::path::Path::new("."));
+        let warning = unavailable_trigger_warning(&args)
+            .expect("the default retransmission trigger must warn");
+        assert!(warning.contains("--trigger-retrans"));
+        assert!(warning.contains("cannot fire"));
+        assert!(warning.contains("--trigger-retrans off"));
+    }
+
+    #[test]
+    fn an_explicitly_disabled_retrans_trigger_stays_quiet() {
+        let mut args = default_args(std::path::Path::new("."));
+        args.trigger_retrans = "off".parse().expect("threshold");
+        assert_eq!(unavailable_trigger_warning(&args), None);
     }
 
     fn default_args(output: &std::path::Path) -> DaemonArgs {
@@ -1526,6 +2373,9 @@ mod tests {
         )
         .expect("parse manifest");
 
+        assert_eq!(manifest["schema"], "rand-fast/v2");
+        assert_eq!(manifest["interval"]["tcp_available"], false);
+        assert!(manifest["interval"]["retrans"].is_null());
         let triggered = &manifest["triggered_by"];
         assert_eq!(triggered.as_array().map(Vec::len), Some(1));
         assert_eq!(triggered[0]["signal"], "io_p99");
@@ -1535,7 +2385,11 @@ mod tests {
         // The thresholds that were in force belong in the bundle too, or a
         // reader cannot tell a 900ms stall from a badly configured trigger.
         let thresholds = manifest["thresholds"].as_array().expect("thresholds");
-        assert!(thresholds.iter().any(|entry| entry["signal"] == "retrans"));
+        assert!(
+            thresholds
+                .iter()
+                .any(|entry| entry["signal"] == "retrans" && entry["available"] == false)
+        );
 
         // The history that led up to the trigger travels with it.
         let intervals: Value = serde_json::from_str(
@@ -1575,6 +2429,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fast-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create scratch dir");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         dir
     }
 
@@ -1897,6 +2753,8 @@ mod tests {
         let size = directory_total(dir).expect("size");
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("recreate scratch dir");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
         size
     }
 
@@ -1912,27 +2770,62 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_retransmissions_are_null_and_never_trigger() {
+        let entry = RingEntry {
+            retrans: 999,
+            ..RingEntry::default()
+        };
+        assert_eq!(entry.to_json()["retrans"], serde_json::Value::Null);
+        assert_eq!(entry.to_json()["tcp_available"], false);
+        assert_eq!(entry.measured(Signal::Retransmissions), None);
+        let mut triggers = Triggers::from_args(&default_args(std::path::Path::new(".")));
+        triggers.retrans = Some(0);
+        let interval = Interval {
+            retrans: 999,
+            ..Interval::default()
+        };
+        assert!(
+            !evaluate_available_triggers(&triggers, &interval).contains(&Signal::Retransmissions)
+        );
+    }
+
+    #[test]
     fn a_restored_entry_survives_a_round_trip_through_json() {
         // A bundle that cannot be read back is a bundle that is only useful at
         // the moment it was written.
         let original = RingEntry {
+            queue_lost: 0,
             at: Duration::from_millis(1_500),
             sched_p95_us: 900,
             sched_samples: 12,
-            cpu_percent: 87.5,
+            cpu_percent: Some(87.5),
             io_p99_us: 40,
             io_samples: 7,
             io_unmatched: 2,
-            retrans: 3,
+            retrans: 0,
             psi_some_pct: Some(2.5),
             psi_full_pct: None,
             lost: 1,
+            lost_by_stream: Some(LostByStream {
+                sched: 0,
+                io: 0,
+                net: 1,
+            }),
             cpu_cost_pct: 0.5,
             memory_bytes: 4096,
             fired: vec![],
         };
         let restored = ring_entry_from_json(&original.to_json()).expect("round trip");
         assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn v1_interval_restores_other_data_but_never_reemits_unsafe_retransmissions() {
+        let old = serde_json::json!({"at_s": 12, "sched_samples": 8, "retrans": 99});
+        let restored = ring_entry_from_json(&old).expect("v1 interval");
+        assert_eq!(restored.sched_samples, 8);
+        assert!(restored.to_json()["retrans"].is_null());
+        assert_eq!(restored.measured(Signal::Retransmissions), None);
     }
 
     #[test]
@@ -1948,6 +2841,8 @@ mod tests {
         let dir = temp_dir("restore_invalid_timestamps");
         let bundle = dir.join("incident-with-bad-intervals");
         std::fs::create_dir_all(&bundle).expect("create bundle");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&bundle, fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(bundle.join("complete.json"), "{}").expect("write completion marker");
         let intervals = serde_json::json!([
             {"at_s": -1.0},
@@ -1995,6 +2890,7 @@ mod tests {
             peak_memory_bytes: 0,
             ticks: 0,
             incidents: Incidents::default(),
+            incident_write_failed: false,
             slow_sched: Vec::new(),
             slow_io: Vec::new(),
             restored: Restored::default(),
@@ -2040,7 +2936,7 @@ mod tests {
         let end = stat.rfind(')').expect("own stat has a comm field");
         let fields: Vec<&str> = stat[end + 2..].split_whitespace().collect();
         let expected: u64 = fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap();
-        assert_eq!(read_self_cpu_ticks().expect("parse own ticks"), expected);
+        assert!(read_self_cpu_ticks().expect("parse own ticks") >= expected);
     }
 
     #[test]

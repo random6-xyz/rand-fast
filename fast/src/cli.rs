@@ -304,6 +304,26 @@ pub struct DiagnoseArgs {
     pub format: FormatArg,
 }
 
+fn daemon_output_for(uid: u32, home: Option<&std::ffi::OsStr>) -> std::path::PathBuf {
+    if uid == 0 {
+        return "/var/lib/rand-fast/incidents".into();
+    }
+    if let Some(home) = home
+        .map(std::path::Path::new)
+        .filter(|path| path.is_absolute())
+    {
+        return home.join(".local/state/rand-fast/incidents");
+    }
+    std::path::PathBuf::from(format!("/tmp/rand-fast-{uid}/incidents"))
+}
+
+fn default_daemon_output() -> std::path::PathBuf {
+    daemon_output_for(
+        unsafe { libc::geteuid() },
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct DaemonArgs {
     /// Process ID (TGID) to observe.
@@ -338,6 +358,10 @@ pub struct DaemonArgs {
     pub trigger_io_p99: LatencyThreshold,
 
     /// Trigger threshold for retransmissions in one interval.
+    ///
+    /// Unavailable in this build: TCP events are not attributed because socket
+    /// ownership cannot be established. The recorder warns at startup when
+    /// this trigger is configured; pass `off` to disable it.
     #[arg(long, default_value = "8", value_name = "COUNT|off")]
     pub trigger_retrans: CountThreshold,
 
@@ -353,14 +377,18 @@ pub struct DaemonArgs {
     #[arg(long, default_value = "off", value_name = "PERCENT|off")]
     pub trigger_cpu: PercentThreshold,
 
-    /// Output directory for incidents.
-    #[arg(long, default_value = "./incidents")]
+    /// Incident output (root: /var/lib/rand-fast/incidents; otherwise: $HOME/.local/state/rand-fast/incidents).
+    ///
+    /// The path must have trusted owners, no symlinks, and no group/other-writable
+    /// output directory. If HOME is unavailable or not absolute, non-root uses
+    /// /tmp/rand-fast-UID/incidents. See fast/INCIDENT-MIGRATION.md for upgrades.
+    #[arg(long, default_value_os_t = default_daemon_output())]
     pub output: std::path::PathBuf,
 
     /// Total size the incident directory is allowed to reach.
     ///
-    /// Checked after every incident, and the oldest bundles are removed to get
-    /// back under it. A recorder that runs for days on a machine that keeps
+    /// Checked after every incident; eligible old bundles are removed to get
+    /// back under it. Legacy and unrelated data are retained and counted. A recorder that runs for days on a machine that keeps
     /// having bad minutes will otherwise fill the disk it is trying to
     /// diagnose, which is the one failure mode a background process must not
     /// have.
@@ -383,6 +411,54 @@ pub struct DaemonArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_default_output_uses_effective_user_not_cwd_or_root_home() {
+        use std::{ffi::OsStr, path::PathBuf};
+        assert_eq!(
+            daemon_output_for(0, Some(OsStr::new("/home/alice"))),
+            PathBuf::from("/var/lib/rand-fast/incidents")
+        );
+        assert_eq!(
+            daemon_output_for(1000, Some(OsStr::new("/home/alice"))),
+            PathBuf::from("/home/alice/.local/state/rand-fast/incidents")
+        );
+        assert_eq!(
+            daemon_output_for(1000, None),
+            PathBuf::from("/tmp/rand-fast-1000/incidents")
+        );
+        assert_eq!(
+            daemon_output_for(1000, Some(OsStr::new("relative"))),
+            PathBuf::from("/tmp/rand-fast-1000/incidents")
+        );
+    }
+
+    #[test]
+    fn daemon_explicit_relative_output_is_not_the_root_default() {
+        let cli =
+            Cli::try_parse_from(["fast", "daemon", "--pid", "123", "--output", "./incidents"])
+                .unwrap();
+        let Command::Daemon(args) = cli.command else {
+            panic!("expected daemon")
+        };
+        assert_eq!(args.output, std::path::Path::new("./incidents"));
+        assert_eq!(
+            daemon_output_for(0, Some(std::ffi::OsStr::new("/home/user"))),
+            std::path::Path::new("/var/lib/rand-fast/incidents")
+        );
+        assert_ne!(args.output, daemon_output_for(0, None));
+    }
+
+    #[test]
+    fn daemon_explicit_output_overrides_default() {
+        let cli =
+            Cli::try_parse_from(["fast", "daemon", "--pid", "123", "--output", "/tmp/custom"])
+                .unwrap();
+        let Command::Daemon(args) = cli.command else {
+            panic!("expected daemon")
+        };
+        assert_eq!(args.output, std::path::Path::new("/tmp/custom"));
+    }
 
     #[test]
     fn parses_duration() {

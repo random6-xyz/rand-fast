@@ -13,9 +13,9 @@ use std::{
     mem::size_of,
     os::fd::AsRawFd,
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -65,14 +65,6 @@ fn multi_collection_wait(duration: Duration, elapsed: Duration) -> Duration {
     }
 }
 
-fn multi_collection_elapsed(duration: Duration, elapsed: Duration) -> Duration {
-    if duration.is_zero() {
-        elapsed
-    } else {
-        elapsed.min(duration)
-    }
-}
-
 /// Default perf buffer page count per CPU buffer.
 ///
 /// One page is 4 KiB. The scheduler emits at most one event per wakeup of the
@@ -105,8 +97,8 @@ pub struct CollectionOptions {
 /// How a collection ended.
 #[derive(Debug, Clone, Copy)]
 pub struct CollectionSummary {
-    /// Wall time actually spent collecting. Shorter than the requested
-    /// duration when Ctrl-C arrived or the process exited early.
+    /// Wall time actually spent collecting. Multi-stream runs include reader
+    /// shutdown and draining, so they can exceed the requested duration.
     pub elapsed: Duration,
     /// The user pressed Ctrl-C.
     pub interrupted: bool,
@@ -121,6 +113,11 @@ pub trait EventHandler<E> {
 
     /// Called when the kernel reports dropped records.
     fn on_lost(&mut self, count: u64);
+
+    /// Records dropped userspace queue samples. Default collectors combine losses.
+    fn on_queue_lost(&mut self, count: u64) {
+        self.on_lost(count);
+    }
 }
 
 /// Lets a borrowed collector be handed to a stream.
@@ -135,6 +132,10 @@ impl<E, H: EventHandler<E> + ?Sized> EventHandler<E> for &mut H {
 
     fn on_lost(&mut self, count: u64) {
         (**self).on_lost(count);
+    }
+
+    fn on_queue_lost(&mut self, count: u64) {
+        (**self).on_queue_lost(count);
     }
 }
 
@@ -458,23 +459,26 @@ pub trait EventSink {
     /// Called when the kernel reports records dropped on this stream.
     fn on_lost(&mut self, count: u64);
 
-    /// Reports everything accumulated so far, as a document.
+    /// Called when the bounded userspace queue drops samples.
+    fn on_queue_lost(&mut self, count: u64) {
+        self.on_lost(count);
+    }
+
+    /// Reports collector state as a document.
     ///
     /// A collector that only reports at the end of a collection does not need
     /// this. A long-running one does: it has to summarise the last interval
     /// while the collection stays open, and the only way to reach the
     /// accumulators from outside is through the stream that owns them.
     ///
-    /// The values are cumulative, not per-interval. The caller differences
-    /// consecutive snapshots, which is what makes the interval length cancel
-    /// out.
+    /// Each collector defines whether snapshot values are cumulative or reset.
     fn snapshot(&mut self) -> Option<serde_json::Value> {
         None
     }
 }
 
 /// A function that renders a collector's accumulated state as a document.
-pub type SnapshotFn<H> = fn(&H) -> serde_json::Value;
+pub type SnapshotFn<H> = fn(&mut H) -> serde_json::Value;
 
 /// Adapts a typed [`EventHandler`] to the type-erased [`EventSink`].
 ///
@@ -540,9 +544,13 @@ where
         self.handler.on_lost(count);
     }
 
+    fn on_queue_lost(&mut self, count: u64) {
+        self.handler.on_queue_lost(count);
+    }
+
     fn snapshot(&mut self) -> Option<serde_json::Value> {
         let snapshot = self.snapshot?;
-        Some(snapshot(&self.handler))
+        Some(snapshot(&mut self.handler))
     }
 }
 
@@ -605,7 +613,8 @@ impl<'a> EventStream<'a> {
 pub struct MultiCollectionOptions {
     /// Process (TGID) whose threads are observed.
     pub pid: u32,
-    /// Collection duration; zero runs until Ctrl-C or target-process exit.
+    /// Stop-request duration; zero runs until Ctrl-C or target-process exit.
+    /// Final perf snapshots and queue drain can extend the reported duration.
     pub duration: Duration,
     /// Collector mode bits written into the eBPF `MODE` map.
     pub mode: u32,
@@ -624,15 +633,14 @@ pub struct MultiCollectionOptions {
 
 /// A periodic summary of every stream, taken while the collection stays open.
 ///
-/// The values are cumulative. A caller that wants the numbers for one interval
-/// differences two consecutive summaries, which is also what makes the summary
-/// independent of when the collection happened to start.
+/// Each stream defines whether its snapshot is cumulative or interval-local.
 pub type TickSummary<'a> = Vec<(&'static str, serde_json::Value)>;
 
 /// The callback a long-running collection uses to summarise each interval.
 ///
-/// Named because the type is long enough to be worth not writing twice.
-pub type TickCallback<'a> = Box<dyn FnMut(Duration, TickSummary<'_>) + 'a>;
+/// Returns the elapsed time at which any callback-owned counters were read.
+/// The final returned time becomes the collection's reported elapsed duration.
+pub type TickCallback<'a> = Box<dyn FnMut(Duration, TickSummary<'_>) -> Duration + 'a>;
 
 /// Claims at most one tick in a collection-loop iteration.
 fn should_run_tick(next_tick: Instant, now: Instant, ticked_this_iteration: &mut bool) -> bool {
@@ -648,8 +656,8 @@ fn should_run_tick(next_tick: Instant, now: Instant, ticked_this_iteration: &mut
 pub struct MultiStreams<'a> {
     /// One entry per `PerfEventArray` to consume.
     pub streams: Vec<EventStream<'a>>,
-    /// Called every [`MultiCollectionOptions::tick_interval`] with cumulative
-    /// totals. `None` for a collection that only reports at the end.
+    /// Called periodically and once after the final drain. Each stream defines
+    /// its snapshot semantics. `None` for a collection that only reports at the end.
     pub on_tick: Option<TickCallback<'a>>,
 }
 
@@ -700,7 +708,13 @@ pub fn run_multi_collection<'a>(
     let interrupted = Arc::new(AtomicBool::new(false));
     install_signal_handler(&stop, &interrupted)?;
 
-    let (sender, receiver) = mpsc::channel::<MultiMessage>();
+    // Bounded across all CPUs and streams. Readers never block on the consumer;
+    // queue drops and perf losses are counted independently, including at shutdown.
+    let (sender, receiver) = mpsc::sync_channel::<MultiMessage>(MULTI_QUEUE_CAPACITY);
+    let losses: Vec<_> = (0..streams.len())
+        .map(|_| Arc::new(StreamLosses::default()))
+        .collect();
+    let reader_error = Arc::new(Mutex::new(None::<String>));
     let mut readers = Vec::new();
     // poll(2) takes milliseconds, and a zero interval would spin, so the
     // option is clamped to at least the default.
@@ -741,6 +755,8 @@ pub fn run_multi_collection<'a>(
                 index,
                 Arc::clone(&stop),
                 sender.clone(),
+                Arc::clone(&losses[index]),
+                Arc::clone(&reader_error),
                 poll_ms,
             ));
         }
@@ -795,13 +811,14 @@ pub fn run_multi_collection<'a>(
         if let Some(tick) = on_tick.as_mut()
             && should_run_tick(next_tick, Instant::now(), &mut ticked_this_iteration)
         {
-            // The snapshots are read here rather than inside the readers, so
-            // the summary is consistent with the events already dispatched.
-            let summary: TickSummary<'_> = streams
-                .iter_mut()
-                .filter_map(|stream| stream.sink.snapshot().map(|value| (stream.name, value)))
-                .collect();
-            tick(started.elapsed(), summary);
+            let at = started.elapsed();
+            // At the duration boundary the final drain owns the tick; emitting
+            // here as well would create a duplicate zero-length interval.
+            if !multi_collection_duration_expired(options.duration, at) {
+                collect_stream_losses(&losses, &mut streams);
+                // Snapshot only events already dispatched by the consumer.
+                emit_multi_tick(&mut streams, tick, at);
+            }
             // Drifted forward from now rather than from the last tick, so a slow
             // callback does not make the interval shorter every time and end
             // up firing back to back.
@@ -826,27 +843,20 @@ pub fn run_multi_collection<'a>(
         }
     }
 
-    stop.store(true, Ordering::Relaxed);
-    let mut reader_panicked = false;
-    for reader in readers {
-        if reader.join().is_err() {
-            reader_panicked = true;
-        }
-    }
-    if reader_panicked && fatal_error.is_none() {
-        fatal_error = Some(anyhow!("a perf event reader thread panicked"));
-    }
-
-    // Drain everything the readers produced while shutting down. Preserve any
-    // late reader or decode error so an incomplete run cannot look successful.
-    if let Some(error) = drain_multi_messages(&receiver, &mut streams)
-        && fatal_error.is_none()
-    {
-        fatal_error = Some(error);
-    }
+    let (elapsed, fatal_error) = finish_multi_collection(
+        &stop,
+        readers,
+        &receiver,
+        &losses,
+        &mut streams,
+        &reader_error,
+        &mut on_tick,
+        started,
+        fatal_error,
+    );
 
     let summary = CollectionSummary {
-        elapsed: multi_collection_elapsed(options.duration, started.elapsed()),
+        elapsed,
         interrupted: interrupted.load(Ordering::Relaxed),
         process_exited,
     };
@@ -857,35 +867,151 @@ pub fn run_multi_collection<'a>(
     }
 }
 
+/// Stop readers while continuing to dispatch their final perf snapshots. The
+/// end time is sampled after every reader and queued event has been consumed,
+/// rather than backdating late samples to the stop request. Readers sample
+/// different perf buffers at slightly different times, and the target keeps
+/// running during this bounded shutdown; this is a dispatch-time boundary,
+/// not an atomic kernel-wide event timestamp boundary.
+#[allow(clippy::too_many_arguments)]
+fn finish_multi_collection(
+    stop: &AtomicBool,
+    readers: Vec<JoinHandle<()>>,
+    receiver: &Receiver<MultiMessage>,
+    losses: &[Arc<StreamLosses>],
+    streams: &mut [EventStream<'_>],
+    reader_error: &Mutex<Option<String>>,
+    on_tick: &mut Option<TickCallback<'_>>,
+    started: Instant,
+    mut fatal_error: Option<anyhow::Error>,
+) -> (Duration, Option<anyhow::Error>) {
+    stop.store(true, Ordering::Relaxed);
+    // All senders belong to readers. Disconnection therefore marks the end of
+    // their final snapshots, without joining while the bounded queue is full.
+    while let Ok(message) = receiver.recv() {
+        if let Err(error) = dispatch_multi_message(message, streams) {
+            preserve_first_error(&mut fatal_error, error);
+        }
+    }
+    for reader in readers {
+        if reader.join().is_err() {
+            preserve_first_error(
+                &mut fatal_error,
+                anyhow!("a perf event reader thread panicked"),
+            );
+        }
+    }
+    collect_stream_losses(losses, streams);
+    if let Some(error) = reader_error
+        .lock()
+        .expect("reader error mutex poisoned")
+        .take()
+    {
+        preserve_first_error(&mut fatal_error, anyhow!(error));
+    }
+    // Snapshot work precedes the end timestamp; CPU counters are read by the
+    // callback immediately afterwards. Any read skew is explicitly documented.
+    let summary = streams
+        .iter_mut()
+        .filter_map(|stream| stream.sink.snapshot().map(|value| (stream.name, value)))
+        .collect();
+    let mut elapsed = started.elapsed();
+    if fatal_error.is_none()
+        && let Some(tick) = on_tick.as_mut()
+    {
+        elapsed = tick(elapsed, summary);
+    }
+    (elapsed, fatal_error)
+}
+
+fn emit_multi_tick(streams: &mut [EventStream<'_>], tick: &mut TickCallback<'_>, at: Duration) {
+    let snapshot_started = Instant::now();
+    let summary = streams
+        .iter_mut()
+        .filter_map(|stream| stream.sink.snapshot().map(|value| (stream.name, value)))
+        .collect();
+    tick(at.saturating_add(snapshot_started.elapsed()), summary);
+}
+
+/// Maximum queued records regardless of duration or event rate.
+const MULTI_QUEUE_CAPACITY: usize = 8192;
+
+#[derive(Default)]
+struct StreamLosses {
+    perf: AtomicU64,
+    queue: AtomicU64,
+}
+
+fn add_loss(counter: &AtomicU64, count: u64) {
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+        Some(old.saturating_add(count))
+    });
+}
+
+fn enqueue_multi_sample(
+    sender: &SyncSender<MultiMessage>,
+    index: usize,
+    payload: [u8; MAX_EVENT_SIZE],
+    losses: &StreamLosses,
+) -> bool {
+    match sender.try_send(MultiMessage::Sample(index, payload)) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) => {
+            add_loss(&losses.queue, 1);
+            true
+        }
+        Err(TrySendError::Disconnected(_)) => false,
+    }
+}
+
+fn collect_stream_losses(losses: &[Arc<StreamLosses>], streams: &mut [EventStream<'_>]) {
+    for (loss, stream) in losses.iter().zip(streams.iter_mut()) {
+        stream.sink.on_lost(loss.perf.swap(0, Ordering::Relaxed));
+        stream
+            .sink
+            .on_queue_lost(loss.queue.swap(0, Ordering::Relaxed));
+    }
+}
+
 enum MultiMessage {
     /// Which stream produced the record, and its raw payload.
     Sample(usize, [u8; MAX_EVENT_SIZE]),
+    /// Reserved for the single-stream compatibility path; multi-stream
+    /// losses are reported through the shared `StreamLosses` counters.
+    #[allow(dead_code)]
     Lost(usize, u64),
+    /// Reserved for the single-stream compatibility path; reader failures are
+    /// reported through the shared error slot.
+    #[allow(dead_code)]
     Error(String),
 }
 
+fn dispatch_multi_message(message: MultiMessage, streams: &mut [EventStream<'_>]) -> Result<()> {
+    match message {
+        MultiMessage::Sample(index, bytes) => {
+            if let Some(stream) = streams.get_mut(index) {
+                stream.sink.on_event(&bytes)?;
+            }
+        }
+        MultiMessage::Lost(index, count) => {
+            if let Some(stream) = streams.get_mut(index) {
+                stream.sink.on_lost(count);
+            }
+        }
+        MultiMessage::Error(error) => bail!(error),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn drain_multi_messages(
     receiver: &Receiver<MultiMessage>,
     streams: &mut [EventStream<'_>],
 ) -> Option<anyhow::Error> {
     let mut first_error = None;
     for message in receiver.try_iter() {
-        match message {
-            MultiMessage::Sample(index, bytes) => {
-                if let Some(stream) = streams.get_mut(index)
-                    && let Err(error) = stream.sink.on_event(&bytes)
-                {
-                    preserve_first_error(&mut first_error, error);
-                }
-            }
-            MultiMessage::Lost(index, count) => {
-                if let Some(stream) = streams.get_mut(index) {
-                    stream.sink.on_lost(count);
-                }
-            }
-            MultiMessage::Error(error) => {
-                preserve_first_error(&mut first_error, anyhow!(error));
-            }
+        if let Err(error) = dispatch_multi_message(message, streams) {
+            preserve_first_error(&mut first_error, error);
         }
     }
     first_error
@@ -918,12 +1044,15 @@ fn decode_payload(head: &[u8], tail: &[u8], event_size: usize) -> Option<[u8; MA
 ///
 /// The payload is forwarded as raw bytes tagged with the stream index, so one
 /// channel can carry every stream and the sink decodes with its own type.
+#[allow(clippy::too_many_arguments)]
 fn spawn_stream_reader(
     mut buffer: PerfEventArrayBuffer<MapData>,
     event_size: usize,
     index: usize,
     stop: Arc<AtomicBool>,
-    sender: Sender<MultiMessage>,
+    sender: SyncSender<MultiMessage>,
+    losses: Arc<StreamLosses>,
+    reader_error: Arc<Mutex<Option<String>>>,
     poll_ms: i32,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -933,51 +1062,55 @@ fn spawn_stream_reader(
             revents: 0,
         };
 
-        while !stop.load(Ordering::Relaxed) {
-            poll_fd.revents = 0;
-            let result = unsafe { libc::poll(&mut poll_fd, 1, poll_ms) };
-            if result < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
+        loop {
+            // Always consume one final perf-buffer snapshot after stop. Perf
+            // only reports losses for which the kernel emitted a LOST record.
+            let stopping = stop.load(Ordering::Relaxed);
+            if !stopping {
+                poll_fd.revents = 0;
+                let result = unsafe { libc::poll(&mut poll_fd, 1, poll_ms) };
+                if result < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    *reader_error.lock().expect("reader error mutex poisoned") =
+                        Some(format!("perf buffer poll failed: {error}"));
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+                if result == 0 {
                     continue;
                 }
-                let _ = sender.send(MultiMessage::Error(format!(
-                    "perf buffer poll failed: {error}"
-                )));
-                break;
-            }
-            if result == 0 {
-                continue;
-            }
-            if poll_fd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)
-                == 0
-            {
-                continue;
+                if poll_fd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)
+                    == 0
+                {
+                    continue;
+                }
             }
 
             let mut send_failed = false;
             buffer.for_each(|event| match event {
                 PerfEvent::Sample { head, tail } => match decode_payload(head, tail, event_size) {
                     Some(payload) => {
-                        if sender.send(MultiMessage::Sample(index, payload)).is_err() {
+                        if !enqueue_multi_sample(&sender, index, payload, &losses) {
                             send_failed = true;
                         }
                     }
                     None => {
-                        let _ = sender.send(MultiMessage::Error(format!(
+                        *reader_error.lock().expect("reader error mutex poisoned") = Some(format!(
                             "invalid event payload: expected at least {event_size} bytes"
-                        )));
+                        ));
+                        stop.store(true, Ordering::Relaxed);
                         send_failed = true;
                     }
                 },
                 PerfEvent::Lost { count } => {
-                    if sender.send(MultiMessage::Lost(index, count)).is_err() {
-                        send_failed = true;
-                    }
+                    add_loss(&losses.perf, count);
                 }
             });
 
-            if send_failed {
+            if send_failed || stopping {
                 break;
             }
         }
@@ -1241,7 +1374,6 @@ mod tests {
         let elapsed = Duration::from_secs(5);
         assert!(!multi_collection_duration_expired(Duration::ZERO, elapsed));
         assert_eq!(multi_collection_wait(Duration::ZERO, elapsed), RECV_WAIT);
-        assert_eq!(multi_collection_elapsed(Duration::ZERO, elapsed), elapsed);
     }
 
     #[test]
@@ -1262,10 +1394,6 @@ mod tests {
         assert_eq!(
             multi_collection_wait(duration, Duration::from_secs(3)),
             Duration::ZERO
-        );
-        assert_eq!(
-            multi_collection_elapsed(duration, Duration::from_secs(3)),
-            duration
         );
     }
 
@@ -1302,6 +1430,191 @@ mod tests {
         assert!(error.to_string().contains("late poll failure"));
         assert_eq!(handler.events, vec![7]);
         assert_eq!(handler.lost, 3);
+    }
+
+    #[test]
+    fn bounded_multi_queue_counts_drops_and_drains_without_blocking() {
+        let (sender, receiver) = mpsc::sync_channel(MULTI_QUEUE_CAPACITY);
+        let loss = StreamLosses::default();
+        for _ in 0..MULTI_QUEUE_CAPACITY + 37 {
+            assert!(enqueue_multi_sample(&sender, 0, [0; MAX_EVENT_SIZE], &loss));
+        }
+        assert_eq!(receiver.try_iter().count(), MULTI_QUEUE_CAPACITY);
+        assert_eq!(loss.queue.load(Ordering::Relaxed), 37);
+        add_loss(&loss.perf, 9);
+        assert_eq!(loss.perf.load(Ordering::Relaxed), 9);
+        drop(receiver);
+        assert!(!enqueue_multi_sample(
+            &sender,
+            0,
+            [0; MAX_EVENT_SIZE],
+            &loss
+        ));
+    }
+
+    #[test]
+    fn final_drain_then_tick_delivers_partial_interval_and_loss() {
+        let (sender, receiver) = mpsc::sync_channel(MULTI_QUEUE_CAPACITY);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let lost = Rc::new(Cell::new(0));
+        let mut streams = vec![EventStream {
+            map_name: "TEST_EVENTS",
+            name: "test",
+            perf_page_count: 1,
+            event_size: 4,
+            sink: Box::new(RecordingSink {
+                events: Rc::clone(&events),
+                lost: Rc::clone(&lost),
+            }),
+        }];
+        let losses = vec![Arc::new(StreamLosses::default())];
+        let mut sample = [0u8; MAX_EVENT_SIZE];
+        sample[..4].copy_from_slice(&19u32.to_ne_bytes());
+        assert!(enqueue_multi_sample(&sender, 0, sample, &losses[0]));
+        add_loss(&losses[0].perf, 3);
+        add_loss(&losses[0].queue, 2);
+        drop(sender);
+        assert!(drain_multi_messages(&receiver, &mut streams).is_none());
+        collect_stream_losses(&losses, &mut streams);
+        let ticks = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&ticks);
+        let mut tick: TickCallback<'_> = Box::new(move |at, _| {
+            captured.borrow_mut().push(at);
+            at
+        });
+        emit_multi_tick(&mut streams, &mut tick, Duration::from_millis(125));
+        assert_eq!(*events.borrow(), vec![19]);
+        assert_eq!(lost.get(), 5);
+        assert!(ticks.borrow()[0] >= Duration::from_millis(125));
+        assert_eq!(losses[0].perf.load(Ordering::Relaxed), 0);
+        assert_eq!(losses[0].queue.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn shutdown_consumes_saturated_queue_while_reader_finishes_and_timestamps_late_events() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize};
+        struct ProgressSink {
+            count: Arc<AtomicUsize>,
+            lost: Rc<Cell<u64>>,
+        }
+        impl EventSink for ProgressSink {
+            fn on_event(&mut self, _: &[u8]) -> Result<()> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn on_lost(&mut self, n: u64) {
+                self.lost.set(self.lost.get() + n);
+            }
+        }
+        let started = Instant::now();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let losses = vec![Arc::new(StreamLosses::default())];
+        let progress = Arc::new(AtomicUsize::new(0));
+        let event_at = Arc::new(AtomicU64::new(0));
+        let lost = Rc::new(Cell::new(0));
+        let mut streams = vec![EventStream {
+            map_name: "test",
+            name: "test",
+            perf_page_count: 1,
+            event_size: 4,
+            sink: Box::new(ProgressSink {
+                count: Arc::clone(&progress),
+                lost: Rc::clone(&lost),
+            }),
+        }];
+        assert!(enqueue_multi_sample(
+            &sender,
+            0,
+            [0; MAX_EVENT_SIZE],
+            &losses[0]
+        ));
+        assert!(enqueue_multi_sample(
+            &sender,
+            0,
+            [0; MAX_EVENT_SIZE],
+            &losses[0]
+        ));
+        let reader_stop = Arc::clone(&stop);
+        let reader_progress = Arc::clone(&progress);
+        let reader_loss = Arc::clone(&losses[0]);
+        let reader_at = Arc::clone(&event_at);
+        let reader = thread::spawn(move || {
+            while !reader_stop.load(Ordering::Relaxed) {
+                thread::yield_now();
+            }
+            // A joining-before-draining consumer cannot make this progress.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while reader_progress.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+                thread::yield_now();
+            }
+            thread::sleep(Duration::from_millis(30));
+            reader_at.store(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            assert!(enqueue_multi_sample(
+                &sender,
+                0,
+                [0; MAX_EVENT_SIZE],
+                &reader_loss
+            ));
+            add_loss(&reader_loss.perf, 3);
+            add_loss(&reader_loss.queue, 2);
+        });
+        let captured = Rc::new(RefCell::new(Vec::new()));
+        let tick_capture = Rc::clone(&captured);
+        let tick_progress = Arc::clone(&progress);
+        let mut callback: Option<TickCallback<'_>> = Some(Box::new(move |at, _| {
+            tick_capture
+                .borrow_mut()
+                .push((at, tick_progress.load(Ordering::SeqCst)));
+            at
+        }));
+        let (elapsed, error) = finish_multi_collection(
+            &stop,
+            vec![reader],
+            &receiver,
+            &losses,
+            &mut streams,
+            &Mutex::new(None),
+            &mut callback,
+            started,
+            None,
+        );
+        assert!(error.is_none());
+        assert_eq!(progress.load(Ordering::SeqCst), 3);
+        assert_eq!(lost.get(), 5);
+        assert!(elapsed.as_nanos() >= event_at.load(Ordering::Relaxed) as u128);
+        assert!(elapsed >= Duration::from_millis(30));
+        assert_eq!(captured.borrow()[0], (elapsed, 3));
+    }
+
+    #[test]
+    fn shutdown_preserves_late_reader_errors_after_draining() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let errors = Arc::new(Mutex::new(None));
+        let reader_stop = Arc::clone(&stop);
+        let reader_errors = Arc::clone(&errors);
+        let reader = thread::spawn(move || {
+            while !reader_stop.load(Ordering::Relaxed) {
+                thread::yield_now();
+            }
+            *reader_errors.lock().unwrap() = Some("late poll failure".to_owned());
+            drop(sender);
+        });
+        let mut streams = Vec::new();
+        let mut callback = None;
+        let (_, error) = finish_multi_collection(
+            &stop,
+            vec![reader],
+            &receiver,
+            &[],
+            &mut streams,
+            &errors,
+            &mut callback,
+            Instant::now(),
+            None,
+        );
+        assert!(error.unwrap().to_string().contains("late poll failure"));
     }
 
     #[test]

@@ -16,12 +16,11 @@ use aya_ebpf::{
     programs::{PerfEventContext, RawTracePointContext, TracePointContext},
 };
 use fast_common::{
-    AF_INET, AF_INET6, COLLECT_CPU_SAMPLE, COLLECT_MEMORY, COLLECT_NET, COLLECT_OFFCPU,
-    COLLECT_SCHEDULER_LATENCY, CpuSampleEvent, IO_OP_UNMATCHED, IoEvent, IoRequestId,
-    IoRequestLayout, MAX_MEMORY_THREADS, MAX_PENDING_IO, MAX_STACKS, MAX_TARGET_TIDS,
-    MAX_TCP_SOCKETS, MemoryCounters, OFFCPU_REASON_IO, OFFCPU_REASON_UNKNOWN, OFFCPU_REASON_WAIT,
-    OffCpuEvent, OffCpuPending, PendingIo, PendingWakeup, SchedulerLatencyEvent, TcpEvent,
-    io_op_from_request_flags, scheduler_state_is_exiting,
+    COLLECT_CPU_SAMPLE, COLLECT_MEMORY, COLLECT_OFFCPU, COLLECT_SCHEDULER_LATENCY, CpuSampleEvent,
+    IO_OP_UNMATCHED, IoEvent, IoRequestId, IoRequestLayout, MAX_MEMORY_THREADS, MAX_PENDING_IO,
+    MAX_STACKS, MAX_TARGET_TIDS, MemoryCounters, OFFCPU_REASON_IO, OFFCPU_REASON_UNKNOWN,
+    OFFCPU_REASON_WAIT, OffCpuEvent, OffCpuPending, PendingIo, PendingWakeup,
+    SchedulerLatencyEvent, TcpEvent, io_op_from_request_flags, scheduler_state_is_exiting,
 };
 
 // Payload offsets for the supported scheduler tracepoint layouts. The user-space
@@ -42,48 +41,6 @@ const SCHED_SWITCH_NEXT_PID_OFFSET: usize = 56;
 // was minor or major, and the reclaim order says nothing a user acts on, so
 // the programs only need the fact that the event happened. The offsets are
 // recorded here so the layout stays documented if a future report needs one.
-
-// Payload offsets of the TCP tracepoints, verified against the format files
-// that tools/qemu-guest-init.sh dumps on the target kernel (7.2.0-rc6).
-//
-//   tcp_probe:            saddr=8(28) daddr=36(28) sport=64 dport=66 family=68
-//                         mark=72 data_len=76 snd_nxt=80 snd_una=84
-//                         snd_cwnd=88 ssthresh=92 snd_wnd=96 srtt=100
-//                         rcv_wnd=104 sock_cookie=112 skbaddr=120 skaddr=128
-//   tcp_retransmit_skb:   skbaddr=8 skaddr=16 state=24 sport=28 dport=30
-//                         family=32 saddr=34(4) daddr=38(4) saddr_v6=42(16)
-//                         daddr_v6=58(16) err=76
-//
-// Both events carry the socket 5-tuple in the payload, so no BTF read and no
-// struct offset is needed: the kernel already resolved the addresses and the
-// ports. `saddr`/`daddr` are a `struct sockaddr_in6`, so they carry the
-// family and port as well as the address; the separate `sport`/`dport`
-// fields are the same ports in host byte order and are preferred.
-//
-// `saddr` and `daddr` are written by TP_STORE_ADDR_PORTS, which stores a
-// `struct sockaddr_in` for IPv4 and a `struct sockaddr_in6` for IPv6. Both
-// begin with the family in host byte order followed by the port in network
-// byte order, so one parser handles either: IPv4 addresses follow directly
-// and IPv6 addresses start after the 4-byte flowinfo field.
-const TCP_PROBE_SADDR_OFFSET: usize = 8;
-const TCP_PROBE_SADDR_LEN: usize = 28;
-const TCP_PROBE_DADDR_OFFSET: usize = 36;
-const TCP_PROBE_SPORT_OFFSET: usize = 64;
-const TCP_PROBE_DPORT_OFFSET: usize = 66;
-const TCP_PROBE_FAMILY_OFFSET: usize = 68;
-const TCP_PROBE_SND_CWND_OFFSET: usize = 88;
-const TCP_PROBE_SRTT_OFFSET: usize = 100;
-const TCP_PROBE_RCV_WND_OFFSET: usize = 104;
-const TCP_PROBE_SKADDR_OFFSET: usize = 128;
-
-const TCP_RETRANS_SKADDR_OFFSET: usize = 16;
-const TCP_RETRANS_SPORT_OFFSET: usize = 28;
-const TCP_RETRANS_DPORT_OFFSET: usize = 30;
-const TCP_RETRANS_FAMILY_OFFSET: usize = 32;
-const TCP_RETRANS_SADDR_OFFSET: usize = 34;
-const TCP_RETRANS_DADDR_OFFSET: usize = 38;
-const TCP_RETRANS_SADDR_V6_OFFSET: usize = 42;
-const TCP_RETRANS_DADDR_V6_OFFSET: usize = 58;
 
 #[cfg(not(target_arch = "bpf"))]
 fn main() {}
@@ -127,16 +84,6 @@ static PENDING_IO: HashMap<IoRequestId, PendingIo> = HashMap::with_max_entries(M
 
 #[map]
 static NET_EVENTS: PerfEventArray<TcpEvent> = PerfEventArray::new(0);
-
-/// Sockets a target thread was seen using, keyed by `struct sock *`.
-///
-/// `tcp_probe` usually runs in the context of the thread that owns the
-/// socket, but TCP retransmissions are raised from softirq context where the
-/// current TID says nothing about the owner. Remembering the socket pointer
-/// when a target thread is seen on it lets those events be attributed to the
-/// socket instead of to whatever task happened to be running.
-#[map]
-static TCP_SOCKETS: LruHashMap<u64, u32> = LruHashMap::with_max_entries(MAX_TCP_SOCKETS, 0);
 
 #[map]
 static OFFCPU_EVENTS: PerfEventArray<OffCpuEvent> = PerfEventArray::new(0);
@@ -555,220 +502,17 @@ fn emit_unmatched(ctx: &impl EbpfContext, tid: u32, dev: u32) {
     );
 }
 
-// --- Network: TCP RTT via tcp_probe ---
-/// Reads a `struct sockaddr_in6` from a tracepoint payload and splits it into
-/// an address family, a port in host byte order, and the address bytes.
-///
-/// The kernel fills these in through `TP_STORE_ADDR_PORTS`, which writes a
-/// `struct sockaddr_in` for IPv4 and a `struct sockaddr_in6` for IPv6. In
-/// both cases the first two bytes are the family in host order and the next
-/// two are the port in network order. IPv4 addresses follow directly; IPv6
-/// addresses start after the 4-byte flowinfo field.
-fn read_socket_addr(
-    ctx: &TracePointContext,
-    offset: usize,
-    len: usize,
-) -> Option<(u16, u16, [u8; 16])> {
-    if len < 24 {
-        return None;
-    }
-    let raw: [u8; 28] = unsafe { ctx.read_at(offset) }.ok()?;
-    let family = u16::from_ne_bytes([raw[0], raw[1]]);
-    // The port is kept in network byte order by the kernel, so it needs an
-    // explicit swap to reach host order.
-    let port = u16::from_be_bytes([raw[2], raw[3]]);
-
-    let mut address = [0u8; 16];
-    if family == AF_INET {
-        address[..4].copy_from_slice(&raw[4..8]);
-    } else {
-        address.copy_from_slice(&raw[8..24]);
-    }
-    Some((family, port, address))
-}
-
-/// Resolves the thread a TCP event belongs to.
-///
-/// Returns `None` when the event cannot be attributed to a target thread,
-/// which is the common case: these tracepoints fire for every TCP connection
-/// on the host, not just for the observed process.
-///
-/// The `skaddr_offset` argument selects where the event keeps its
-/// `struct sock *`. Both `tcp_probe` and `tcp_retransmit_skb` record the
-/// same pointer, so a socket learned from one is recognised by the other.
-fn attribute_tcp_socket(ctx: &TracePointContext, skaddr_offset: usize) -> Option<u32> {
-    let skaddr = unsafe { ctx.read_at::<u64>(skaddr_offset) }.ok()?;
-    if skaddr == 0 {
-        return None;
-    }
-    let tid = bpf_get_current_pid_tgid() as u32;
-    if unsafe { TARGET_TIDS.get(tid) }.is_some() {
-        // A target thread is using this socket, so remember the association
-        // for later events that arrive outside of its context.
-        let _ = TCP_SOCKETS.insert(skaddr, tid, BPF_ANY as u64);
-        return Some(tid);
-    }
-    // Not in a target thread: fall back to a socket a target was seen using.
-    // This is the path retransmissions take, since the kernel raises them
-    // from softirq context where the current TID is unrelated to the owner.
-    let owner = unsafe { TCP_SOCKETS.get(skaddr) }?;
-    Some(*owner)
-}
-
+// These tracepoints cannot establish socket ownership. In particular, receive
+// processing can run in softirq context and a raw socket address can be reused.
+// Never emit an attributed event until a verified ownership path exists.
 #[tracepoint(name = "tcp_probe", category = "tcp")]
-pub fn tcp_probe(ctx: TracePointContext) -> u32 {
-    match try_tcp_probe(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
-}
-
-fn try_tcp_probe(ctx: TracePointContext) -> Result<u32, u32> {
-    if unsafe { MODE.get(0) }.copied().unwrap_or(0) & COLLECT_NET == 0 {
-        return Ok(0);
-    }
-
-    let tid = match attribute_tcp_socket(&ctx, TCP_PROBE_SKADDR_OFFSET) {
-        Some(tid) => tid,
-        None => return Ok(0),
-    };
-
-    let sfamily = match unsafe { ctx.read_at::<u16>(TCP_PROBE_FAMILY_OFFSET) }.ok() {
-        Some(value) => value,
-        None => return Ok(0),
-    };
-    let (parsed_sfamily, _, saddr) =
-        match read_socket_addr(&ctx, TCP_PROBE_SADDR_OFFSET, TCP_PROBE_SADDR_LEN) {
-            Some(value) => value,
-            None => return Ok(0),
-        };
-    let (dfamily, _, daddr) =
-        match read_socket_addr(&ctx, TCP_PROBE_DADDR_OFFSET, TCP_PROBE_SADDR_LEN) {
-            Some(value) => value,
-            None => return Ok(0),
-        };
-    // The dedicated `family` field and the family embedded in the sockaddr
-    // are written by the same kernel code, so they always agree. When they do
-    // not, the payload layout this program assumes is wrong for the running
-    // kernel, and reporting the sample would poison the endpoint table with
-    // misread addresses. Dropping it turns a silent corruption into an empty
-    // report.
-    if parsed_sfamily != sfamily || sfamily != dfamily {
-        return Ok(0);
-    }
-    if sfamily != AF_INET && sfamily != AF_INET6 {
-        return Ok(0);
-    }
-
-    let sport = unsafe { ctx.read_at::<u16>(TCP_PROBE_SPORT_OFFSET) }.unwrap_or(0);
-    let dport = unsafe { ctx.read_at::<u16>(TCP_PROBE_DPORT_OFFSET) }.unwrap_or(0);
-    // The kernel source for this tracepoint assigns `tp->srtt_us >> 3` to
-    // the field, which would make the stored value one eighth of a
-    // microsecond. On the verified kernel the stored value nevertheless
-    // matches the RTT `ss -ti` reports for the same sockets (43 us against
-    // 45 us in the recorded run), so the field is used unscaled. The
-    // cross-check in tools/qemu-smoke.sh is what establishes the scale: a
-    // wrong factor of eight shows up as an 8x disagreement with the kernel
-    // rather than as a plausible-looking number.
-    let srtt = unsafe { ctx.read_at::<u32>(TCP_PROBE_SRTT_OFFSET) }.unwrap_or(0);
-    let snd_cwnd = unsafe { ctx.read_at::<u32>(TCP_PROBE_SND_CWND_OFFSET) }.unwrap_or(0);
-    let rcv_wnd = unsafe { ctx.read_at::<u32>(TCP_PROBE_RCV_WND_OFFSET) }.unwrap_or(0);
-
-    let event = TcpEvent {
-        tid,
-        family: sfamily,
-        retrans: 0,
-        _pad: 0,
-        sport,
-        dport,
-        rtt_us: srtt,
-        snd_cwnd,
-        rcv_wnd,
-        saddr,
-        daddr,
-    };
-    NET_EVENTS.output(&ctx, event, BPF_ANY);
-    Ok(0)
+pub fn tcp_probe(_ctx: TracePointContext) -> u32 {
+    0
 }
 
 #[tracepoint(name = "tcp_retransmit_skb", category = "tcp")]
-pub fn tcp_retransmit_skb(ctx: TracePointContext) -> u32 {
-    match try_tcp_retransmit_skb(ctx) {
-        Ok(ret) => ret,
-        Err(ret) => ret,
-    }
-}
-
-fn try_tcp_retransmit_skb(ctx: TracePointContext) -> Result<u32, u32> {
-    if unsafe { MODE.get(0) }.copied().unwrap_or(0) & COLLECT_NET == 0 {
-        return Ok(0);
-    }
-
-    // The kernel raises retransmissions from softirq context, so the current
-    // TID is never the socket owner. Attribution goes through the socket
-    // pointer, which both TCP tracepoints share.
-    let tid = match attribute_tcp_socket(&ctx, TCP_RETRANS_SKADDR_OFFSET) {
-        Some(tid) => tid,
-        None => return Ok(0),
-    };
-
-    let family = match unsafe { ctx.read_at::<u16>(TCP_RETRANS_FAMILY_OFFSET) }.ok() {
-        Some(value) => value,
-        None => return Ok(0),
-    };
-
-    // saddr/daddr always hold the IPv4 addresses; saddr_v6/daddr_v6 hold
-    // either the IPv6 address or a v4-mapped form of the IPv4 one. Reading
-    // the pair that matches the family keeps the layout identical to what
-    // tcp_probe produces, so both events land on the same endpoint.
-    let (saddr, daddr) = if family == AF_INET6 {
-        let s: [u8; 16] = match unsafe { ctx.read_at(TCP_RETRANS_SADDR_V6_OFFSET) } {
-            Ok(value) => value,
-            Err(_) => return Ok(0),
-        };
-        let d: [u8; 16] = match unsafe { ctx.read_at(TCP_RETRANS_DADDR_V6_OFFSET) } {
-            Ok(value) => value,
-            Err(_) => return Ok(0),
-        };
-        (s, d)
-    } else if family == AF_INET {
-        let s: [u8; 4] = match unsafe { ctx.read_at(TCP_RETRANS_SADDR_OFFSET) } {
-            Ok(value) => value,
-            Err(_) => return Ok(0),
-        };
-        let d: [u8; 4] = match unsafe { ctx.read_at(TCP_RETRANS_DADDR_OFFSET) } {
-            Ok(value) => value,
-            Err(_) => return Ok(0),
-        };
-        let mut wide_s = [0u8; 16];
-        let mut wide_d = [0u8; 16];
-        wide_s[..4].copy_from_slice(&s);
-        wide_d[..4].copy_from_slice(&d);
-        (wide_s, wide_d)
-    } else {
-        // Neither AF_INET nor AF_INET6, for example a Unix socket.
-        return Ok(0);
-    };
-
-    let sport = unsafe { ctx.read_at::<u16>(TCP_RETRANS_SPORT_OFFSET) }.unwrap_or(0);
-    let dport = unsafe { ctx.read_at::<u16>(TCP_RETRANS_DPORT_OFFSET) }.unwrap_or(0);
-
-    let event = TcpEvent {
-        tid,
-        family,
-        retrans: 1,
-        _pad: 0,
-        sport,
-        dport,
-        // A retransmission has no smoothed RTT or window to report.
-        rtt_us: 0,
-        snd_cwnd: 0,
-        rcv_wnd: 0,
-        saddr,
-        daddr,
-    };
-    NET_EVENTS.output(&ctx, event, BPF_ANY);
-    Ok(0)
+pub fn tcp_retransmit_skb(_ctx: TracePointContext) -> u32 {
+    0
 }
 
 // --- Memory: page faults and direct reclaim, counted rather than streamed ---

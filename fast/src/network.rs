@@ -73,20 +73,6 @@ impl Endpoint {
         }
     }
 
-    /// Total number of observed segments: RTT samples plus retransmissions.
-    pub fn segments(&self) -> u64 {
-        self.rtts.len() as u64 + self.retrans
-    }
-
-    /// Retransmissions as a fraction of observed segments, from 0.0 to 1.0.
-    pub fn retrans_ratio(&self) -> f64 {
-        let total = self.segments();
-        if total == 0 {
-            return 0.0;
-        }
-        self.retrans as f64 / total as f64
-    }
-
     /// p50, p95 and p99 of this endpoint's RTT samples, in microseconds.
     pub fn rtt_percentiles(&self) -> (u32, u32, u32) {
         crate::stats::percentiles_us(&self.rtts)
@@ -230,13 +216,7 @@ pub fn run(args: NetArgs) -> Result<()> {
         "/fast-ebpf"
     )))
     .context("failed to load eBPF object; run as root or grant CAP_BPF and CAP_PERFMON")?;
-    // Both programs share the NET_EVENTS map and the TCP_SOCKETS map, so the
-    // retransmission program can attribute an event to a socket the RTT
-    // program first saw. tcp_probe must be attached as well: it is what
-    // populates TCP_SOCKETS.
-    runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_probe")?;
-    runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_retransmit_skb")?;
-
+    // No TCP tracepoint provides trustworthy ownership attribution.
     let mut target_tids = runtime::take_target_map(&mut bpf)?;
 
     let mut known_tids = BTreeSet::new();
@@ -263,8 +243,9 @@ pub fn run(args: NetArgs) -> Result<()> {
         if summary.interrupted {
             println!("Status: interrupted");
         }
-        println!("Samples: {}", stats.samples());
-        println!("Retransmissions: {}", stats.retrans());
+        println!("TCP attribution: unavailable (socket ownership cannot be established)");
+        println!("Samples: unavailable");
+        println!("Retransmissions: unavailable");
         println!("Lost events: {}", stats.lost());
         println!();
 
@@ -272,29 +253,27 @@ pub fn run(args: NetArgs) -> Result<()> {
         if ranked.is_empty() {
             println!("Endpoints");
             println!("No TCP samples collected.");
-            println!("Test with: fast-workload net-hog --duration 30s   (then observe its PID)");
             return Ok(());
         }
 
         // The table leads with the slowest endpoint so the connection worth
         // looking at is the first thing on screen. All latencies are in
-        // microseconds, and the ratio is retransmissions over observed segments.
+        // microseconds. Transmitted segment counts are not collected.
         println!(
             "Slow endpoints by RTT p95 ({} of {} shown)",
             ranked.len().min(MAX_REPORTED_ENDPOINTS),
             ranked.len()
         );
         println!(
-            "  {:>8} {:>8} {:>8} {:>8} {:>8} {:>7}  endpoint",
-            "p95", "p50", "p99", "samples", "retrans", "ratio"
+            "  {:>8} {:>8} {:>8} {:>8} {:>8}  endpoint",
+            "p95", "p50", "p99", "samples", "retrans"
         );
         for endpoint in ranked.iter().take(MAX_REPORTED_ENDPOINTS) {
             let (p50, p95, p99) = endpoint.rtt_percentiles();
             println!(
-                "  {p95:>8} {p50:>8} {p99:>8} {:>8} {:>8} {:>6.1}%  {}",
+                "  {p95:>8} {p50:>8} {p99:>8} {:>8} {:>8}  {}",
                 endpoint.rtts.len(),
                 endpoint.retrans,
-                endpoint.retrans_ratio() * 100.0,
                 format_endpoint(endpoint),
             );
         }
@@ -313,14 +292,8 @@ pub fn run(args: NetArgs) -> Result<()> {
         println!("Slowest endpoint");
         println!("  {} us p95", worst_p95);
         println!("  {}", format_endpoint(worst));
-        if worst.retrans > 0 {
-            println!(
-                "  {} retransmissions, {:.1}% of {} observed segments",
-                worst.retrans,
-                worst.retrans_ratio() * 100.0,
-                worst.segments()
-            );
-        }
+        println!("  {} retransmissions", worst.retrans);
+        println!("  retransmission rate unavailable (transmitted segment count not collected)");
         // A closed congestion window with retransmissions on top is what a
         // struggling path looks like, so both are always named here.
         println!(
@@ -338,7 +311,8 @@ pub fn run(args: NetArgs) -> Result<()> {
                 summary.interrupted,
                 false,
                 crate::json_payloads::network_json(&stats),
-            ),
+            )
+            .with_v2(),
         );
     }
     Ok(())
@@ -347,6 +321,32 @@ pub fn run(args: NetArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tcp_programs_have_no_attribution_or_output_path() {
+        let ebpf = include_str!("../../fast-ebpf/src/main.rs");
+        assert_eq!(
+            ebpf.matches("NET_EVENTS").count(),
+            1,
+            "the event map may only be declared"
+        );
+        assert!(!ebpf.contains("TCP_SOCKETS"));
+        for name in ["tcp_probe", "tcp_retransmit_skb"] {
+            let body = format!("pub fn {name}(_ctx: TracePointContext) -> u32 {{\n    0\n}}");
+            assert!(
+                ebpf.contains(&body),
+                "{name} must unconditionally return without attributing"
+            );
+            for source in [
+                include_str!("network.rs"),
+                include_str!("diagnose.rs"),
+                include_str!("daemon.rs"),
+            ] {
+                let attachment = format!("attach_tracepoint(&mut bpf, \"tcp\", \"{name}\")");
+                assert!(!source.contains(&attachment), "{name} must not be attached");
+            }
+        }
+    }
 
     fn probe(family: u16, saddr: [u8; 16], daddr: [u8; 16], rtt: u32) -> TcpEvent {
         TcpEvent {
@@ -428,33 +428,18 @@ mod tests {
     }
 
     #[test]
-    fn computes_retrans_ratio() {
-        let mut s = NetStats::default();
-        for _ in 0..3 {
-            s.record(probe(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 1), 100));
-        }
-        s.record(retrans(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 1)));
-
-        let endpoint = &s.slowest_endpoints()[0];
-        assert_eq!(endpoint.segments(), 4);
-        assert!((endpoint.retrans_ratio() - 0.25).abs() < 1e-9);
-    }
-
-    #[test]
-    fn retrans_ratio_is_zero_without_segments() {
-        let endpoint = Endpoint {
-            family: AF_INET,
-            saddr: v4(127, 0, 0, 1),
-            daddr: v4(10, 0, 0, 1),
-            sport: 1,
-            dport: 2,
-            rtts: Vec::new(),
-            retrans: 0,
-            max_cwnd: 0,
-            max_rcv_wnd: 0,
-        };
-        assert_eq!(endpoint.segments(), 0);
-        assert_eq!(endpoint.retrans_ratio(), 0.0);
+    fn network_json_never_reports_unattributable_events() {
+        // The reporters keep no TCP ownership, so events recorded through the
+        // low-level collector must not leak into the document as measurements.
+        let mut stats = NetStats::default();
+        let src = v4(127, 0, 0, 1);
+        stats.record(probe(AF_INET, src, v4(10, 0, 0, 3), 100));
+        stats.record(retrans(AF_INET, src, v4(10, 0, 0, 3)));
+        let json = serde_json::to_value(crate::json_payloads::network_json(&stats)).unwrap();
+        assert_eq!(json["tcp_available"], false);
+        assert!(json["samples"].is_null());
+        assert!(json["retransmissions"].is_null());
+        assert_eq!(json["endpoints"].as_array().unwrap().len(), 0);
     }
 
     #[test]

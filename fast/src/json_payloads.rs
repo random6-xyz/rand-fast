@@ -4,7 +4,8 @@
 //! whole schema can be read in one place, and that the naming rules the
 //! envelope documents are applied uniformly: latencies in microseconds with a
 //! `_us` suffix, rates per second with `_per_s`, byte counts in bytes with
-//! `_bytes`, and an unknown value omitted rather than serialised as null.
+//! `_bytes`, and an unknown value omitted rather than serialised as null,
+//! except for the explicitly unavailable v2 retransmission ratio.
 
 use std::time::Duration;
 
@@ -22,10 +23,12 @@ use crate::{
 /// The `net` command's `data` object.
 #[derive(Debug, Clone, Serialize)]
 pub struct NetJson {
+    /// Whether TCP ownership attribution is available.
+    pub tcp_available: bool,
     /// Ordinary RTT samples observed.
-    pub samples: u64,
+    pub samples: Option<u64>,
     /// Retransmissions observed.
-    pub retransmissions: u64,
+    pub retransmissions: Option<u64>,
     /// Records the kernel dropped from the perf buffer.
     pub lost_events: u64,
     /// One row per remote endpoint, slowest first.
@@ -55,8 +58,9 @@ pub struct EndpointJson {
     pub p99_us: u64,
     /// Retransmissions on this endpoint.
     pub retransmissions: u64,
-    /// Retransmissions over observed segments, from 0.0 to 1.0.
-    pub retrans_ratio: f64,
+    /// Always null: transmitted segment counts are not collected. The field is
+    /// retained in v2, but its former v1 numeric value was invalid.
+    pub retrans_ratio: Option<f64>,
     /// Highest congestion window seen, in segments.
     pub max_cwnd: u64,
     /// Highest receive window seen, in bytes.
@@ -66,31 +70,11 @@ pub struct EndpointJson {
 /// Builds the `net` document's `data` object.
 pub fn network_json(stats: &NetStats) -> NetJson {
     NetJson {
-        samples: stats.samples(),
-        retransmissions: stats.retrans(),
+        tcp_available: false,
+        samples: None,
+        retransmissions: None,
         lost_events: stats.lost(),
-        endpoints: stats
-            .slowest_endpoints()
-            .into_iter()
-            .map(|endpoint| {
-                let (p50, p95, p99) = endpoint.rtt_percentiles();
-                EndpointJson {
-                    family: endpoint.family,
-                    source: crate::network::format_address(endpoint.family, endpoint.saddr),
-                    destination: crate::network::format_address(endpoint.family, endpoint.daddr),
-                    source_port: endpoint.sport,
-                    destination_port: endpoint.dport,
-                    samples: endpoint.rtts.len() as u64,
-                    p50_us: p50 as u64,
-                    p95_us: p95 as u64,
-                    p99_us: p99 as u64,
-                    retransmissions: endpoint.retrans,
-                    retrans_ratio: endpoint.retrans_ratio(),
-                    max_cwnd: endpoint.max_cwnd as u64,
-                    max_rcv_wnd_bytes: endpoint.max_rcv_wnd as u64,
-                }
-            })
-            .collect(),
+        endpoints: Vec::new(),
     }
 }
 
@@ -99,6 +83,8 @@ pub fn network_json(stats: &NetStats) -> NetJson {
 /// The `daemon` command's `data` object.
 #[derive(Debug, Clone, Serialize)]
 pub struct DaemonJson {
+    /// Whether TCP ownership attribution is available.
+    pub tcp_available: bool,
     /// How long the recorder ran, in seconds.
     pub ran_s: f64,
     /// The rolling window the ring covers, in seconds.
@@ -123,16 +109,34 @@ pub struct DaemonJson {
     pub within_memory_budget: bool,
     /// Where incidents are written.
     pub output_dir: String,
+    /// Completed incident bundles, even if later rotation failed.
+    pub incidents_written: u64,
+    /// Failed bundle writes before completion.
+    pub incident_write_failures: u64,
+    /// Rotation failures after a bundle completed.
+    pub incident_rotation_failures: u64,
+    /// Fired intervals skipped because incident writing was disabled.
+    pub incidents_skipped: u64,
+    /// Whether incident writing is disabled for the remainder of this run.
+    pub incident_writes_disabled: bool,
+    /// Semantics for newly collected interval values.
+    pub measurement_semantics: &'static str,
     /// The most recent intervals, oldest first.
     pub intervals_detail: Vec<serde_json::Value>,
 }
 
 /// Builds the `daemon` document's `data` object.
+#[allow(clippy::too_many_arguments)]
 pub fn daemon_json(
     ring: &crate::daemon::Ring,
     peak_cpu_pct: f64,
     peak_memory_bytes: u64,
     ticks: u64,
+    incidents_written: u64,
+    incident_write_failures: u64,
+    incident_rotation_failures: u64,
+    incidents_skipped: u64,
+    incident_writes_disabled: bool,
 ) -> DaemonJson {
     let window = ring.window();
     let entry = ring.entries().next();
@@ -146,6 +150,7 @@ pub fn daemon_json(
             })
     });
     DaemonJson {
+        tcp_available: false,
         ran_s: ring.entries().last().map_or(0.0, |e| e.at.as_secs_f64()),
         window_s: window.as_secs_f64(),
         interval_s: interval.as_secs_f64(),
@@ -158,6 +163,12 @@ pub fn daemon_json(
         budget_recording_bytes: crate::daemon::BUDGET_RECORDING_BYTES,
         within_memory_budget: peak_memory_bytes <= crate::daemon::BUDGET_RECORDING_BYTES,
         output_dir: String::new(),
+        incidents_written,
+        incident_write_failures,
+        incident_rotation_failures,
+        incidents_skipped,
+        incident_writes_disabled,
+        measurement_semantics: crate::daemon::MEASUREMENT_SEMANTICS,
         intervals_detail: ring
             .entries()
             .rev()
@@ -517,7 +528,7 @@ pub fn memory_json(
 pub struct DiagnoseJson {
     /// The measurements the ranking was computed from, so a consumer can
     /// recompute or re-weight them without re-running the collection.
-    pub measured: Evidence,
+    pub measured: serde_json::Value,
     /// Records the kernel dropped, one entry per stream that lost any.
     pub lost_events: Vec<LostJson>,
     /// The ranked causes, highest share first.
@@ -546,8 +557,13 @@ pub struct CauseJson {
 
 /// Builds the `diagnose` document's `data` object.
 pub fn diagnose_json(evidence: &Evidence) -> DiagnoseJson {
+    let mut measured = serde_json::to_value(evidence).expect("evidence is serializable");
+    if !evidence.tcp_available {
+        measured["net_samples"] = serde_json::Value::Null;
+        measured["retrans_ratio"] = serde_json::Value::Null;
+    }
     DiagnoseJson {
-        measured: evidence.clone(),
+        measured,
         lost_events: evidence
             .lost
             .iter()
@@ -578,48 +594,11 @@ mod tests {
     }
 
     #[test]
-    fn net_json_names_every_field_with_a_unit() {
-        let mut stats = NetStats::default();
-        for rtt in [100u32, 200, 300] {
-            crate::runtime::EventHandler::on_event(
-                &mut stats,
-                fast_common::TcpEvent {
-                    tid: 1,
-                    family: fast_common::AF_INET,
-                    retrans: 0,
-                    _pad: 0,
-                    sport: 1234,
-                    dport: 80,
-                    rtt_us: rtt,
-                    snd_cwnd: 10,
-                    rcv_wnd: 4096,
-                    saddr: {
-                        let mut a = [0u8; 16];
-                        a[0] = 127;
-                        a
-                    },
-                    daddr: {
-                        let mut a = [0u8; 16];
-                        a[0] = 10;
-                        a
-                    },
-                },
-            );
-        }
-        let value = value_of(&network_json(&stats));
-        assert_eq!(value["samples"], serde_json::json!(3));
-        let endpoint = &value["endpoints"][0];
-        // Latencies are microseconds and windows are named with their unit, so
-        // a consumer never has to guess.
-        assert!(endpoint.get("p50_us").is_some());
-        assert!(endpoint.get("retrans_ratio").is_some());
-        assert_eq!(endpoint["max_rcv_wnd_bytes"], serde_json::json!(4096));
-    }
-
-    #[test]
     fn net_json_of_an_empty_run_is_still_well_formed() {
         let value = value_of(&network_json(&NetStats::default()));
-        assert_eq!(value["samples"], serde_json::json!(0));
+        assert_eq!(value["tcp_available"], false);
+        assert!(value["samples"].is_null());
+        assert!(value["retransmissions"].is_null());
         assert_eq!(value["endpoints"].as_array().unwrap().len(), 0);
     }
 
@@ -702,9 +681,13 @@ mod tests {
             offcpu_samples: 1_000,
             offcpu_total_us: 100_000,
             offcpu_futex_ratio: 0.9,
+            net_samples: 12,
+            retransmissions: 2,
             ..Evidence::default()
         };
         let value = value_of(&diagnose_json(&evidence));
+        assert_eq!(value["measured"]["retransmissions"], 2);
+        assert_eq!(value["measured"].get("retrans_ratio"), Some(&Value::Null));
         assert_eq!(
             value["measured"]["offcpu_samples"],
             serde_json::json!(1_000)
@@ -720,6 +703,20 @@ mod tests {
                 .contains("futex"),
             "the cause must carry its evidence"
         );
+    }
+
+    #[test]
+    fn diagnose_json_uses_null_for_unavailable_tcp_measurements() {
+        let evidence = Evidence {
+            net_samples: 123,
+            retrans_ratio: Some(0.5),
+            tcp_available: false,
+            ..Evidence::default()
+        };
+        let value = value_of(&diagnose_json(&evidence));
+        assert_eq!(value["measured"]["tcp_available"], false);
+        assert!(value["measured"]["net_samples"].is_null());
+        assert!(value["measured"]["retrans_ratio"].is_null());
     }
 
     #[test]
