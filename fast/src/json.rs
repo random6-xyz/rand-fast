@@ -25,11 +25,10 @@
 //!   readability; JSON does not, because a consumer should never have to parse
 //!   "1.5 ms".
 //! - All byte counts are bytes, named with a `_bytes` suffix.
-//! - A field is present whenever it is known, and absent rather than null when
-//!   it is not. A consumer can tell "no samples" from "zero samples" by the
-//!   absence of the count, which is the distinction the human report makes in
-//!   words. In v2 `net` and `diagnose`, `retrans_ratio` is explicitly null:
-//!   no transmitted segment count is collected.
+//! - In v1, a field is present when known and absent rather than null when it
+//!   is not. V2 reports use null for unavailable values; `net` and `diagnose`
+//!   report `retrans_ratio` as null because no transmitted segment count is
+//!   collected and TCP attribution is unavailable.
 //! - `lost_events` is present on every eBPF-backed command, so a consumer can
 //!   decide how far to trust the rest.
 //!
@@ -48,9 +47,8 @@ use serde::Serialize;
 
 /// The schema identifier every JSON document carries.
 pub const SCHEMA: &str = "rand-fast/v1";
-
-/// Schema for reports whose retransmission ratio was corrected.
-pub const NETWORK_SCHEMA: &str = "rand-fast/v2";
+/// Schema for reports with unavailable TCP measurements.
+pub const SCHEMA_V2: &str = "rand-fast/v2";
 
 /// The output format a command was asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -100,7 +98,7 @@ impl<T: Serialize> Envelope<T> {
     ) -> Self {
         Self {
             schema: if matches!(command, "net" | "diagnose") {
-                NETWORK_SCHEMA
+                SCHEMA_V2
             } else {
                 SCHEMA
             },
@@ -116,12 +114,21 @@ impl<T: Serialize> Envelope<T> {
         }
     }
 
+    /// Marks a report whose measurement types use the v2 contract.
+    pub fn with_v2(mut self) -> Self {
+        self.schema = SCHEMA_V2;
+        self
+    }
+
     /// Serializes to a single line, which is what a streaming consumer wants
     /// and what makes the output diffable line by line.
     pub fn to_line(&self) -> String {
         // Serializing a struct of plain values cannot fail.
         serde_json::to_string(self).unwrap_or_else(|error| {
-            format!("{{\"schema\":\"{SCHEMA}\",\"error\":\"json serialization failed: {error}\"}}")
+            format!(
+                "{{\"schema\":\"{}\",\"error\":\"json serialization failed: {error}\"}}",
+                self.schema
+            )
         })
     }
 }
@@ -165,6 +172,16 @@ mod tests {
             false,
             data,
         )
+    }
+
+    #[test]
+    fn v2_reports_are_explicit_while_other_reports_remain_v1() {
+        let original = envelope(Sample {
+            count: 3,
+            note: None,
+        });
+        assert_eq!(to_value(&original)["schema"], "rand-fast/v1");
+        assert_eq!(to_value(&original.with_v2())["schema"], "rand-fast/v2");
     }
 
     #[test]
@@ -355,8 +372,8 @@ mod schema_tests {
     #[test]
     fn corrected_network_reports_use_v2_without_changing_other_commands() {
         for (command, schema) in [
-            ("net", NETWORK_SCHEMA),
-            ("diagnose", NETWORK_SCHEMA),
+            ("net", SCHEMA_V2),
+            ("diagnose", SCHEMA_V2),
             ("sched", SCHEMA),
         ] {
             let envelope = Envelope::new(command, 1, None, Duration::ZERO, false, false, ());

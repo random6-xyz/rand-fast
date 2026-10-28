@@ -60,6 +60,8 @@ pub struct Evidence {
     pub net_samples: u64,
     /// Retransmissions observed, not a rate.
     pub retransmissions: u64,
+    /// False when TCP ownership cannot be established.
+    pub tcp_available: bool,
     /// Always null: transmitted segment counts are not collected. Retained
     /// in v2; previous v1 numeric values were invalid.
     pub retrans_ratio: Option<f64>,
@@ -139,16 +141,10 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
     .context("failed to load eBPF object; run as root or grant CAP_BPF and CAP_PERFMON")?;
     crate::io_request_layout::configure(&mut bpf)?;
 
-    // Only the programs this command needs are attached. Both scheduler
-    // programs are needed: the off-CPU pairing reads the same switch-out the
-    // latency measurement reads. Both TCP programs are needed for the same
-    // reason: tcp_probe registers the sockets that tcp_retransmit_skb then
-    // attributes.
+    // TCP attribution is unavailable; do not attach the TCP tracepoints.
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_wakeup")?;
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_switch")?;
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_process_exit")?;
-    runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_probe")?;
-    runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_retransmit_skb")?;
     runtime::attach_raw_tracepoint(&mut bpf, "block_rq_issue")?;
     runtime::attach_raw_tracepoint(&mut bpf, "block_rq_complete")?;
     runtime::attach_tracepoint(&mut bpf, "exceptions", "page_fault_user")?;
@@ -279,7 +275,8 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
                 summary.interrupted,
                 summary.process_exited,
                 crate::json_payloads::diagnose_json(&evidence),
-            ),
+            )
+            .with_v2(),
         );
     } else {
         print_report(&process_name, pid, &summary, &evidence);
@@ -324,6 +321,7 @@ fn collect_evidence(
         io_slow: io_stats.slow_count(),
         net_samples: net.samples() + net.retrans(),
         retransmissions: net.retrans(),
+        tcp_available: false,
         retrans_ratio: None,
         offcpu_samples: offcpu.sample_count(),
         offcpu_p95_us: offcpu_p95 / 1_000,
@@ -382,10 +380,7 @@ fn print_report(name: &str, pid: u32, summary: &runtime::CollectionSummary, evid
         "  block io: {} completions, {} unmatched, p99 {} us, {} over the slow threshold",
         evidence.io_samples, evidence.io_unmatched, evidence.io_p99_us, evidence.io_slow
     );
-    println!(
-        "  tcp: {} events, {} retransmissions; retransmission rate unavailable (transmitted segment count not collected)",
-        evidence.net_samples, evidence.retransmissions
-    );
+    println!("  tcp: unavailable (socket ownership cannot be established)");
     println!(
         "  off-cpu: {} waits, p95 {} us, {} us total, {:.0}% of it on a futex",
         evidence.offcpu_samples,

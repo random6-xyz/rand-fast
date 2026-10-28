@@ -17,7 +17,7 @@
 #
 # Environment overrides:
 #   DURATION    per-run collection length (default 5s)
-#   OUT_DIR     where raw reports are written (default /tmp/fast-smoke)
+#   OUT_DIR     where raw reports are written (default /fast-smoke)
 #   IO_HOG_PATH file the io-hog reads; put it on a real block device (not
 #               tmpfs) so block_rq_* tracepoints fire (default /tmp/fast-workload-io)
 #
@@ -29,7 +29,7 @@ FAST=${FAST:-./fast}
 SCHED_WORKLOAD=${SCHED_WORKLOAD:-./sched-workload}
 FAST_WORKLOAD=${FAST_WORKLOAD:-./fast-workload}
 DURATION=${DURATION:-5s}
-OUT_DIR=${OUT_DIR:-/tmp/fast-smoke}
+OUT_DIR=${OUT_DIR:-/fast-smoke}
 IO_HOG_PATH=${IO_HOG_PATH:-/tmp/fast-workload-io}
 FAILURES=0
 PID_MAX_ORIGINAL=
@@ -81,9 +81,17 @@ run_case() {
 
     if "$FAST" "$command_name" --pid "$target_pid" --duration "$DURATION" \
         >"$report" 2>&1; then
-        echo "$command_name verifier: pass (program loaded and attached)"
+        if [ "$command_name" = net ]; then
+            echo "net collection: pass (TCP programs not attached; no TCP verifier check)"
+        else
+            echo "$command_name verifier: pass (program loaded and attached)"
+        fi
     else
-        echo "$command_name verifier: FAIL"
+        if [ "$command_name" = net ]; then
+            echo "net collection: FAIL (TCP programs not attached)"
+        else
+            echo "$command_name verifier: FAIL"
+        fi
         cat "$report"
         FAILURES=$((FAILURES + 1))
         kill "$target_pid" 2>/dev/null
@@ -144,9 +152,86 @@ run_sched_case() {
     echo
 }
 
+# The TCP programs are intentionally not attached. Exercise the public
+# unavailable contract against live traffic, not an invented zero count.
+check_tcp_unavailable() {
+    local dir="$OUT_DIR/tcp-unavailable" pid status=0 manifest
+    rm -rf "$dir"
+    mkdir -p "$dir/incidents" "$dir/triggered"
+    "$FAST_WORKLOAD" net-hog --duration 60s --workers 2 --delay-ms 600 \
+        >"$dir/fixture.log" 2>&1 &
+    pid=$!
+    sleep 0.5
+    "$FAST" net --pid "$pid" --duration 2s >"$dir/net.txt" 2>&1 || status=1
+    "$FAST" net --pid "$pid" --duration 2s --format json >"$dir/net.json" 2>"$dir/net.err" || status=1
+    "$FAST" diagnose --pid "$pid" --duration 2s >"$dir/diagnose.txt" 2>&1 || status=1
+    "$FAST" diagnose --pid "$pid" --duration 2s --format json >"$dir/diagnose.json" 2>"$dir/diagnose.err" || status=1
+    local flags="--trigger-sched-p95 off --trigger-io-p99 off --trigger-retrans 1 --trigger-psi-some off --trigger-psi-full off --trigger-cpu off"
+    # Only the disabled retransmission trigger is enabled.
+    "$FAST" daemon --pid "$pid" --duration 4s --interval 1s --window 10s \
+        --output "$dir/incidents" $flags >"$dir/daemon.txt" 2>&1 || status=1
+    "$FAST" daemon --pid "$pid" --duration 4s --interval 1s --window 10s \
+        --output "$dir/incidents" $flags --format json >"$dir/daemon.json" 2>"$dir/daemon.err" || status=1
+    # A different signal produces a real incident whose TCP fields must still
+    # be unavailable. This also checks the incident envelope and manifest.
+    "$FAST" daemon --pid "$pid" --duration 5s --interval 1s --window 10s \
+        --output "$dir/triggered" --trigger-sched-p95 1us --trigger-io-p99 off \
+        --trigger-retrans 1 --trigger-psi-some off --trigger-psi-full off \
+        --trigger-cpu off >"$dir/incident.txt" 2>&1 || status=1
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+
+    grep -q '^TCP attribution: unavailable' "$dir/net.txt" || status=1
+    grep -q '^Samples: unavailable' "$dir/net.txt" || status=1
+    grep -q '^Retransmissions: unavailable' "$dir/net.txt" || status=1
+    grep -q '"schema":"rand-fast/v2"' "$dir/net.json" || status=1
+    grep -q '"tcp_available":false' "$dir/net.json" || status=1
+    grep -q '"samples":null' "$dir/net.json" || status=1
+    grep -q '"retransmissions":null' "$dir/net.json" || status=1
+    grep -q '"endpoints":\[\]' "$dir/net.json" || status=1
+    grep -q '^  tcp: unavailable' "$dir/diagnose.txt" || status=1
+    grep -q '"schema":"rand-fast/v2"' "$dir/diagnose.json" || status=1
+    grep -q '"tcp_available":false' "$dir/diagnose.json" || status=1
+    grep -q '"net_samples":null' "$dir/diagnose.json" || status=1
+    grep -q '"retrans_ratio":null' "$dir/diagnose.json" || status=1
+    grep -q 'retrans: unavailable' "$dir/daemon.txt" || status=1
+    grep -q 'incidents written: 0' "$dir/daemon.txt" || status=1
+    grep -q '"schema":"rand-fast/v2"' "$dir/daemon.json" || status=1
+    grep -q '"tcp_available":false' "$dir/daemon.json" || status=1
+    grep -q '"retrans":null' "$dir/daemon.json" || status=1
+    for candidate in "$dir"/incidents/*/; do
+        [ ! -d "$candidate" ] || status=1
+    done
+    manifest=""
+    for candidate in "$dir"/triggered/*/manifest.json; do
+        [ -f "$candidate" ] && { manifest=$candidate; break; }
+    done
+    if [ -z "$manifest" ]; then
+        status=1
+    else
+        grep -q '"schema": "rand-fast/v2"' "$manifest" || status=1
+        grep -q '"retrans": null' "$manifest" || status=1
+        grep -q '"tcp_available": false' "$manifest" || status=1
+        grep -q '"signal": "sched_p95"' "$manifest" || status=1
+        grep -q '"available": false' "$manifest" || status=1
+    fi
+    if [ "$status" -ne 0 ]; then
+        echo "TCP unavailable contract: FAIL (see $dir)"
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "TCP unavailable contract: pass (net, diagnose, daemon and incident; retransmission trigger disabled)"
+        echo "TCP verifier: SKIP (programs intentionally not attached)"
+    fi
+}
+
 # Host-side stub tests exercise the same case/failure accounting without QEMU.
 if [ "${QEMU_SMOKE_TEST_CASE:-}" = "single-io" ]; then
     run_case io "$FAST_WORKLOAD" io-hog --duration 1s --workers 1
+    finish
+fi
+
+if [ "${QEMU_SMOKE_TEST_CASE:-}" = "tcp-unavailable" ]; then
+    check_tcp_unavailable
     finish
 fi
 
@@ -293,342 +378,6 @@ check_io_request_identity() {
     wait "$other_pid" 2>/dev/null
     wait "$target_pid" 2>/dev/null
 }
-
-# Proves the RTT distribution actually moves when the link degrades.
-#
-# A qdisc would be the obvious way to degrade a link, but netem, HTB and TBF
-# are all optional kernel features and none of them are usable on loopback in
-# the verified kernel (netem and TBF are not built in, and HTB shapes the
-# link so hard the connection never gets going). The stalling fixture is used
-# instead: it closes the receive window in cycles, which stretches the round
-# trip into the tens of milliseconds while the baseline sits in the tens of
-# microseconds.
-#
-# The slowest endpoint is compared on both sides. Cycling the receive window
-# leaves one direction of each connection fast and the other stretched, so a
-# median lands on whichever side happened to dominate and the ratio collapses
-# from one run to the next. The slowest endpoint is the same measurement on
-# both sides, and the gap is measured in orders of magnitude, so a loose
-# threshold still catches a measurement that is stuck or scaled wrong. The
-# report is reused from the retransmission check, which needs the same
-# cycling workload.
-RTT_MIN_RATIO=${RTT_MIN_RATIO:-20}
-
-# rand-fast reports microseconds, ss reports milliseconds. The two must agree
-# within a factor of two: wide enough for the run-to-run drift of a smoothed
-# RTT, tight enough to catch a wrong scale factor or a misread offset.
-RTT_CROSSCHECK_TOLERANCE=${RTT_CROSSCHECK_TOLERANCE:-2}
-
-# Proves the endpoint ranking is usable: the report is supposed to lead with
-# the connection that is actually slow, so the first row has to be a real
-# outlier rather than one of the healthy ones. The cycling fixture stretches
-# its round trips into the milliseconds while a plain loopback run sits in the
-# microseconds, so the two are compared row by row.
-check_net_endpoint_ranking() {
-    if [ ! -f "$OUT_DIR/net-retrans.txt" ] || [ ! -f "$OUT_DIR/net-rtt-base.txt" ]; then
-        echo "net endpoint ranking: SKIP (no reports from the earlier net checks)"
-        return
-    fi
-
-    # First data row of each table, and the slowest row of the cycling table.
-    local worst_p95 base_p95 median_p95
-    worst_p95=$(max_p95_us "$OUT_DIR/net-retrans.txt")
-    base_p95=$(max_p95_us "$OUT_DIR/net-rtt-base.txt")
-    median_p95=$(median_p50_us "$OUT_DIR/net-retrans.txt")
-
-    if [ "${worst_p95:-0}" -le 0 ] || [ "${median_p95:-0}" -le 0 ]; then
-        echo "net endpoint ranking: FAIL (no p95 values; worst=$worst_p95 median=$median_p95)"
-        FAILURES=$((FAILURES + 1))
-        return
-    fi
-    if ! awk -v w="$worst_p95" -v m="$median_p95" -v b="$base_p95" \
-            'BEGIN { ok = (w >= b * 5)
-                     printf "net endpoint ranking: first row %d us p95 vs %d us median under load and %d us on plain loopback\n", w, m, b
-                     exit ok ? 0 : 1 }'; then
-        echo "    the first row is not a real outlier, so the ranking is not leading with the slow endpoint"
-        FAILURES=$((FAILURES + 1))
-    fi
-}
-
-check_net_rtt_separation() {
-    local base stalled ratio_ok=1
-    base=$(max_p95_us "$OUT_DIR/net-rtt-base.txt")
-    # The cycling run that check_net_retransmit_attribution collected: its
-    # round trips are stretched by the shut receive window.
-    stalled=$(max_p95_us "$OUT_DIR/net-retrans.txt")
-    if [ "${base:-0}" -le 0 ] || [ "${stalled:-0}" -le 0 ]; then
-        echo "net RTT separation: FAIL (no RTT samples; plain loopback=$base window cycling=$stalled)"
-        FAILURES=$((FAILURES + 1))
-        return
-    fi
-    if ! awk -v b="$base" -v d="$stalled" -v need="$RTT_MIN_RATIO" \
-            'BEGIN { r = (b + 0) == 0 ? 0 : d / b
-                     printf "net RTT separation: slowest endpoint p95 %d us on plain loopback vs %d us with the receive window cycling shut (%.0fx)\n", b, d, r
-                     exit (r >= need) ? 0 : 1 }'; then
-        ratio_ok=0
-    fi
-    [ "$ratio_ok" -eq 1 ] || FAILURES=$((FAILURES + 1))
-}
-
-# Locates ss, which busybox does not provide at all.
-SS_BIN=""
-for candidate in /sbin/ss /bin/ss; do
-    [ -x "$candidate" ] && { SS_BIN=$candidate; break; }
-done
-
-# Median of the per-endpoint p50 column, in microseconds.
-#
-# The endpoint table is printed with fixed-width numeric columns, so the
-# columns are positional: p95, p50, p99, samples, retrans, endpoint.
-# Data rows are recognised by a leading integer, which the header and the
-# surrounding prose never have.
-median_p50_us() {
-    awk '$1 ~ /^[0-9]+$/ { print $2 }' "$1" | sort -n \
-        | awk '{ v[NR] = $1 } END { if (NR == 0) { print 0 } else { print v[int((NR+1)/2)] } }'
-}
-
-# Slowest p95 in a report, in microseconds.
-max_p95_us() {
-    awk '$1 ~ /^[0-9]+$/ && $1 + 0 > m { m = $1 + 0 } END { print m + 0 }' "$1"
-}
-
-# Congestion window rand-fast reported for the slowest endpoint, which the
-# report prints in its detail block.
-fast_cwnd() {
-    awk '/congestion window/ { print $3; exit }' "$1"
-}
-
-# Congestion window `ss -ti` reported for a loopback socket.
-ss_cwnd() {
-    awk '/cwnd:/ { for (i = 1; i <= NF; i++) if ($i ~ /^cwnd:/ && $i != "cwnd:") { split($i, p, ":"); print p[2]; exit } }' "$1"
-}
-
-# Median of the `rtt:` values `ss -ti` printed for loopback sockets, in
-# microseconds.
-#
-# `ss -ti` prints two lines per socket: a header with the addresses, then an
-# indented detail line carrying `rtt:<smoothed>/<last>`. The detail line is
-# what holds the number, so the header is remembered and checked to decide
-# whether the detail line belongs to a loopback socket. The first number of
-# `rtt:` is the same srtt the tracepoint carries.
-median_ss_rtt_us() {
-    awk '/127\.0\.0\.1/ { loopback = 1; next }
-         loopback && /rtt:/ {
-             for (i = 1; i <= NF; i++)
-                 if ($i ~ /^rtt:/ && $i != "rtt:") {
-                     split($i, part, "/")
-                     split(part[1], pair, ":")
-                     if (pair[2] + 0 > 0) print pair[2] * 1000
-                 }
-             loopback = 0
-         }' "$1" | sort -n \
-        | awk '{ v[NR] = $1 } END { if (NR == 0) { print 0 } else { print v[int((NR+1)/2)] } }'
-}
-
-# Collects RTT for a net-hog fixture. Arguments are the report path and the
-# path the ss snapshot is written to. Returns non-zero when the collection
-# fails; the fixture is always cleaned up.
-#
-# The ss snapshot is sampled repeatedly while the eBPF collection runs, not
-# once before it. rand-fast adds its own overhead to a saturated guest, so a
-# snapshot taken before collection starts would compare a lightly loaded
-# loopback against a heavily loaded one and report a large false mismatch.
-collect_net_rtt() {
-    report=$1
-    ss_out=$2
-    "$FAST_WORKLOAD" net-hog --duration 20s --workers 2 >/dev/null 2>&1 &
-    fixture_pid=$!
-    sleep 0.3
-    : >"$ss_out"
-    if [ -n "$SS_BIN" ]; then
-        # 0.25s of settle time, then 16 samples spaced 0.4s apart across the
-        # 8s collection window.
-        ( sleep 0.25
-          i=0
-          while [ "$i" -lt 16 ]; do
-              "$SS_BIN" -ti state established 2>/dev/null >>"$ss_out" || true
-              echo >>"$ss_out"
-              i=$((i + 1))
-              sleep 0.4
-          done ) &
-        ss_pid=$!
-    else
-        ss_pid=""
-    fi
-    if ! "$FAST" net --pid "$fixture_pid" --duration 8s >"$report" 2>&1; then
-        [ -n "$ss_pid" ] && kill "$ss_pid" 2>/dev/null
-        kill "$fixture_pid" 2>/dev/null
-        wait "$fixture_pid" 2>/dev/null
-        return 1
-    fi
-    [ -n "$ss_pid" ] && { kill "$ss_pid" 2>/dev/null; wait "$ss_pid" 2>/dev/null; }
-    kill "$fixture_pid" 2>/dev/null
-    wait "$fixture_pid" 2>/dev/null
-    return 0
-}
-
-# Proves the retransmission path attributes events to endpoints.
-#
-# A loopback link never loses packets, so the fixture has to create the
-# condition retransmission needs: a receive window that shuts while segments
-# are still in flight. net-hog cycles the server between draining and stalling
-# for longer than the initial RTO, which produces a burst of real
-# retransmissions at the start of every cycle.
-#
-# The report must then name the endpoints carrying the retransmissions, and
-# the kernel's own counters are printed alongside so a miss is
-# distinguishable from a workload that simply did not retransmit.
-RETRANS_DELAY_MS=${RETRANS_DELAY_MS:-600}
-RETRANS_RCVBUF_KB=${RETRANS_RCVBUF_KB:-8}
-
-check_net_retransmit_attribution() {
-    "$FAST_WORKLOAD" net-hog --duration 20s --workers 2 \
-        --delay-ms "$RETRANS_DELAY_MS" --rcvbuf-kb "$RETRANS_RCVBUF_KB" \
-        >"$OUT_DIR/net-retrans-fixture.log" 2>&1 &
-    local fixture_pid=$!
-    # The fixture prints its listening port, which is used to filter the ss
-    # snapshot. Without the filter a socket left over from an earlier case
-    # could be mistaken for evidence that this fixture retransmitted.
-    sleep 0.5
-    local port
-    port=$(grep -m1 -oE 'endpoint: 127\.0\.0\.1:[0-9]+' "$OUT_DIR/net-retrans-fixture.log" \
-        | grep -oE '[0-9]+$')
-    : >"$OUT_DIR/net-retrans-ss.txt"
-    if [ -n "$SS_BIN" ]; then
-        ( i=0
-          while [ "$i" -lt 12 ]; do
-              if [ -n "$port" ]; then
-                  # Filtering on the port keeps sockets from other cases out
-                  # of the evidence.
-                  "$SS_BIN" -ti 2>/dev/null | grep -A1 ":$port" \
-                      >>"$OUT_DIR/net-retrans-ss.txt" || true
-              else
-                  "$SS_BIN" -ti 2>/dev/null >>"$OUT_DIR/net-retrans-ss.txt" || true
-              fi
-              echo >>"$OUT_DIR/net-retrans-ss.txt"
-              i=$((i + 1))
-              sleep 0.5
-          done ) &
-        local ss_pid=$!
-    else
-        ss_pid=""
-    fi
-    if ! "$FAST" net --pid "$fixture_pid" --duration 8s >"$OUT_DIR/net-retrans.txt" 2>&1; then
-        echo "net retransmit attribution: FAIL (collection failed)"
-        FAILURES=$((FAILURES + 1))
-        kill "$fixture_pid" 2>/dev/null
-        wait "$fixture_pid" 2>/dev/null
-        return
-    fi
-    [ -n "$ss_pid" ] && { kill "$ss_pid" 2>/dev/null; wait "$ss_pid" 2>/dev/null; }
-    kill "$fixture_pid" 2>/dev/null
-    wait "$fixture_pid" 2>/dev/null
-
-    # What the kernel itself counted. bytes_retrans is cumulative per socket,
-    # so the largest single value seen is the total, not the sum.
-    if [ -n "$SS_BIN" ] && [ -s "$OUT_DIR/net-retrans-ss.txt" ]; then
-        local kernel_bytes kernel_segs
-        kernel_bytes=$(awk '/bytes_retrans:/ {for(i=1;i<=NF;i++) if($i ~ /^bytes_retrans:/){split($i,p,":"); if(p[2]+0>m) m=p[2]}} END{print m+0}' "$OUT_DIR/net-retrans-ss.txt")
-        kernel_segs=$(awk '/retrans:/ {for(i=1;i<=NF;i++) if($i ~ /^retrans:/){split($i,p,"/"); if(p[2]+0>m) m=p[2]}} END{print m+0}' "$OUT_DIR/net-retrans-ss.txt")
-        echo "    kernel ss on port ${port:-?}: $kernel_bytes bytes_retrans, $kernel_segs retrans segs"
-    fi
-
-    if ! grep -Fq 'retransmission rate unavailable (transmitted segment count not collected)' "$OUT_DIR/net-retrans.txt"; then
-        echo "net retransmit attribution: FAIL (unavailable rate was not reported)"
-        FAILURES=$((FAILURES + 1))
-    fi
-
-    local total endpoints
-    total=$(awk '/^Retransmissions:/ {print $2}' "$OUT_DIR/net-retrans.txt")
-    # Endpoints whose retrans column is not zero.
-    endpoints=$(awk '$1 ~ /^[0-9]+$/ && $5 + 0 > 0 { n++ } END { print n + 0 }' \
-        "$OUT_DIR/net-retrans.txt")
-    if [ "${total:-0}" -le 0 ]; then
-        echo "net retransmit attribution: FAIL (rand-fast saw no retransmissions; see the kernel counter above for whether the workload produced any)"
-        FAILURES=$((FAILURES + 1))
-        return
-    fi
-    if [ "${endpoints:-0}" -le 0 ]; then
-        echo "net retransmit attribution: FAIL ($total retransmissions were not attributed to any endpoint)"
-        FAILURES=$((FAILURES + 1))
-        return
-    fi
-    echo "net retransmit attribution: $total retransmissions across $endpoints endpoints"
-}
-
-# Cross-checks rand-fast's RTT against the kernel's own estimate.
-check_net_rtt_crosscheck() {
-    if [ -z "$SS_BIN" ]; then
-        echo "net RTT cross-check: SKIP (no ss binary in the guest)"
-        return
-    fi
-    if ! collect_net_rtt "$OUT_DIR/net-rtt-xcheck.txt" "$OUT_DIR/net-ss-xcheck.txt"; then
-        echo "net RTT cross-check: FAIL (collection failed)"
-        FAILURES=$((FAILURES + 1))
-        return
-    fi
-
-    mine=$(median_p50_us "$OUT_DIR/net-rtt-xcheck.txt")
-    kernel=$(median_ss_rtt_us "$OUT_DIR/net-ss-xcheck.txt")
-    # The raw snapshots are summarised so a mismatch can be diagnosed from
-    # the log alone instead of re-running the guest.
-    echo "    fast: $(awk '$1 ~ /^[0-9]+$/{n++} END{print n+0}' "$OUT_DIR/net-rtt-xcheck.txt") endpoints, p50 $mine us, cwnd $(fast_cwnd "$OUT_DIR/net-rtt-xcheck.txt")"
-    echo "    ss:   $(awk '/rtt:/{n++} END{print n+0}' "$OUT_DIR/net-ss-xcheck.txt") samples, first $(awk '/rtt:/{for(i=1;i<=NF;i++) if($i ~ /^rtt:/ && $i != "rtt:"){print $i; exit}}' "$OUT_DIR/net-ss-xcheck.txt"), cwnd $(ss_cwnd "$OUT_DIR/net-ss-xcheck.txt")"
-
-    if [ "${mine:-0}" -le 0 ] || [ "${kernel:-0}" -le 0 ]; then
-        echo "net RTT cross-check: FAIL (no samples; fast=$mine us kernel=$kernel us)"
-        FAILURES=$((FAILURES + 1))
-        return
-    fi
-    if ! awk -v a="$mine" -v b="$kernel" -v tol="$RTT_CROSSCHECK_TOLERANCE" \
-            'BEGIN { lo = (a < b ? a : b); hi = (a > b ? a : b)
-                     ratio = (lo + 0) == 0 ? 0 : hi / lo
-                     printf "net RTT cross-check: fast %d us vs kernel ss %d us (%.2fx, tolerance %gx)\n", a, b, ratio, tol
-                     exit (ratio <= tol) ? 0 : 1 }'; then
-        FAILURES=$((FAILURES + 1))
-    fi
-}
-
-# Confirms the payload offsets are right by checking a second field. `ss -ti`
-# prints the congestion window the same way it prints the RTT, so agreement
-# on both values means the reads land on the intended fields rather than
-# merely on plausible-looking numbers.
-check_net_field_crosscheck() {
-    if [ -z "$SS_BIN" ]; then
-        echo "net field cross-check: SKIP (no ss binary in the guest)"
-        return
-    fi
-    local report="$OUT_DIR/net-rtt-xcheck.txt"
-    local ss_out="$OUT_DIR/net-ss-xcheck.txt"
-    [ -f "$report" ] && [ -f "$ss_out" ] || {
-        echo "net field cross-check: SKIP (no snapshots from the RTT cross-check)"
-        return
-    }
-
-    local mine kernel
-    mine=$(fast_cwnd "$report")
-    kernel=$(ss_cwnd "$ss_out")
-    if [ "${mine:-0}" -le 0 ] || [ "${kernel:-0}" -le 0 ]; then
-        echo "net field cross-check: FAIL (no cwnd samples; fast=$mine kernel=$kernel)"
-        FAILURES=$((FAILURES + 1))
-        return
-    fi
-    if ! awk -v a="$mine" -v b="$kernel" \
-            'BEGIN { printf "net field cross-check: fast snd_cwnd %d vs kernel ss cwnd %d\n", a, b
-                     exit (a == b) ? 0 : 1 }'; then
-        echo "    the payload offsets do not line up with the kernel layout"
-        FAILURES=$((FAILURES + 1))
-    fi
-}
-
-
-# The unthrottled baseline both net checks compare against.
-if collect_net_rtt "$OUT_DIR/net-rtt-base.txt" "$OUT_DIR/net-ss-base.txt"; then
-    :
-else
-    echo "net RTT baseline: FAIL (collection failed)"
-    FAILURES=$((FAILURES + 1))
-fi
 
 # Proves off-CPU waits are attributed to the right process shape.
 #
@@ -1227,9 +976,7 @@ check_daemon_budget() {
 #
 # A trigger that fires on everything would pass a "did anything fire" check
 # while being useless, so every case here requires the matching trigger to have
-# fired and the run's incident tally to name it. The network case additionally
-# requires the opposite: the I/O and scheduler triggers must stay quiet, because
-# a link that is losing packets is not a disk that is stuck.
+# fired and the run's incident tally to name it. TCP unavailability is checked separately.
 TRIGGER_RUN=${TRIGGER_RUN:-20s}
 
 trigger_case() {
@@ -1536,9 +1283,8 @@ trigger_flags() {
         echo "--trigger-psi-full off --trigger-cpu off --trigger-io-p99 30us"
         ;;
     net)
-        # The cycling receive window loses packets every round, so a handful in
-        # one interval is reached quickly.
-        echo "--trigger-sched-p95 off --trigger-io-p99 off --trigger-retrans 2"
+        # The disabled trigger must not fire, even at its lowest valid threshold.
+        echo "--trigger-sched-p95 off --trigger-io-p99 off --trigger-retrans 1"
         echo "--trigger-psi-some off --trigger-psi-full off --trigger-cpu off"
         ;;
     sched)
@@ -1565,9 +1311,6 @@ check_daemon_triggers() {
         "$FAST_WORKLOAD" io-hog --duration "$TRIGGER_RUN" --workers 2 \
         --path "$IO_HOG_PATH" --size-mib 256
 
-    trigger_case net retrans io_p99 \
-        "$FAST_WORKLOAD" net-hog --duration "$TRIGGER_RUN" --workers 2 --delay-ms 600
-
     # Lock contention, because that is what actually produces scheduler
     # latency on a machine with spare CPUs. A single spinning worker does not,
     # which is why a case built on one would be testing a threshold the fixture
@@ -1576,6 +1319,7 @@ check_daemon_triggers() {
         "$FAST_WORKLOAD" lock-hog --duration "$TRIGGER_RUN" --workers 32
 }
 
+check_tcp_unavailable
 check_cpu_rate_scaling
 check_cpu_symbolization
 check_io_pairing
@@ -1593,11 +1337,6 @@ check_daemon_infinite_default
 check_daemon_budget
 check_daemon_triggers
 check_daemon_storage
-check_net_rtt_crosscheck
-check_net_field_crosscheck
-check_net_retransmit_attribution
-check_net_endpoint_ranking
-check_net_rtt_separation
 
 echo "=== key metrics ==="
 print_metrics() {
@@ -1614,7 +1353,7 @@ print_metrics() {
 print_metrics sched 'p95|> 1ms'
 print_metrics cpu 'Samples:|CPU usage:'
 print_metrics io 'Samples:|rchar:'
-print_metrics net 'Retransmissions:|RTT p50'
+print_metrics net 'TCP attribution:|Samples:|Retransmissions:'
 print_metrics off-cpu 'Samples:'
 print_metrics memory 'eBPF user faults|minor |direct reclaim'
 print_metrics diagnose 'scheduler:|cpu:|block io:|tcp:|off-cpu:|memory:|lost events:'

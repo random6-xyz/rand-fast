@@ -338,6 +338,10 @@ pub struct DaemonArgs {
     pub trigger_io_p99: LatencyThreshold,
 
     /// Trigger threshold for retransmissions in one interval.
+    ///
+    /// Unavailable in this build: TCP events are not attributed because socket
+    /// ownership cannot be established. The recorder warns at startup when
+    /// this trigger is configured; pass `off` to disable it.
     #[arg(long, default_value = "8", value_name = "COUNT|off")]
     pub trigger_retrans: CountThreshold,
 

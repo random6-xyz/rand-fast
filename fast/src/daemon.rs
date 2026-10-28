@@ -135,7 +135,8 @@ impl RingEntry {
             "io_p99_us": self.io_p99_us,
             "io_samples": self.io_samples,
             "io_unmatched": self.io_unmatched,
-            "retrans": self.retrans,
+            "retrans": null,
+            "tcp_available": false,
             // Absent rather than zero, so a kernel without PSI is not read as
             // a machine with no memory pressure.
             "psi_some_pct": self.psi_some_pct,
@@ -179,7 +180,7 @@ fn write_incident(
     let carried = total_entries.min(BUNDLE_MAX_INTERVALS);
 
     let manifest = serde_json::json!({
-        "schema": crate::json::SCHEMA,
+        "schema": crate::json::SCHEMA_V2,
         "command": "daemon.incident",
         "recorded_at_s": entry.at.as_secs_f64(),
         "process": { "pid": args.pid },
@@ -200,6 +201,7 @@ fn write_incident(
                 "signal": signal.name(),
                 "unit": signal.unit(),
                 "at_or_above": signal.threshold(triggers),
+                "available": *signal != Signal::Retransmissions,
             }))
             .collect::<Vec<_>>(),
         // Stated in the bundle, because a reader who assumed it holds the whole
@@ -216,7 +218,8 @@ fn write_incident(
             "io_p99_us": entry.io_p99_us,
             "io_samples": entry.io_samples,
             "io_unmatched": entry.io_unmatched,
-            "retrans": entry.retrans,
+            "retrans": null,
+            "tcp_available": false,
             "psi_some_pct": entry.psi_some_pct,
             "psi_full_pct": entry.psi_full_pct,
             "lost_events": entry.lost,
@@ -251,7 +254,7 @@ fn write_incident(
     write_json(
         &directory.join("complete.json"),
         &serde_json::json!({
-            "schema": crate::json::SCHEMA,
+            "schema": crate::json::SCHEMA_V2,
             "files": [
                 "manifest.json",
                 "intervals.json",
@@ -504,6 +507,7 @@ fn diagnose_from(entry: &RingEntry, pid: u32, slow: &SlowSamples) -> Value {
         io_slow: 0,
         net_samples: 0,
         retransmissions: entry.retrans,
+        tcp_available: false,
         retrans_ratio: None,
         offcpu_samples: 0,
         offcpu_p95_us: 0,
@@ -530,7 +534,7 @@ fn diagnose_from(entry: &RingEntry, pid: u32, slow: &SlowSamples) -> Value {
     };
     let causes = crate::scoring::score(&evidence);
     serde_json::json!({
-        "schema": crate::json::SCHEMA,
+        "schema": crate::json::SCHEMA_V2,
         "command": "daemon.incident.diagnosis",
         "pid": pid,
         "scored_by": "the ranking fast diagnose uses, fed with the recorder's own measurements",
@@ -545,7 +549,7 @@ fn diagnose_from(entry: &RingEntry, pid: u32, slow: &SlowSamples) -> Value {
         "not_collected": [
             "off-CPU wait reasons and stacks",
             "page fault and direct reclaim rates",
-            "transmitted segment count, so no retransmission ratio",
+            "TCP attribution and retransmissions: socket ownership cannot be established",
             "on-CPU samples; usage is read from the target's accounting counters",
         ],
         "slowest_samples": slow.to_json(),
@@ -592,7 +596,7 @@ impl RingEntry {
         match signal {
             Signal::SchedulerP95 => Some(self.sched_p95_us as f64),
             Signal::IoP99 => Some(self.io_p99_us as f64),
-            Signal::Retransmissions => Some(self.retrans as f64),
+            Signal::Retransmissions => None,
             Signal::PsiSome => self.psi_some_pct.map(f64::from),
             Signal::PsiFull => self.psi_full_pct.map(f64::from),
             Signal::CpuUsage => Some(self.cpu_percent),
@@ -629,7 +633,7 @@ fn incident_text(entry: &RingEntry, triggers: &Triggers, diagnosis: &Value) -> S
         "  block I/O p99  {} us over {} completions, {} unmatched\n",
         entry.io_p99_us, entry.io_samples, entry.io_unmatched
     ));
-    text.push_str(&format!("  retransmissions {}\n", entry.retrans));
+    text.push_str("  retransmissions unavailable (socket ownership cannot be established)\n");
     match (entry.psi_some_pct, entry.psi_full_pct) {
         (Some(some), Some(full)) => {
             text.push_str(&format!("  memory PSI     {some}% some, {full}% full\n"));
@@ -825,7 +829,26 @@ struct PreviousTick {
     primed: bool,
 }
 
+/// Explains a configured trigger that cannot fire in this build.
+///
+/// The warning belongs at startup, not only in the final report: the default
+/// recording is unbounded, so an operator who selected the retransmission
+/// trigger would otherwise learn that it was never armed only when they stop
+/// the recorder. Returning the message keeps it testable; the caller writes it
+/// to stderr so JSON on stdout stays one document.
+fn unavailable_trigger_warning(args: &DaemonArgs) -> Option<String> {
+    Triggers::from_args(args).retrans.map(|_| {
+        "warning: --trigger-retrans is configured but cannot fire: TCP ownership \
+         attribution is unavailable, so no retransmissions are measured; pass \
+         --trigger-retrans off to disable this trigger"
+            .to_owned()
+    })
+}
+
 pub fn run(args: DaemonArgs) -> Result<()> {
+    if let Some(warning) = unavailable_trigger_warning(&args) {
+        eprintln!("{warning}");
+    }
     // Read before anything else happens, so the report can separate the
     // program's own footprint from what setting the recording up costs. A
     // budget that counts the interpreter's own text is not a budget anyone can
@@ -849,8 +872,6 @@ pub fn run(args: DaemonArgs) -> Result<()> {
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_process_exit")?;
     runtime::attach_raw_tracepoint(&mut bpf, "block_rq_issue")?;
     runtime::attach_raw_tracepoint(&mut bpf, "block_rq_complete")?;
-    runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_probe")?;
-    runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_retransmit_skb")?;
 
     let after_attach_rss = read_self_rss_bytes().unwrap_or(0);
     let mut target_tids = runtime::take_target_map(&mut bpf)?;
@@ -998,7 +1019,8 @@ pub fn run(args: DaemonArgs) -> Result<()> {
                     peak_memory_bytes,
                     ticks,
                 ),
-            ),
+            )
+            .with_v2(),
         );
     } else {
         print_summary(
@@ -1222,16 +1244,19 @@ fn tick(
 
     // The triggers read the same interval the ring does, so a trigger can
     // never fire on a number the incident does not show.
-    let fired = triggers.evaluate(&Interval {
-        sched_p95_us: entry.sched_p95_us,
-        sched_samples: entry.sched_samples,
-        io_p99_us: entry.io_p99_us,
-        io_samples: entry.io_samples,
-        retrans: entry.retrans,
-        psi_some_pct: entry.psi_some_pct.map(f64::from),
-        psi_full_pct: entry.psi_full_pct.map(f64::from),
-        cpu_percent: Some(entry.cpu_percent),
-    });
+    let fired = evaluate_available_triggers(
+        &triggers,
+        &Interval {
+            sched_p95_us: entry.sched_p95_us,
+            sched_samples: entry.sched_samples,
+            io_p99_us: entry.io_p99_us,
+            io_samples: entry.io_samples,
+            retrans: entry.retrans,
+            psi_some_pct: entry.psi_some_pct.map(f64::from),
+            psi_full_pct: entry.psi_full_pct.map(f64::from),
+            cpu_percent: Some(entry.cpu_percent),
+        },
+    );
     entry.fired = fired.clone();
     incidents.record(&fired);
     // The incident file is written before the entry goes into the ring, so a
@@ -1350,7 +1375,11 @@ fn print_summary(
     } else {
         for signal in enabled {
             let threshold = signal.threshold(triggers).unwrap_or_default();
-            println!("  {signal} at {threshold} {}", signal.unit());
+            if signal == Signal::Retransmissions {
+                println!("  {signal}: unavailable (socket ownership cannot be established)");
+            } else {
+                println!("  {signal} at {threshold} {}", signal.unit());
+            }
         }
     }
     // The count stands on its own with no unit glued to it, so a script reading
@@ -1391,11 +1420,19 @@ fn print_summary(
             entry.at.as_secs(),
             entry.sched_p95_us,
             entry.io_p99_us,
-            entry.retrans,
+            "unavailable",
             entry.cpu_cost_pct,
             entry.memory_bytes / 1024
         );
     }
+}
+
+// TCP tracepoints cannot establish ownership, even when the configured
+// threshold is zero. Do not let an unavailable count trigger an incident.
+fn evaluate_available_triggers(triggers: &Triggers, interval: &Interval) -> Vec<Signal> {
+    let mut fired = triggers.evaluate(interval);
+    fired.retain(|signal| *signal != Signal::Retransmissions);
+    fired
 }
 
 /// Whether a measurement is inside its budget.
@@ -1461,6 +1498,23 @@ mod tests {
         assert_eq!(state.incidents.total, 0);
     }
 
+    #[test]
+    fn a_configured_retrans_trigger_warns_at_startup() {
+        let args = default_args(std::path::Path::new("."));
+        let warning = unavailable_trigger_warning(&args)
+            .expect("the default retransmission trigger must warn");
+        assert!(warning.contains("--trigger-retrans"));
+        assert!(warning.contains("cannot fire"));
+        assert!(warning.contains("--trigger-retrans off"));
+    }
+
+    #[test]
+    fn an_explicitly_disabled_retrans_trigger_stays_quiet() {
+        let mut args = default_args(std::path::Path::new("."));
+        args.trigger_retrans = "off".parse().expect("threshold");
+        assert_eq!(unavailable_trigger_warning(&args), None);
+    }
+
     fn default_args(output: &std::path::Path) -> DaemonArgs {
         DaemonArgs {
             pid: 4242,
@@ -1524,6 +1578,9 @@ mod tests {
         )
         .expect("parse manifest");
 
+        assert_eq!(manifest["schema"], "rand-fast/v2");
+        assert_eq!(manifest["interval"]["tcp_available"], false);
+        assert!(manifest["interval"]["retrans"].is_null());
         let triggered = &manifest["triggered_by"];
         assert_eq!(triggered.as_array().map(Vec::len), Some(1));
         assert_eq!(triggered[0]["signal"], "io_p99");
@@ -1533,7 +1590,11 @@ mod tests {
         // The thresholds that were in force belong in the bundle too, or a
         // reader cannot tell a 900ms stall from a badly configured trigger.
         let thresholds = manifest["thresholds"].as_array().expect("thresholds");
-        assert!(thresholds.iter().any(|entry| entry["signal"] == "retrans"));
+        assert!(
+            thresholds
+                .iter()
+                .any(|entry| entry["signal"] == "retrans" && entry["available"] == false)
+        );
 
         // The history that led up to the trigger travels with it.
         let intervals: Value = serde_json::from_str(
@@ -1910,6 +1971,26 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_retransmissions_are_null_and_never_trigger() {
+        let entry = RingEntry {
+            retrans: 999,
+            ..RingEntry::default()
+        };
+        assert_eq!(entry.to_json()["retrans"], serde_json::Value::Null);
+        assert_eq!(entry.to_json()["tcp_available"], false);
+        assert_eq!(entry.measured(Signal::Retransmissions), None);
+        let mut triggers = Triggers::from_args(&default_args(std::path::Path::new(".")));
+        triggers.retrans = Some(0);
+        let interval = Interval {
+            retrans: 999,
+            ..Interval::default()
+        };
+        assert!(
+            !evaluate_available_triggers(&triggers, &interval).contains(&Signal::Retransmissions)
+        );
+    }
+
+    #[test]
     fn a_restored_entry_survives_a_round_trip_through_json() {
         // A bundle that cannot be read back is a bundle that is only useful at
         // the moment it was written.
@@ -1921,7 +2002,7 @@ mod tests {
             io_p99_us: 40,
             io_samples: 7,
             io_unmatched: 2,
-            retrans: 3,
+            retrans: 0,
             psi_some_pct: Some(2.5),
             psi_full_pct: None,
             lost: 1,
@@ -1931,6 +2012,15 @@ mod tests {
         };
         let restored = ring_entry_from_json(&original.to_json()).expect("round trip");
         assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn v1_interval_restores_other_data_but_never_reemits_unsafe_retransmissions() {
+        let old = serde_json::json!({"at_s": 12, "sched_samples": 8, "retrans": 99});
+        let restored = ring_entry_from_json(&old).expect("v1 interval");
+        assert_eq!(restored.sched_samples, 8);
+        assert!(restored.to_json()["retrans"].is_null());
+        assert_eq!(restored.measured(Signal::Retransmissions), None);
     }
 
     #[test]

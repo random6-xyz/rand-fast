@@ -4,8 +4,8 @@
 # The privileged eBPF checks need a real kernel and root, which the developer
 # host does not provide. This script builds a self-contained initramfs-only
 # guest around tools/qemu-guest-init.sh, boots it under KVM, and prints the
-# recorded results, so the eBPF verifier and every collector are exercised
-# end to end without host sudo.
+# recorded results without host sudo. Enabled collectors exercise the eBPF
+# verifier; the intentionally disabled TCP programs are not attached.
 #
 # Usage:
 #   tools/qemu-run.sh                 # build, boot, print results
@@ -20,9 +20,13 @@
 #   MEM_MB     guest memory in MiB (default 2048)
 #   OUT_DIR    where the guest log is written (default /tmp/fast-qemu)
 #   DURATION   per-run collection length passed to the matrix (default 5s)
+#   QEMU_SMOKE_CASE  all or tcp-unavailable (default all)
 #
 # Exit status: 0 when the guest smoke run succeeded, 1 otherwise.
 set -u
+# Normal Linux permissions in the guest; the incident store rejects
+# group/other-writable ancestors. A permissive caller umask must not leak in.
+umask 022
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 FAST=${FAST:-$ROOT/target/release/fast}
@@ -31,6 +35,8 @@ CPUS=${CPUS:-8}
 MEM_MB=${MEM_MB:-2048}
 OUT_DIR=${OUT_DIR:-/tmp/fast-qemu}
 DURATION=${DURATION:-5s}
+QEMU_SMOKE_CASE=${QEMU_SMOKE_CASE:-all}
+case "$QEMU_SMOKE_CASE" in all|tcp-unavailable) ;; *) echo "qemu-run: invalid QEMU_SMOKE_CASE" >&2; exit 2 ;; esac
 KEEP=0
 
 while [ "$#" -gt 0 ]; do
@@ -173,7 +179,8 @@ cp "$ROOT/tools/qemu-smoke.sh" "$STAGE/tools/qemu-smoke.sh"
 cp "$ROOT/tools/qemu-guest-init.sh" "$STAGE/init"
 
 log "packing the initramfs"
-( cd "$STAGE" && find . | cpio -o -H newc 2>/dev/null | gzip -1 ) > "$INITRAMFS" \
+# Pack root-owned: cpio otherwise preserves the unprivileged host uid.
+( cd "$STAGE" && find . | cpio -o -H newc --owner=0:0 2>/dev/null | gzip -1 ) > "$INITRAMFS" \
     || die "failed to pack the initramfs"
 
 # --- boot -------------------------------------------------------------------
@@ -199,7 +206,7 @@ fi
 timeout 1800 qemu-system-x86_64 $ACCEL \
     -m "$MEM_MB" -smp "$CPUS" \
     -kernel "$KERNEL" -initrd "$INITRAMFS" \
-    -append "console=ttyS0 rdinit=/init loglevel=3 panic=-1 fast.duration=$DURATION" \
+    -append "console=ttyS0 rdinit=/init loglevel=3 panic=-1 fast.duration=$DURATION fast.smoke_case=$QEMU_SMOKE_CASE" \
     -nographic -no-reboot -monitor none \
     -drive "file=$IO_IMG,format=raw,if=virtio" \
     < /dev/null > "$LOG" 2>&1
@@ -223,7 +230,7 @@ fi
 printf '\n===== guest summary =====\n'
 grep -E '^guest:|^=== .* (format|MISSING|present|available)' "$LOG" 2>/dev/null \
     | sed 's/^/  /'
-grep -E 'smoke run finished with rc=' "$LOG" 2>/dev/null | sed 's/^/  /'
+grep -E '^(TCP unavailable contract:|TCP verifier:|=== smoke run finished with rc=)' "$LOG" 2>/dev/null | sed 's/^/  /'
 
 printf '\n===== smoke reports =====\n'
 sed -n '/^=== reports ===/,$p' "$LOG" 2>/dev/null \
