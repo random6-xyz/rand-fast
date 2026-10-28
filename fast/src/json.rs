@@ -25,10 +25,9 @@
 //!   readability; JSON does not, because a consumer should never have to parse
 //!   "1.5 ms".
 //! - All byte counts are bytes, named with a `_bytes` suffix.
-//! - A field is present whenever it is known, and absent rather than null when
-//!   it is not. A consumer can tell "no samples" from "zero samples" by the
-//!   absence of the count, which is the distinction the human report makes in
-//!   words.
+//! - In v1, a field is present whenever it is known, and absent rather than
+//!   null when it is not. V2 TCP reports use null for unavailable values,
+//!   distinguishing an unmeasured signal from a zero measurement.
 //! - `lost_events` is present on every eBPF-backed command, so a consumer can
 //!   decide how far to trust the rest.
 //!
@@ -45,6 +44,8 @@ use serde::Serialize;
 
 /// The schema identifier every JSON document carries.
 pub const SCHEMA: &str = "rand-fast/v1";
+/// Schema for reports with unavailable TCP measurements.
+pub const SCHEMA_V2: &str = "rand-fast/v2";
 
 /// The output format a command was asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -106,6 +107,12 @@ impl<T: Serialize> Envelope<T> {
         }
     }
 
+    /// Marks a report whose measurement types use the v2 contract.
+    pub fn with_v2(mut self) -> Self {
+        self.schema = SCHEMA_V2;
+        self
+    }
+
     /// Serializes to a single line, which is what a streaming consumer wants
     /// and what makes the output diffable line by line.
     pub fn to_line(&self) -> String {
@@ -155,6 +162,16 @@ mod tests {
             false,
             data,
         )
+    }
+
+    #[test]
+    fn v2_reports_are_explicit_while_other_reports_remain_v1() {
+        let original = envelope(Sample {
+            count: 3,
+            note: None,
+        });
+        assert_eq!(to_value(&original)["schema"], "rand-fast/v1");
+        assert_eq!(to_value(&original.with_v2())["schema"], "rand-fast/v2");
     }
 
     #[test]

@@ -230,13 +230,7 @@ pub fn run(args: NetArgs) -> Result<()> {
         "/fast-ebpf"
     )))
     .context("failed to load eBPF object; run as root or grant CAP_BPF and CAP_PERFMON")?;
-    // Both programs share the NET_EVENTS map and the TCP_SOCKETS map, so the
-    // retransmission program can attribute an event to a socket the RTT
-    // program first saw. tcp_probe must be attached as well: it is what
-    // populates TCP_SOCKETS.
-    runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_probe")?;
-    runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_retransmit_skb")?;
-
+    // No TCP tracepoint provides trustworthy ownership attribution.
     let mut target_tids = runtime::take_target_map(&mut bpf)?;
 
     let mut known_tids = BTreeSet::new();
@@ -263,8 +257,9 @@ pub fn run(args: NetArgs) -> Result<()> {
         if summary.interrupted {
             println!("Status: interrupted");
         }
-        println!("Samples: {}", stats.samples());
-        println!("Retransmissions: {}", stats.retrans());
+        println!("TCP attribution: unavailable (socket ownership cannot be established)");
+        println!("Samples: unavailable");
+        println!("Retransmissions: unavailable");
         println!("Lost events: {}", stats.lost());
         println!();
 
@@ -272,7 +267,6 @@ pub fn run(args: NetArgs) -> Result<()> {
         if ranked.is_empty() {
             println!("Endpoints");
             println!("No TCP samples collected.");
-            println!("Test with: fast-workload net-hog --duration 30s   (then observe its PID)");
             return Ok(());
         }
 
@@ -338,7 +332,8 @@ pub fn run(args: NetArgs) -> Result<()> {
                 summary.interrupted,
                 false,
                 crate::json_payloads::network_json(&stats),
-            ),
+            )
+            .with_v2(),
         );
     }
     Ok(())
@@ -347,6 +342,32 @@ pub fn run(args: NetArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tcp_programs_have_no_attribution_or_output_path() {
+        let ebpf = include_str!("../../fast-ebpf/src/main.rs");
+        assert_eq!(
+            ebpf.matches("NET_EVENTS").count(),
+            1,
+            "the event map may only be declared"
+        );
+        assert!(!ebpf.contains("TCP_SOCKETS"));
+        for name in ["tcp_probe", "tcp_retransmit_skb"] {
+            let body = format!("pub fn {name}(_ctx: TracePointContext) -> u32 {{\n    0\n}}");
+            assert!(
+                ebpf.contains(&body),
+                "{name} must unconditionally return without attributing"
+            );
+            for source in [
+                include_str!("network.rs"),
+                include_str!("diagnose.rs"),
+                include_str!("daemon.rs"),
+            ] {
+                let attachment = format!("attach_tracepoint(&mut bpf, \"tcp\", \"{name}\")");
+                assert!(!source.contains(&attachment), "{name} must not be attached");
+            }
+        }
+    }
 
     fn probe(family: u16, saddr: [u8; 16], daddr: [u8; 16], rtt: u32) -> TcpEvent {
         TcpEvent {

@@ -73,10 +73,7 @@ for event in sched_wakeup sched_switch sched_process_exit; do
     fi
 done
 
-# Record the TCP tracepoint payload layouts the eBPF network programs rely
-# on. Both events carry the socket 5-tuple in the payload, so the programs
-# need no BTF and no struct offsets: tcp_probe also carries srtt, and
-# tcp_retransmit_skb carries the IPv4 and IPv6 addresses.
+# Record TCP layouts for investigation; TCP programs are not attached.
 for event in tcp_probe tcp_retransmit_skb; do
     if [ -e /sys/kernel/tracing/events/tcp/$event/format ]; then
         echo "=== $event format ==="
@@ -124,6 +121,7 @@ if [ -r /proc/cmdline ]; then
     for arg in $(cat /proc/cmdline); do
         case "$arg" in
         fast.duration=*) DURATION=${arg#fast.duration=} ;;
+        fast.smoke_case=tcp-unavailable) export QEMU_SMOKE_TEST_CASE=tcp-unavailable ;;
         esac
     done
 fi
@@ -140,6 +138,7 @@ for f in /tmp/fast-smoke/*-fixture.log; do
 done
 echo "=== reports ==="
 for f in /tmp/fast-smoke/*.txt; do
+    [ -f "$f" ] || continue
     echo "----- $f -----"
     cat "$f"
 done

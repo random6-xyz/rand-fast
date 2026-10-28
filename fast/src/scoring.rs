@@ -247,10 +247,14 @@ fn score_lock(evidence: &Evidence) -> Option<Severity> {
 
 /// Scores packet loss.
 fn score_network(evidence: &Evidence) -> Option<Severity> {
-    if evidence.net_samples == 0 && evidence.offcpu_samples == 0 {
+    if (!evidence.tcp_available || evidence.net_samples == 0) && evidence.offcpu_samples == 0 {
         return None;
     }
-    let ratio = evidence.retrans_ratio.clamp(0.0, 1.0);
+    let ratio = if evidence.tcp_available {
+        evidence.retrans_ratio.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     let loss = ramp(ratio, 0.0, threshold::RETRANS_RATIO * 10.0);
     // A process blocked on a socket is a network problem whether or not a
     // segment was lost, so the wait share counts alongside the loss.
@@ -259,12 +263,16 @@ fn score_network(evidence: &Evidence) -> Option<Severity> {
         threshold::NETWORK_WAIT_SHARE,
         evidence,
     );
-    let mut detail = format!(
-        "{:.2}% of {} TCP events retransmitted, threshold {:.2}%",
-        ratio * 100.0,
-        evidence.net_samples,
-        threshold::RETRANS_RATIO * 100.0
-    );
+    let mut detail = if evidence.tcp_available {
+        format!(
+            "{:.2}% of {} TCP events retransmitted, threshold {:.2}%",
+            ratio * 100.0,
+            evidence.net_samples,
+            threshold::RETRANS_RATIO * 100.0
+        )
+    } else {
+        "TCP attribution unavailable".to_owned()
+    };
     if evidence.offcpu_samples > 0 {
         detail.push_str(&format!(
             ", {:.0}% of {} us off-CPU waiting on a socket",
@@ -538,11 +546,23 @@ mod tests {
     fn a_lossy_link_ranks_network_first() {
         let evidence = Evidence {
             net_samples: 20_000,
+            tcp_available: true,
             retrans_ratio: 0.08,
             ..idle()
         };
         let ranked = score(&evidence);
         assert_eq!(ranked[0].cause, "Network");
+    }
+
+    #[test]
+    fn unavailable_tcp_is_not_scored_even_with_stale_values() {
+        let evidence = Evidence {
+            net_samples: 20_000,
+            retrans_ratio: 0.9,
+            tcp_available: false,
+            ..idle()
+        };
+        assert!(!score(&evidence).iter().any(|d| d.cause == "Network"));
     }
 
     #[test]

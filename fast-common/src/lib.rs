@@ -19,10 +19,6 @@ pub const MAX_TARGET_TIDS: u32 = 4096;
 /// identity. If the map fills, the collector reports an unmatched request
 /// instead of silently evicting a pending measurement.
 pub const MAX_PENDING_IO: u32 = 8192;
-/// Upper bound for remembered TCP sockets. Entries are added only for sockets
-/// a target thread is seen using, so this is generous headroom over the
-/// number of connections a process keeps open.
-pub const MAX_TCP_SOCKETS: u32 = 8192;
 /// Upper bound for per-thread memory counters. Only target threads get an
 /// entry, so this matches the target thread limit.
 pub const MAX_MEMORY_THREADS: u32 = MAX_TARGET_TIDS;

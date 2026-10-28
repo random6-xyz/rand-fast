@@ -22,10 +22,12 @@ use crate::{
 /// The `net` command's `data` object.
 #[derive(Debug, Clone, Serialize)]
 pub struct NetJson {
+    /// Whether TCP ownership attribution is available.
+    pub tcp_available: bool,
     /// Ordinary RTT samples observed.
-    pub samples: u64,
+    pub samples: Option<u64>,
     /// Retransmissions observed.
-    pub retransmissions: u64,
+    pub retransmissions: Option<u64>,
     /// Records the kernel dropped from the perf buffer.
     pub lost_events: u64,
     /// One row per remote endpoint, slowest first.
@@ -66,31 +68,11 @@ pub struct EndpointJson {
 /// Builds the `net` document's `data` object.
 pub fn network_json(stats: &NetStats) -> NetJson {
     NetJson {
-        samples: stats.samples(),
-        retransmissions: stats.retrans(),
+        tcp_available: false,
+        samples: None,
+        retransmissions: None,
         lost_events: stats.lost(),
-        endpoints: stats
-            .slowest_endpoints()
-            .into_iter()
-            .map(|endpoint| {
-                let (p50, p95, p99) = endpoint.rtt_percentiles();
-                EndpointJson {
-                    family: endpoint.family,
-                    source: crate::network::format_address(endpoint.family, endpoint.saddr),
-                    destination: crate::network::format_address(endpoint.family, endpoint.daddr),
-                    source_port: endpoint.sport,
-                    destination_port: endpoint.dport,
-                    samples: endpoint.rtts.len() as u64,
-                    p50_us: p50 as u64,
-                    p95_us: p95 as u64,
-                    p99_us: p99 as u64,
-                    retransmissions: endpoint.retrans,
-                    retrans_ratio: endpoint.retrans_ratio(),
-                    max_cwnd: endpoint.max_cwnd as u64,
-                    max_rcv_wnd_bytes: endpoint.max_rcv_wnd as u64,
-                }
-            })
-            .collect(),
+        endpoints: Vec::new(),
     }
 }
 
@@ -99,6 +81,8 @@ pub fn network_json(stats: &NetStats) -> NetJson {
 /// The `daemon` command's `data` object.
 #[derive(Debug, Clone, Serialize)]
 pub struct DaemonJson {
+    /// Whether TCP ownership attribution is available.
+    pub tcp_available: bool,
     /// How long the recorder ran, in seconds.
     pub ran_s: f64,
     /// The rolling window the ring covers, in seconds.
@@ -146,6 +130,7 @@ pub fn daemon_json(
             })
     });
     DaemonJson {
+        tcp_available: false,
         ran_s: ring.entries().last().map_or(0.0, |e| e.at.as_secs_f64()),
         window_s: window.as_secs_f64(),
         interval_s: interval.as_secs_f64(),
@@ -517,7 +502,7 @@ pub fn memory_json(
 pub struct DiagnoseJson {
     /// The measurements the ranking was computed from, so a consumer can
     /// recompute or re-weight them without re-running the collection.
-    pub measured: Evidence,
+    pub measured: serde_json::Value,
     /// Records the kernel dropped, one entry per stream that lost any.
     pub lost_events: Vec<LostJson>,
     /// The ranked causes, highest share first.
@@ -546,8 +531,13 @@ pub struct CauseJson {
 
 /// Builds the `diagnose` document's `data` object.
 pub fn diagnose_json(evidence: &Evidence) -> DiagnoseJson {
+    let mut measured = serde_json::to_value(evidence).expect("evidence is serializable");
+    if !evidence.tcp_available {
+        measured["net_samples"] = serde_json::Value::Null;
+        measured["retrans_ratio"] = serde_json::Value::Null;
+    }
     DiagnoseJson {
-        measured: evidence.clone(),
+        measured,
         lost_events: evidence
             .lost
             .iter()
@@ -578,48 +568,11 @@ mod tests {
     }
 
     #[test]
-    fn net_json_names_every_field_with_a_unit() {
-        let mut stats = NetStats::default();
-        for rtt in [100u32, 200, 300] {
-            crate::runtime::EventHandler::on_event(
-                &mut stats,
-                fast_common::TcpEvent {
-                    tid: 1,
-                    family: fast_common::AF_INET,
-                    retrans: 0,
-                    _pad: 0,
-                    sport: 1234,
-                    dport: 80,
-                    rtt_us: rtt,
-                    snd_cwnd: 10,
-                    rcv_wnd: 4096,
-                    saddr: {
-                        let mut a = [0u8; 16];
-                        a[0] = 127;
-                        a
-                    },
-                    daddr: {
-                        let mut a = [0u8; 16];
-                        a[0] = 10;
-                        a
-                    },
-                },
-            );
-        }
-        let value = value_of(&network_json(&stats));
-        assert_eq!(value["samples"], serde_json::json!(3));
-        let endpoint = &value["endpoints"][0];
-        // Latencies are microseconds and windows are named with their unit, so
-        // a consumer never has to guess.
-        assert!(endpoint.get("p50_us").is_some());
-        assert!(endpoint.get("retrans_ratio").is_some());
-        assert_eq!(endpoint["max_rcv_wnd_bytes"], serde_json::json!(4096));
-    }
-
-    #[test]
     fn net_json_of_an_empty_run_is_still_well_formed() {
         let value = value_of(&network_json(&NetStats::default()));
-        assert_eq!(value["samples"], serde_json::json!(0));
+        assert_eq!(value["tcp_available"], false);
+        assert!(value["samples"].is_null());
+        assert!(value["retransmissions"].is_null());
         assert_eq!(value["endpoints"].as_array().unwrap().len(), 0);
     }
 
@@ -720,6 +673,20 @@ mod tests {
                 .contains("futex"),
             "the cause must carry its evidence"
         );
+    }
+
+    #[test]
+    fn diagnose_json_uses_null_for_unavailable_tcp_measurements() {
+        let evidence = Evidence {
+            net_samples: 123,
+            retrans_ratio: 0.5,
+            tcp_available: false,
+            ..Evidence::default()
+        };
+        let value = value_of(&diagnose_json(&evidence));
+        assert_eq!(value["measured"]["tcp_available"], false);
+        assert!(value["measured"]["net_samples"].is_null());
+        assert!(value["measured"]["retrans_ratio"].is_null());
     }
 
     #[test]
