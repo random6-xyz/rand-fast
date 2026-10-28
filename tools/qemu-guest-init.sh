@@ -22,6 +22,11 @@
 # Mount-point directories must exist before the mounts below; fresh staging
 # trees do not carry them.
 mkdir -p /proc /sys /dev /tmp /mnt/io
+# The initramfs has no tmpfiles daemon, so /tmp gets the mode every Linux
+# system gives it. The incident store deliberately rejects group/world
+# writable ancestors without the sticky bit; a non-sticky /tmp would make
+# every documented daemon invocation fail inside this smoke guest.
+chmod 1777 /tmp
 
 /bin/mount2 none proc /proc
 /bin/mount2 none sysfs /sys
