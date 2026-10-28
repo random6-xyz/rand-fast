@@ -27,7 +27,7 @@ pub enum Command {
     Cpu(CpuArgs),
     /// Measure disk I/O latency.
     Io(IoArgs),
-    /// Measure network latency and retransmissions.
+    /// Report TCP measurement availability.
     Net(NetArgs),
     /// Measure off-CPU wait time.
     OffCpu(OffCpuArgs),
