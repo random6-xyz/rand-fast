@@ -77,8 +77,9 @@ All subcommands take `--pid <TGID>` and `--duration` (for example `10s` or
 while the collection runs; the report is printed when the collection ends or
 the process exits.
 
-Every subcommand also accepts `--format json` and prints one line of
-`rand-fast/v1` JSON. See [JSON output](#json-output).
+Every subcommand also accepts `--format json` and prints one line of JSON.
+`daemon` uses `rand-fast/v2`; the other commands use `rand-fast/v1`. See
+[JSON output](#json-output).
 
 | Subcommand  | Measures                                   | State |
 | ----------- | ------------------------------------------ | ----- |
@@ -434,8 +435,10 @@ by reading the first entry of the causes array from real JSON. See
 
 The flight recorder. It runs the same parallel collection as `fast diagnose`,
 keeps it open, and summarises on a tick. Each ring entry holds the numbers for
-*that interval*, obtained by differencing two consecutive cumulative summaries,
-which is what makes the interval length cancel out.
+*that interval*. CPU usage is calculated from process tick differences over the
+actual time between readings, as a percentage of one CPU; multicore usage can
+exceed 100%. If a reading is unavailable, CPU usage is unavailable rather than
+zero, and the next successful reading establishes a new baseline.
 
 ```bash
 sudo ./target/release/fast daemon --pid 1234 --duration 300s \
@@ -444,8 +447,8 @@ sudo ./target/release/fast daemon --pid 1234 --duration 300s \
 
 #### Triggers
 
-An incident is written when **any** enabled trigger fires. A recorder that only
-watches one signal has a failure mode that looks like success: a host that is
+An incident write is attempted when **any** enabled trigger fires. A recorder
+that only watches one signal has a failure mode that looks like success: a host that is
 slow because it is losing packets has a healthy scheduler p95, the trigger never
 fires, and the operator is shown a clean bill of health for a machine that is
 visibly struggling.
@@ -485,14 +488,20 @@ each threshold the measurement went.
 Each incident is a directory, named so that `ls` is a timeline:
 
 ```text
-incidents/incident-10s_43ms_42us_561ns/
+incidents/incident-000000010043s/
   manifest.json       what tripped it, the measured value, the threshold, the unit
   intervals.json      the rolling window that led up to it
   slow-samples.json   the slowest latencies themselves, longest first
   diagnosis.json      the ranking fast diagnose uses, plus what it did not collect
   summary.txt         the same, without a JSON parser
-  complete.json       written last: a bundle is complete or absent, never partial
+  complete.json       written last to mark a complete bundle
 ```
+
+Incident bundles use `rand-fast/v2`: the version is recorded in the manifest,
+completion marker and diagnosis. In `intervals.json`, `cpu_percent` is a number
+when measured and `null` when unavailable; unavailable CPU usage cannot fire a
+CPU trigger. The recorder can still restore numeric CPU readings from v1
+bundles. See the [daemon JSON v2 migration guide](docs/daemon-json-v2.md).
 
 `slow-samples.json` holds the measurements rather than the percentiles that
 summarise them. A p99 says where the tail fell; someone opening an incident at
@@ -744,12 +753,17 @@ run shows the expected signal delta.
 ## JSON output
 
 Every subcommand takes `--format json` and prints a single line of JSON, so the
-output can be piped into a tool that reads lines without a wrapper. One schema
-covers all of them:
+output can be piped into a tool that reads lines without a wrapper. Commands
+other than `daemon` use `rand-fast/v1`, for example:
 
 ```json
 {"schema":"rand-fast/v1","command":"diagnose","pid":691,"process":"sched-workload","duration_s":4.0,"interrupted":false,"process_exited":false,"data":{...}}
 ```
+
+`daemon` uses `rand-fast/v2`, with the same envelope shape. Its
+`data.intervals_detail` entries have a numeric `cpu_percent` when measured and
+`null` when unavailable. See the [daemon JSON v2 migration guide](docs/daemon-json-v2.md)
+for incident bundles and v1 restoration.
 
 The envelope is the same for every command — schema, command, the process it
 looked at, how long it ran, and whether it stopped because it was interrupted
@@ -761,10 +775,9 @@ Two rules the documents follow:
 - **Units are in the field names.** `sched_p95_us`, `io_p99_us`,
   `retrans`, `psi_some_pct`, `recorder_memory_bytes`. A number without a unit is
   a number nobody can check.
-- **A measurement that was not taken is absent, not zero.** A kernel without
-  `CONFIG_PSI` reports no `psi_some_pct` at all, rather than zero pressure,
-  because those are different claims and a consumer cannot tell them apart if
-  both are spelled `0`.
+- **A measurement that was not taken is not zero.** For example, unavailable
+  daemon interval CPU usage is `null`, not zero; consumers must distinguish the
+  two. Other optional fields may be absent when unavailable.
 
 ```bash
 sudo ./target/release/fast diagnose --pid 1234 --duration 10s --format json
@@ -892,7 +905,7 @@ sudo ./target/release/fast sched --pid <TARGET_PID> --duration 10s
 - a long-running flight recorder with multi-signal triggers and incident
   bundles
 
-All of it is available as text and as one schema of JSON. It runs on one process
+All of it is available as text and as versioned JSON. It runs on one process
 at a time; correlating several is not implemented. See
 [Known limitations](#known-limitations) for what is still not right.
 
