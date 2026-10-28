@@ -554,7 +554,7 @@ mod tests {
         let output = Output::open(&t.0).unwrap();
         let file = t.0.join("private-user-data");
         fs::write(&file, vec![0; 512]).unwrap();
-        fs::set_permissions(&file, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
         let old = output.create("000000001000s").unwrap();
         let current = output.create("000000002000s").unwrap();
         let state = output
@@ -611,7 +611,7 @@ mod tests {
         let bundle = output.create("000000001000s").unwrap();
         let unrelated = t.0.join("unrelated");
         fs::create_dir(&unrelated).unwrap();
-        fs::set_permissions(&unrelated, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&unrelated, fs::Permissions::from_mode(0o000)).unwrap();
         let result = output
             .rotate_with(
                 0,
