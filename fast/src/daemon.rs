@@ -503,10 +503,8 @@ fn diagnose_from(entry: &RingEntry, pid: u32, slow: &SlowSamples) -> Value {
         // slow threshold, so this signal is left out rather than guessed at.
         io_slow: 0,
         net_samples: 0,
-        // Retransmissions are counted but segments are not, so there is no
-        // ratio to score. Zero here would read as a perfect link rather than
-        // as an absent measurement.
-        retrans_ratio: 0.0,
+        retransmissions: entry.retrans,
+        retrans_ratio: None,
         offcpu_samples: 0,
         offcpu_p95_us: 0,
         offcpu_total_us: 0,

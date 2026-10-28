@@ -4,7 +4,8 @@
 //! whole schema can be read in one place, and that the naming rules the
 //! envelope documents are applied uniformly: latencies in microseconds with a
 //! `_us` suffix, rates per second with `_per_s`, byte counts in bytes with
-//! `_bytes`, and an unknown value omitted rather than serialised as null.
+//! `_bytes`, and an unknown value omitted rather than serialised as null,
+//! except for the explicitly unavailable v2 retransmission ratio.
 
 use std::time::Duration;
 
@@ -55,8 +56,9 @@ pub struct EndpointJson {
     pub p99_us: u64,
     /// Retransmissions on this endpoint.
     pub retransmissions: u64,
-    /// Retransmissions over observed segments, from 0.0 to 1.0.
-    pub retrans_ratio: f64,
+    /// Always null: transmitted segment counts are not collected. The field is
+    /// retained in v2, but its former v1 numeric value was invalid.
+    pub retrans_ratio: Option<f64>,
     /// Highest congestion window seen, in segments.
     pub max_cwnd: u64,
     /// Highest receive window seen, in bytes.
@@ -85,7 +87,7 @@ pub fn network_json(stats: &NetStats) -> NetJson {
                     p95_us: p95 as u64,
                     p99_us: p99 as u64,
                     retransmissions: endpoint.retrans,
-                    retrans_ratio: endpoint.retrans_ratio(),
+                    retrans_ratio: None,
                     max_cwnd: endpoint.max_cwnd as u64,
                     max_rcv_wnd_bytes: endpoint.max_rcv_wnd as u64,
                 }
@@ -612,7 +614,7 @@ mod tests {
         // Latencies are microseconds and windows are named with their unit, so
         // a consumer never has to guess.
         assert!(endpoint.get("p50_us").is_some());
-        assert!(endpoint.get("retrans_ratio").is_some());
+        assert_eq!(endpoint.get("retrans_ratio"), Some(&Value::Null));
         assert_eq!(endpoint["max_rcv_wnd_bytes"], serde_json::json!(4096));
     }
 
@@ -702,9 +704,13 @@ mod tests {
             offcpu_samples: 1_000,
             offcpu_total_us: 100_000,
             offcpu_futex_ratio: 0.9,
+            net_samples: 12,
+            retransmissions: 2,
             ..Evidence::default()
         };
         let value = value_of(&diagnose_json(&evidence));
+        assert_eq!(value["measured"]["retransmissions"], 2);
+        assert_eq!(value["measured"].get("retrans_ratio"), Some(&Value::Null));
         assert_eq!(
             value["measured"]["offcpu_samples"],
             serde_json::json!(1_000)

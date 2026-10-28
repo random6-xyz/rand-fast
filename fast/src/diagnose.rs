@@ -58,8 +58,11 @@ pub struct Evidence {
     pub io_slow: u64,
     /// TCP events observed.
     pub net_samples: u64,
-    /// Retransmissions as a fraction of observed segments, from 0.0 to 1.0.
-    pub retrans_ratio: f64,
+    /// Retransmissions observed, not a rate.
+    pub retransmissions: u64,
+    /// Always null: transmitted segment counts are not collected. Retained
+    /// in v2; previous v1 numeric values were invalid.
+    pub retrans_ratio: Option<f64>,
     /// Off-CPU waits collected.
     pub offcpu_samples: usize,
     /// Off-CPU wait p95, in microseconds.
@@ -307,11 +310,6 @@ fn collect_evidence(
     // zero, and its counters are too small to mean anything anyway.
     let seconds = summary.elapsed.as_secs_f64().max(0.001);
 
-    let net_segments: u64 = net
-        .slowest_endpoints()
-        .iter()
-        .map(|endpoint| endpoint.segments())
-        .sum();
     let (offcpu_p50, offcpu_p95, _offcpu_p99) = offcpu.percentiles();
     let _ = offcpu_p50;
 
@@ -325,11 +323,8 @@ fn collect_evidence(
         io_p99_us: io_stats.summary().map_or(0, |s| s.p99_ns / 1_000),
         io_slow: io_stats.slow_count(),
         net_samples: net.samples() + net.retrans(),
-        retrans_ratio: if net_segments == 0 {
-            0.0
-        } else {
-            net.retrans() as f64 / net_segments as f64
-        },
+        retransmissions: net.retrans(),
+        retrans_ratio: None,
         offcpu_samples: offcpu.sample_count(),
         offcpu_p95_us: offcpu_p95 / 1_000,
         offcpu_total_us: offcpu.total_ns() / 1_000,
@@ -388,9 +383,8 @@ fn print_report(name: &str, pid: u32, summary: &runtime::CollectionSummary, evid
         evidence.io_samples, evidence.io_unmatched, evidence.io_p99_us, evidence.io_slow
     );
     println!(
-        "  tcp: {} events, {:.2}% retransmitted",
-        evidence.net_samples,
-        evidence.retrans_ratio * 100.0
+        "  tcp: {} events, {} retransmissions; retransmission rate unavailable (transmitted segment count not collected)",
+        evidence.net_samples, evidence.retransmissions
     );
     println!(
         "  off-cpu: {} waits, p95 {} us, {} us total, {:.0}% of it on a futex",
@@ -407,20 +401,26 @@ fn print_report(name: &str, pid: u32, summary: &runtime::CollectionSummary, evid
     println!("  swap used: {} KiB", evidence.swap_kb);
     println!("  lost events: {}", describe_lost(evidence));
 
-    let ranked = crate::scoring::score(evidence);
     println!();
     println!("Ranked causes");
-    if ranked.is_empty() {
-        println!("  nothing was measured, so nothing can be concluded");
-    } else {
-        for (index, diagnosis) in ranked.iter().enumerate() {
-            println!("  {}", diagnosis.render(index + 1));
-        }
-    }
+    print!("{}", render_ranked_causes(evidence));
     println!();
     println!("Confidence is each cause's share of the measured slowdown, not a probability.");
     println!("The signals are measured; the weighting between them is a judgement, and the");
     println!("thresholds behind each verdict are documented in fast/src/scoring.rs.");
+}
+
+/// Renders the ranking, including the explanation when no signal is scorable.
+fn render_ranked_causes(evidence: &Evidence) -> String {
+    let ranked = crate::scoring::score(evidence);
+    if ranked.is_empty() {
+        return "  insufficient scorable evidence to rank causes\n".to_string();
+    }
+    ranked
+        .iter()
+        .enumerate()
+        .map(|(index, diagnosis)| format!("  {}\n", diagnosis.render(index + 1)))
+        .collect()
 }
 
 /// Renders the dropped-record line, naming the streams it came from.
@@ -472,6 +472,19 @@ mod tests {
         assert_eq!(evidence.cpu_percent, 99.0);
         assert_eq!(evidence.offcpu_total_us, 0);
         assert_eq!(evidence.offcpu_futex_ratio, 0.0);
+    }
+
+    #[test]
+    fn retransmissions_without_scorable_evidence_do_not_claim_nothing_was_measured() {
+        let evidence = Evidence {
+            net_samples: 12,
+            retransmissions: 12,
+            ..quiet()
+        };
+        assert_eq!(
+            render_ranked_causes(&evidence),
+            "  insufficient scorable evidence to rank causes\n"
+        );
     }
 
     #[test]

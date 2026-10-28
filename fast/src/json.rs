@@ -28,7 +28,8 @@
 //! - A field is present whenever it is known, and absent rather than null when
 //!   it is not. A consumer can tell "no samples" from "zero samples" by the
 //!   absence of the count, which is the distinction the human report makes in
-//!   words.
+//!   words. In v2 `net` and `diagnose`, `retrans_ratio` is explicitly null:
+//!   no transmitted segment count is collected.
 //! - `lost_events` is present on every eBPF-backed command, so a consumer can
 //!   decide how far to trust the rest.
 //!
@@ -37,7 +38,9 @@
 //! The `schema` field is the contract. Within a major version, fields are only
 //! added, never removed or retyped; a breaking change bumps the number. A
 //! consumer should ignore fields it does not recognise, which is what makes
-//! adding one safe.
+//! adding one safe. `net` and `diagnose` use v2 because the invalid v1
+//! retransmission ratio is now null instead of a number. Other commands remain
+//! on v1. Consumers must dispatch on both schema and command.
 
 use std::time::Duration;
 
@@ -45,6 +48,9 @@ use serde::Serialize;
 
 /// The schema identifier every JSON document carries.
 pub const SCHEMA: &str = "rand-fast/v1";
+
+/// Schema for reports whose retransmission ratio was corrected.
+pub const NETWORK_SCHEMA: &str = "rand-fast/v2";
 
 /// The output format a command was asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -62,7 +68,7 @@ pub enum Format {
 /// measurements, which makes it diffable and cacheable.
 #[derive(Debug, Clone, Serialize)]
 pub struct Envelope<T: Serialize> {
-    /// Always [`SCHEMA`].
+    /// The schema version for this command.
     pub schema: &'static str,
     /// The subcommand that produced this document.
     pub command: &'static str,
@@ -93,7 +99,11 @@ impl<T: Serialize> Envelope<T> {
         data: T,
     ) -> Self {
         Self {
-            schema: SCHEMA,
+            schema: if matches!(command, "net" | "diagnose") {
+                NETWORK_SCHEMA
+            } else {
+                SCHEMA
+            },
             command,
             pid,
             process,
@@ -340,6 +350,18 @@ mod schema_tests {
                 .unwrap_or_else(|| panic!("missing field {name} in {document}"));
         }
         current
+    }
+
+    #[test]
+    fn corrected_network_reports_use_v2_without_changing_other_commands() {
+        for (command, schema) in [
+            ("net", NETWORK_SCHEMA),
+            ("diagnose", NETWORK_SCHEMA),
+            ("sched", SCHEMA),
+        ] {
+            let envelope = Envelope::new(command, 1, None, Duration::ZERO, false, false, ());
+            assert_eq!(envelope.schema, schema);
+        }
     }
 
     #[test]
