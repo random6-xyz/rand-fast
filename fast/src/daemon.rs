@@ -52,6 +52,9 @@ const PERF_PAGE_COUNT: usize = 4;
 /// cost of the whole program.
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
+/// Schema for daemon reports and their incident bundles.
+const DAEMON_SCHEMA: &str = "rand-fast/v2";
+
 /// Documented CPU budget, as a fraction of one CPU.
 ///
 /// Revised from an aspirational 2% once the recorder could measure itself.
@@ -99,8 +102,8 @@ pub struct RingEntry {
     pub sched_p95_us: u64,
     /// Scheduler samples over the interval.
     pub sched_samples: u64,
-    /// On-CPU usage as a percentage of one CPU.
-    pub cpu_percent: f64,
+    /// On-CPU usage as a percentage of one CPU, absent when unavailable.
+    pub cpu_percent: Option<f64>,
     /// Block I/O p99 over the interval, in microseconds.
     pub io_p99_us: u64,
     /// Block I/O completions over the interval.
@@ -123,7 +126,7 @@ pub struct RingEntry {
     /// Peak recorder resident set over the interval, in bytes.
     pub memory_bytes: u64,
     /// The triggers that fired on this interval, worst first. Empty on a
-    /// quiet interval, and the reason the incident was written when it is not.
+    /// quiet interval. An incident write can fail even when triggers fired.
     pub fired: Vec<Signal>,
 }
 
@@ -182,7 +185,7 @@ fn write_incident(
     let carried = total_entries.min(BUNDLE_MAX_INTERVALS);
 
     let manifest = serde_json::json!({
-        "schema": crate::json::SCHEMA,
+        "schema": DAEMON_SCHEMA,
         "command": "daemon.incident",
         "recorded_at_s": entry.at.as_secs_f64(),
         "process": { "pid": args.pid },
@@ -253,7 +256,7 @@ fn write_incident(
     directory.json(
         "complete.json",
         &serde_json::json!({
-            "schema": crate::json::SCHEMA,
+            "schema": DAEMON_SCHEMA,
             "files": [
                 "manifest.json",
                 "intervals.json",
@@ -402,10 +405,7 @@ fn ring_entry_from_json(value: &Value) -> Option<RingEntry> {
         at,
         sched_p95_us: number("sched_p95_us").unwrap_or(0),
         sched_samples: number("sched_samples").unwrap_or(0),
-        cpu_percent: value
-            .get("cpu_percent")
-            .and_then(Value::as_f64)
-            .unwrap_or_default(),
+        cpu_percent: value.get("cpu_percent").and_then(Value::as_f64),
         io_p99_us: number("io_p99_us").unwrap_or(0),
         io_samples: number("io_samples").unwrap_or(0),
         io_unmatched: number("io_unmatched").unwrap_or(0),
@@ -468,7 +468,7 @@ fn diagnose_from(entry: &RingEntry, pid: u32, slow: &SlowSamples) -> Value {
         psi_some_pct: entry.psi_some_pct.unwrap_or(0.0),
         psi_full_pct: entry.psi_full_pct.unwrap_or(0.0),
         cpu_samples: 0,
-        cpu_percent: entry.cpu_percent,
+        cpu_percent: entry.cpu_percent.unwrap_or_default(),
         // The recorder knows the streams' dropped-event count for the interval
         // but not for the whole run, so this is the interval's figure.
         lost: vec![("interval", entry.lost)],
@@ -480,7 +480,7 @@ fn diagnose_from(entry: &RingEntry, pid: u32, slow: &SlowSamples) -> Value {
     };
     let causes = crate::scoring::score(&evidence);
     serde_json::json!({
-        "schema": crate::json::SCHEMA,
+        "schema": DAEMON_SCHEMA,
         "command": "daemon.incident.diagnosis",
         "pid": pid,
         "scored_by": "the ranking fast diagnose uses, fed with the recorder's own measurements",
@@ -526,7 +526,7 @@ impl RingEntry {
             Signal::Retransmissions => Some(self.retrans as f64),
             Signal::PsiSome => self.psi_some_pct.map(f64::from),
             Signal::PsiFull => self.psi_full_pct.map(f64::from),
-            Signal::CpuUsage => Some(self.cpu_percent),
+            Signal::CpuUsage => self.cpu_percent,
         }
     }
 }
@@ -901,8 +901,11 @@ struct PreviousTick {
     at: Duration,
     usage: SelfUsage,
     totals: Cumulative,
-    /// Target CPU ticks at the previous tick.
-    target_cpu_ticks: u64,
+    /// The previous successful target accounting reading.
+    target_cpu: Option<(Instant, u64)>,
+    /// Set once the first tick has been recorded, so the second tick produces a
+    /// real interval instead of a difference against zero.
+    primed: bool,
 }
 
 pub fn run(args: DaemonArgs) -> Result<()> {
@@ -966,7 +969,6 @@ pub fn run(args: DaemonArgs) -> Result<()> {
         previous: PreviousTick {
             at: restored.previous_at,
             usage: read_self_usage(),
-            target_cpu_ticks: cpu::read_process_ticks(pid).unwrap_or(0),
             ..PreviousTick::default()
         },
         peak_cpu_pct: 0.0,
@@ -1050,7 +1052,7 @@ pub fn run(args: DaemonArgs) -> Result<()> {
     if args.format.format == Format::Json {
         json::emit(
             args.format.format,
-            &Envelope::new(
+            &daemon_envelope(
                 "daemon",
                 pid,
                 Some(process_name),
@@ -1091,6 +1093,28 @@ pub fn run(args: DaemonArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn daemon_envelope<T: serde::Serialize>(
+    command: &'static str,
+    pid: u32,
+    process: Option<String>,
+    elapsed: Duration,
+    interrupted: bool,
+    process_exited: bool,
+    data: T,
+) -> Envelope<T> {
+    let mut envelope = Envelope::new(
+        command,
+        pid,
+        process,
+        elapsed,
+        interrupted,
+        process_exited,
+        data,
+    );
+    envelope.schema = DAEMON_SCHEMA;
+    envelope
 }
 
 /// Everything a tick updates and the report reads back.
@@ -1136,7 +1160,10 @@ struct Restored {
     previous_at: Duration,
 }
 
-/// How often each trigger produced a successfully written incident.
+/// How often each trigger fired over a run.
+///
+/// Kept as a running tally rather than by re-reading the incident files.
+/// Only successfully written incidents are counted.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct Incidents {
     total: u64,
@@ -1166,6 +1193,11 @@ impl Incidents {
         }
     }
 
+    /// A summary when no incident was successfully written.
+    fn empty_message(&self) -> Option<&'static str> {
+        (self.total == 0).then_some("no incidents written")
+    }
+
     /// The signals that fired at least once, most frequent first.
     fn signals(&self) -> Vec<(Signal, u64)> {
         let mut counts = self.per_signal.clone();
@@ -1182,6 +1214,20 @@ fn tick(
     summary: runtime::TickSummary<'_>,
     state: &mut RecorderState,
     args: &DaemonArgs,
+) -> Result<()> {
+    let target_cpu = cpu::read_process_ticks(pid)
+        .ok()
+        .map(|ticks| (Instant::now(), ticks));
+    tick_with_target_cpu(tick_started, at, summary, state, args, target_cpu)
+}
+
+fn tick_with_target_cpu(
+    tick_started: Instant,
+    at: Duration,
+    summary: runtime::TickSummary<'_>,
+    state: &mut RecorderState,
+    args: &DaemonArgs,
+    target_cpu: Option<(Instant, u64)>,
 ) -> Result<()> {
     let RecorderState {
         ring,
@@ -1234,13 +1280,28 @@ fn tick(
     }
 
     let usage = read_self_usage();
-    let target_cpu_ticks = cpu::read_process_ticks(pid).unwrap_or(previous.target_cpu_ticks);
     // End the interval when the CPU counters were sampled, not before the
     // callback and /proc reads. The individual reads are not atomic.
     let at = at
         .saturating_add(tick_started.elapsed())
         .saturating_add(*time_offset);
     let psi = crate::memory::read_psi("/proc/pressure/memory");
+    let target_cpu_percent = interval_cpu_percent(previous.target_cpu, target_cpu);
+
+    // The first tick has nothing to difference against, so it only records the
+    // baseline. Reporting a difference against zero would make the very first
+    // interval look like the entire run so far.
+    if !previous.primed {
+        previous.at = at;
+        previous.usage = usage;
+        previous.primed = true;
+        previous.totals = current;
+        previous.target_cpu = target_cpu;
+        *ticks = 1;
+        *peak_cpu_pct = (*peak_cpu_pct).max(cpu_cost_pct(usage.ticks, at));
+        *peak_memory_bytes = (*peak_memory_bytes).max(usage.rss_bytes);
+        return Ok(());
+    }
 
     // Both sides carry the same offset, so the interval is unaffected by it.
     let window = at.saturating_sub(previous.at);
@@ -1268,10 +1329,7 @@ fn tick(
         // Latency distributions and their sample counts reset together at each tick.
         sched_p95_us: current.sched_p95_us,
         sched_samples: current.sched_samples,
-        cpu_percent: cpu_cost_pct(
-            target_cpu_ticks.saturating_sub(previous.target_cpu_ticks),
-            window,
-        ),
+        cpu_percent: target_cpu_percent,
         io_p99_us: current.io_p99_us,
         io_samples: current.io_samples,
         io_unmatched: current.io_unmatched.saturating_sub(before.io_unmatched),
@@ -1295,7 +1353,7 @@ fn tick(
         retrans: entry.retrans,
         psi_some_pct: entry.psi_some_pct.map(f64::from),
         psi_full_pct: entry.psi_full_pct.map(f64::from),
-        cpu_percent: Some(entry.cpu_percent),
+        cpu_percent: entry.cpu_percent,
     });
     entry.fired = fired.clone();
     // The incident file is written before the entry goes into the ring, so a
@@ -1336,8 +1394,25 @@ fn tick(
     previous.at = at;
     previous.usage = usage;
     previous.totals = current;
-    previous.target_cpu_ticks = target_cpu_ticks;
+    previous.target_cpu = target_cpu;
     incident_result
+}
+
+/// Calculates usage from consecutive successful accounting readings.
+fn interval_cpu_percent(
+    previous: Option<(Instant, u64)>,
+    current: Option<(Instant, u64)>,
+) -> Option<f64> {
+    let (before_at, before_ticks) = previous?;
+    let (after_at, after_ticks) = current?;
+    let elapsed = after_at.checked_duration_since(before_at)?.as_secs_f64();
+    let ticks = after_ticks.checked_sub(before_ticks)?;
+    // sysconf reports the units used by /proc/<pid>/stat.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if elapsed == 0.0 || hz <= 0 {
+        return None;
+    }
+    Some(ticks as f64 / hz as f64 / elapsed * 100.0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1510,7 +1585,256 @@ mod tests {
         assert_eq!(std::mem::size_of_val(&collector), 24);
     }
 
+
+    #[test]
+    fn interval_cpu_percent_uses_tick_deltas_and_actual_elapsed_time() {
+        use super::*;
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+        assert!(hz > 0);
+        let start = Instant::now();
+        let sample = |seconds, ticks| Some((start + Duration::from_secs(seconds), ticks));
+        let baseline = sample(0, 10_000 * hz);
+        let first = sample(1, 10_001 * hz);
+        let second = sample(2, 10_002 * hz);
+        assert_eq!(interval_cpu_percent(baseline, first), Some(100.0));
+        assert_eq!(interval_cpu_percent(first, second), Some(100.0));
+        let changed = sample(4, 10_003 * hz);
+        assert_eq!(interval_cpu_percent(second, changed), Some(50.0));
+        let multicore = sample(5, 10_006 * hz);
+        assert_eq!(interval_cpu_percent(changed, multicore), Some(300.0));
+        assert_eq!(
+            interval_cpu_percent(multicore, sample(6, 10_006 * hz)),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn interval_cpu_percent_requires_consecutive_valid_readings() {
+        use super::*;
+        let now = Instant::now();
+        let first = Some((now, 100));
+        let next = Some((now + Duration::from_secs(1), 200));
+        assert_eq!(interval_cpu_percent(None, first), None);
+        assert_eq!(interval_cpu_percent(first, None), None);
+        assert_eq!(interval_cpu_percent(None, next), None);
+        assert_eq!(interval_cpu_percent(first, Some((now, 200))), None);
+        assert_eq!(
+            interval_cpu_percent(first, Some((now + Duration::from_secs(1), 99))),
+            None
+        );
+        assert!(interval_cpu_percent(first, next).is_some());
+    }
+
+    #[test]
+    fn missing_cpu_is_null_and_does_not_fire_or_restore_as_zero() {
+        use super::*;
+        let entry = RingEntry::default();
+        assert!(entry.to_json()["cpu_percent"].is_null());
+        assert_eq!(entry.measured(Signal::CpuUsage), None);
+        assert_eq!(
+            ring_entry_from_json(&entry.to_json()).unwrap().cpu_percent,
+            None
+        );
+        let mut json = entry.to_json();
+        json["cpu_percent"] = serde_json::json!(42.5);
+        assert_eq!(ring_entry_from_json(&json).unwrap().cpu_percent, Some(42.5));
+    }
     use super::*;
+
+    fn tick_test_state() -> RecorderState {
+        RecorderState {
+            ring: Ring::new(Duration::from_secs(60), Duration::from_secs(1)),
+            previous: PreviousTick::default(),
+            peak_cpu_pct: 0.0,
+            peak_memory_bytes: 0,
+            ticks: 0,
+            incidents: Incidents::default(),
+            slow_sched: Vec::new(),
+            slow_io: Vec::new(),
+            restored: Restored::default(),
+            time_offset: Duration::ZERO,
+        }
+    }
+
+    fn tick_summary(samples: u64) -> runtime::TickSummary<'static> {
+        vec![("sched", serde_json::json!({"samples": samples}))]
+    }
+
+    #[test]
+    fn tick_baseline_and_missing_read_recovery_reach_ring_and_triggers() {
+        let dir = temp_dir("tick_read_recovery");
+        let mut args = default_args(&dir);
+        args.trigger_cpu = "80".parse().unwrap();
+        let mut state = tick_test_state();
+        let start = Instant::now();
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+        assert!(hz > 0);
+        let sample = |n: u64| Some((start + Duration::from_secs(n), (1000 + n) * hz));
+        tick_with_target_cpu(
+            Instant::now(),
+            Duration::from_secs(1),
+            tick_summary(10),
+            &mut state,
+            &args,
+            sample(0),
+        )
+        .unwrap();
+        assert_eq!(state.ring.entries().count(), 0);
+        tick_with_target_cpu(
+            Instant::now(),
+            Duration::from_secs(2),
+            tick_summary(20),
+            &mut state,
+            &args,
+            None,
+        )
+        .unwrap();
+        tick_with_target_cpu(
+            Instant::now(),
+            Duration::from_secs(3),
+            tick_summary(30),
+            &mut state,
+            &args,
+            sample(2),
+        )
+        .unwrap();
+        let entries: Vec<_> = state.ring.entries().collect();
+        assert_eq!(
+            entries.iter().map(|e| e.cpu_percent).collect::<Vec<_>>(),
+            vec![None, None]
+        );
+        assert!(entries.iter().all(|e| !e.fired.contains(&Signal::CpuUsage)));
+        tick_with_target_cpu(
+            Instant::now(),
+            Duration::from_secs(4),
+            tick_summary(40),
+            &mut state,
+            &args,
+            sample(3),
+        )
+        .unwrap();
+        let entry = state.ring.entries().last().unwrap();
+        assert_eq!(entry.cpu_percent, Some(100.0));
+        assert_eq!(entry.sched_samples, 10);
+        assert!(entry.fired.contains(&Signal::CpuUsage));
+        assert_eq!(state.incidents.total, 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tick_commits_all_interval_state_when_incident_write_fails() {
+        let dir = temp_dir("tick_write_recovery");
+        let output = dir.join("blocked");
+        std::fs::write(&output, "not a directory").unwrap();
+        let mut args = default_args(&output);
+        args.trigger_cpu = "80".parse().unwrap();
+        let mut state = tick_test_state();
+        let start = Instant::now();
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
+        assert!(hz > 0);
+        let sample = |seconds, ticks| Some((start + Duration::from_secs(seconds), ticks * hz));
+        tick_with_target_cpu(
+            Instant::now(),
+            Duration::from_secs(1),
+            tick_summary(10),
+            &mut state,
+            &args,
+            sample(0, 1000),
+        )
+        .unwrap();
+        assert!(
+            tick_with_target_cpu(
+                Instant::now(),
+                Duration::from_secs(2),
+                tick_summary(20),
+                &mut state,
+                &args,
+                sample(1, 1001)
+            )
+            .is_err()
+        );
+        let failed_entry = state.ring.entries().last().unwrap();
+        assert_eq!(failed_entry.cpu_percent, Some(100.0));
+        assert_eq!(failed_entry.sched_samples, 10);
+        assert!(failed_entry.fired.contains(&Signal::CpuUsage));
+        assert_eq!(state.previous.at, Duration::from_secs(2));
+        assert_eq!(state.ticks, 2);
+        assert_eq!(state.incidents.total, 0);
+        assert_eq!(
+            state.incidents.empty_message(),
+            Some("no incidents written")
+        );
+        std::fs::remove_file(&output).unwrap();
+        std::fs::create_dir(&output).unwrap();
+        tick_with_target_cpu(
+            Instant::now(),
+            Duration::from_secs(3),
+            tick_summary(35),
+            &mut state,
+            &args,
+            sample(2, 1003),
+        )
+        .unwrap();
+        let entry = state.ring.entries().last().unwrap();
+        assert_eq!(entry.cpu_percent, Some(200.0));
+        assert_eq!(entry.sched_samples, 15);
+        assert!(entry.fired.contains(&Signal::CpuUsage));
+        assert_eq!(state.ticks, 3);
+        assert_eq!(state.incidents.total, 1);
+        assert_eq!(state.incidents.empty_message(), None);
+        let bundle = std::fs::read_dir(&output)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(bundle.join("manifest.json")).unwrap()).unwrap();
+        let complete: Value =
+            serde_json::from_slice(&std::fs::read(bundle.join("complete.json")).unwrap()).unwrap();
+        let diagnosis: Value =
+            serde_json::from_slice(&std::fs::read(bundle.join("diagnosis.json")).unwrap()).unwrap();
+        let history: Value =
+            serde_json::from_slice(&std::fs::read(bundle.join("intervals.json")).unwrap()).unwrap();
+        assert_eq!(manifest["schema"], DAEMON_SCHEMA);
+        assert_eq!(complete["schema"], DAEMON_SCHEMA);
+        assert_eq!(diagnosis["schema"], DAEMON_SCHEMA);
+        assert_eq!(manifest["triggered_by"][0]["measured"], 200.0);
+        assert_eq!(history[0]["cpu_percent"], 100.0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn daemon_report_v2_and_v1_bundle_restoration() {
+        let mut ring = Ring::new(Duration::from_secs(60), Duration::from_secs(1));
+        ring.push(RingEntry::default());
+        let envelope = daemon_envelope(
+            "daemon",
+            1,
+            None,
+            Duration::from_secs(1),
+            false,
+            false,
+            crate::json_payloads::daemon_json(&ring, 0.0, 0, 1),
+        );
+        let document = serde_json::to_value(envelope).unwrap();
+        assert_eq!(document["schema"], "rand-fast/v2");
+        assert!(document["data"]["intervals_detail"][0]["cpu_percent"].is_null());
+        let dir = temp_dir("restore_v1_cpu");
+        let bundle = dir.join("incident-000000001000s");
+        std::fs::create_dir(&bundle).unwrap();
+        std::fs::write(bundle.join("complete.json"), r#"{"schema":"rand-fast/v1"}"#).unwrap();
+        std::fs::write(bundle.join("manifest.json"), r#"{"schema":"rand-fast/v1"}"#).unwrap();
+        std::fs::write(
+            bundle.join("intervals.json"),
+            r#"[{"at_s":1.0,"cpu_percent":87.5}]"#,
+        )
+        .unwrap();
+        let restored = restore_ring(&dir, Duration::from_secs(60));
+        assert_eq!(restored.entries.len(), 1);
+        assert_eq!(restored.entries[0].cpu_percent, Some(87.5));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn interval_latency_spike_recovery_empty_and_final_tick() {
@@ -2366,7 +2690,7 @@ mod tests {
             at: Duration::from_millis(1_500),
             sched_p95_us: 900,
             sched_samples: 12,
-            cpu_percent: 87.5,
+            cpu_percent: Some(87.5),
             io_p99_us: 40,
             io_samples: 7,
             io_unmatched: 2,

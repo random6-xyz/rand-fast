@@ -25,10 +25,8 @@
 //!   readability; JSON does not, because a consumer should never have to parse
 //!   "1.5 ms".
 //! - All byte counts are bytes, named with a `_bytes` suffix.
-//! - A field is present whenever it is known, and absent rather than null when
-//!   it is not. A consumer can tell "no samples" from "zero samples" by the
-//!   absence of the count, which is the distinction the human report makes in
-//!   words.
+//! - In v1, optional fields are absent rather than null when unknown. Daemon
+//!   v2 interval CPU usage is an exception: it is null when unavailable.
 //! - `lost_events` is present on every eBPF-backed command, so a consumer can
 //!   decide how far to trust the rest.
 //!
@@ -43,7 +41,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-/// The schema identifier every JSON document carries.
+/// The default schema identifier for v1 JSON documents.
 pub const SCHEMA: &str = "rand-fast/v1";
 
 /// The output format a command was asked for.
@@ -62,7 +60,7 @@ pub enum Format {
 /// measurements, which makes it diffable and cacheable.
 #[derive(Debug, Clone, Serialize)]
 pub struct Envelope<T: Serialize> {
-    /// Always [`SCHEMA`].
+    /// Schema identifier for this document.
     pub schema: &'static str,
     /// The subcommand that produced this document.
     pub command: &'static str,
@@ -111,7 +109,10 @@ impl<T: Serialize> Envelope<T> {
     pub fn to_line(&self) -> String {
         // Serializing a struct of plain values cannot fail.
         serde_json::to_string(self).unwrap_or_else(|error| {
-            format!("{{\"schema\":\"{SCHEMA}\",\"error\":\"json serialization failed: {error}\"}}")
+            format!(
+                "{{\"schema\":\"{}\",\"error\":\"json serialization failed: {error}\"}}",
+                self.schema
+            )
         })
     }
 }
