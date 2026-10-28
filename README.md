@@ -49,10 +49,10 @@ The prebuilt binary embeds the eBPF object; a release does not need Rust,
 
 Prebuilt archives target Linux x86_64. Pick a version from
 [GitHub Releases](https://github.com/random6-xyz/rand-fast/releases/latest) and
-replace `v0.1.0` below with that tag.
+replace `v0.2.0` below with that tag.
 
 ```bash
-VERSION=v0.1.0
+VERSION=v0.2.0
 BASE_URL="https://github.com/random6-xyz/rand-fast/releases/download/${VERSION}"
 ARCHIVE="rand-fast-${VERSION}-linux-x86_64.tar.gz"
 
