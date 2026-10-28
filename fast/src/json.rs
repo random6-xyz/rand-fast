@@ -27,7 +27,8 @@
 //! - All byte counts are bytes, named with a `_bytes` suffix.
 //! - In v1, optional fields are absent rather than null when unknown. In v2,
 //!   unavailable measurements are explicitly null: daemon interval CPU usage,
-//!   and `net`/`diagnose` retransmission ratios (no transmitted segment count).
+//!   `net`/`diagnose` retransmission ratios (no transmitted segment count), and
+//!   TCP measurements when attribution is unavailable.
 //! - `lost_events` is present on every eBPF-backed command, so a consumer can
 //!   decide how far to trust the rest.
 //!
@@ -46,9 +47,8 @@ use serde::Serialize;
 
 /// The default schema identifier for v1 JSON documents.
 pub const SCHEMA: &str = "rand-fast/v1";
-
-/// Schema for reports whose retransmission ratio was corrected.
-pub const NETWORK_SCHEMA: &str = "rand-fast/v2";
+/// Schema for reports with unavailable TCP measurements.
+pub const SCHEMA_V2: &str = "rand-fast/v2";
 
 /// The output format a command was asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -98,7 +98,7 @@ impl<T: Serialize> Envelope<T> {
     ) -> Self {
         Self {
             schema: if matches!(command, "net" | "diagnose") {
-                NETWORK_SCHEMA
+                SCHEMA_V2
             } else {
                 SCHEMA
             },
@@ -112,6 +112,12 @@ impl<T: Serialize> Envelope<T> {
             process_exited,
             data,
         }
+    }
+
+    /// Marks a report whose measurement types use the v2 contract.
+    pub fn with_v2(mut self) -> Self {
+        self.schema = SCHEMA_V2;
+        self
     }
 
     /// Serializes to a single line, which is what a streaming consumer wants
@@ -166,6 +172,16 @@ mod tests {
             false,
             data,
         )
+    }
+
+    #[test]
+    fn v2_reports_are_explicit_while_other_reports_remain_v1() {
+        let original = envelope(Sample {
+            count: 3,
+            note: None,
+        });
+        assert_eq!(to_value(&original)["schema"], "rand-fast/v1");
+        assert_eq!(to_value(&original.with_v2())["schema"], "rand-fast/v2");
     }
 
     #[test]
@@ -356,8 +372,8 @@ mod schema_tests {
     #[test]
     fn corrected_network_reports_use_v2_without_changing_other_commands() {
         for (command, schema) in [
-            ("net", NETWORK_SCHEMA),
-            ("diagnose", NETWORK_SCHEMA),
+            ("net", SCHEMA_V2),
+            ("diagnose", SCHEMA_V2),
             ("sched", SCHEMA),
         ] {
             let envelope = Envelope::new(command, 1, None, Duration::ZERO, false, false, ());

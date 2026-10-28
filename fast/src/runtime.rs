@@ -976,7 +976,13 @@ fn collect_stream_losses(losses: &[Arc<StreamLosses>], streams: &mut [EventStrea
 enum MultiMessage {
     /// Which stream produced the record, and its raw payload.
     Sample(usize, [u8; MAX_EVENT_SIZE]),
+    /// Reserved for the single-stream compatibility path; multi-stream
+    /// losses are reported through the shared `StreamLosses` counters.
+    #[allow(dead_code)]
     Lost(usize, u64),
+    /// Reserved for the single-stream compatibility path; reader failures are
+    /// reported through the shared error slot.
+    #[allow(dead_code)]
     Error(String),
 }
 
@@ -1038,6 +1044,7 @@ fn decode_payload(head: &[u8], tail: &[u8], event_size: usize) -> Option<[u8; MA
 ///
 /// The payload is forwarded as raw bytes tagged with the stream index, so one
 /// channel can carry every stream and the sink decodes with its own type.
+#[allow(clippy::too_many_arguments)]
 fn spawn_stream_reader(
     mut buffer: PerfEventArrayBuffer<MapData>,
     event_size: usize,

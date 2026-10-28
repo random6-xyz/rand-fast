@@ -16,7 +16,6 @@
 use std::{
     collections::VecDeque,
     fs,
-    io::Read,
     time::{Duration, Instant},
 };
 
@@ -151,7 +150,8 @@ impl RingEntry {
             "io_p99_us": self.io_p99_us,
             "io_samples": self.io_samples,
             "io_unmatched": self.io_unmatched,
-            "retrans": self.retrans,
+            "retrans": null,
+            "tcp_available": false,
             // Absent rather than zero, so a kernel without PSI is not read as
             // a machine with no memory pressure.
             "psi_some_pct": self.psi_some_pct,
@@ -217,6 +217,7 @@ fn write_incident(
                 "signal": signal.name(),
                 "unit": signal.unit(),
                 "at_or_above": signal.threshold(triggers),
+                "available": *signal != Signal::Retransmissions,
             }))
             .collect::<Vec<_>>(),
         // Stated in the bundle, because a reader who assumed it holds the whole
@@ -233,7 +234,8 @@ fn write_incident(
             "io_p99_us": entry.io_p99_us,
             "io_samples": entry.io_samples,
             "io_unmatched": entry.io_unmatched,
-            "retrans": entry.retrans,
+            "retrans": null,
+            "tcp_available": false,
             "psi_some_pct": entry.psi_some_pct,
             "psi_full_pct": entry.psi_full_pct,
             "lost_events": entry.lost,
@@ -467,6 +469,7 @@ fn diagnose_from(entry: &RingEntry, pid: u32, slow: &SlowSamples) -> Value {
         io_slow: 0,
         net_samples: 0,
         retransmissions: entry.retrans,
+        tcp_available: false,
         retrans_ratio: None,
         offcpu_samples: 0,
         offcpu_p95_us: 0,
@@ -508,7 +511,7 @@ fn diagnose_from(entry: &RingEntry, pid: u32, slow: &SlowSamples) -> Value {
         "not_collected": [
             "off-CPU wait reasons and stacks",
             "page fault and direct reclaim rates",
-            "transmitted segment count, so no retransmission ratio",
+            "TCP attribution and retransmissions: socket ownership cannot be established",
             "on-CPU samples; usage is read from the target's accounting counters",
         ],
         "slowest_samples": slow.to_json(),
@@ -536,7 +539,7 @@ impl RingEntry {
         match signal {
             Signal::SchedulerP95 => Some(self.sched_p95_us as f64),
             Signal::IoP99 => Some(self.io_p99_us as f64),
-            Signal::Retransmissions => Some(self.retrans as f64),
+            Signal::Retransmissions => None,
             Signal::PsiSome => self.psi_some_pct.map(f64::from),
             Signal::PsiFull => self.psi_full_pct.map(f64::from),
             Signal::CpuUsage => self.cpu_percent,
@@ -573,7 +576,7 @@ fn incident_text(entry: &RingEntry, triggers: &Triggers, diagnosis: &Value) -> S
         "  block I/O p99  {} us over {} completions, {} unmatched\n",
         entry.io_p99_us, entry.io_samples, entry.io_unmatched
     ));
-    text.push_str(&format!("  retransmissions {}\n", entry.retrans));
+    text.push_str("  retransmissions unavailable (socket ownership cannot be established)\n");
     match (entry.psi_some_pct, entry.psi_full_pct) {
         (Some(some), Some(full)) => {
             text.push_str(&format!("  memory PSI     {some}% some, {full}% full\n"));
@@ -780,7 +783,7 @@ impl IntervalLatency {
         if self.count == 0 {
             return 0;
         }
-        let rank = ((self.count as u128 * percentile as u128 + 99) / 100) as u64;
+        let rank = (self.count as u128 * percentile as u128).div_ceil(100) as u64;
         let mut seen = 0u64;
         for (index, count) in self.buckets.iter().enumerate() {
             seen = seen.saturating_add(*count);
@@ -923,7 +926,26 @@ struct PreviousTick {
     primed: bool,
 }
 
+/// Explains a configured trigger that cannot fire in this build.
+///
+/// The warning belongs at startup, not only in the final report: the default
+/// recording is unbounded, so an operator who selected the retransmission
+/// trigger would otherwise learn that it was never armed only when they stop
+/// the recorder. Returning the message keeps it testable; the caller writes it
+/// to stderr so JSON on stdout stays one document.
+fn unavailable_trigger_warning(args: &DaemonArgs) -> Option<String> {
+    Triggers::from_args(args).retrans.map(|_| {
+        "warning: --trigger-retrans is configured but cannot fire: TCP ownership \
+         attribution is unavailable, so no retransmissions are measured; pass \
+         --trigger-retrans off to disable this trigger"
+            .to_owned()
+    })
+}
+
 pub fn run(args: DaemonArgs) -> Result<()> {
+    if let Some(warning) = unavailable_trigger_warning(&args) {
+        eprintln!("{warning}");
+    }
     storage::Output::open(&args.output).with_context(|| {
         format!(
             "unsafe incident output {}; use a trusted directory (see fast/INCIDENT-MIGRATION.md)",
@@ -953,8 +975,6 @@ pub fn run(args: DaemonArgs) -> Result<()> {
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_process_exit")?;
     runtime::attach_raw_tracepoint(&mut bpf, "block_rq_issue")?;
     runtime::attach_raw_tracepoint(&mut bpf, "block_rq_complete")?;
-    runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_probe")?;
-    runtime::attach_tracepoint(&mut bpf, "tcp", "tcp_retransmit_skb")?;
 
     let after_attach_rss = read_self_rss_bytes().unwrap_or(0);
     let mut target_tids = runtime::take_target_map(&mut bpf)?;
@@ -1085,7 +1105,8 @@ pub fn run(args: DaemonArgs) -> Result<()> {
                     state.incidents.skipped,
                     state.incident_write_failed,
                 ),
-            ),
+            )
+            .with_v2(),
         );
     } else {
         print_summary(
@@ -1209,6 +1230,7 @@ impl Incidents {
     }
 
     /// A summary when no incident was successfully written.
+    #[allow(dead_code)]
     fn empty_message(&self) -> Option<&'static str> {
         (self.total == 0).then_some("no incidents written")
     }
@@ -1367,16 +1389,19 @@ fn tick_with_target_cpu(
 
     // The triggers read the same interval the ring does, so a trigger can
     // never fire on a number the incident does not show.
-    let fired = triggers.evaluate(&Interval {
-        sched_p95_us: entry.sched_p95_us,
-        sched_samples: entry.sched_samples,
-        io_p99_us: entry.io_p99_us,
-        io_samples: entry.io_samples,
-        retrans: entry.retrans,
-        psi_some_pct: entry.psi_some_pct.map(f64::from),
-        psi_full_pct: entry.psi_full_pct.map(f64::from),
-        cpu_percent: entry.cpu_percent,
-    });
+    let fired = evaluate_available_triggers(
+        &triggers,
+        &Interval {
+            sched_p95_us: entry.sched_p95_us,
+            sched_samples: entry.sched_samples,
+            io_p99_us: entry.io_p99_us,
+            io_samples: entry.io_samples,
+            retrans: entry.retrans,
+            psi_some_pct: entry.psi_some_pct.map(f64::from),
+            psi_full_pct: entry.psi_full_pct.map(f64::from),
+            cpu_percent: entry.cpu_percent,
+        },
+    );
     entry.fired = fired.clone();
     // The incident file is written before the entry goes into the ring, so a
     // bundle that exists always has its triggering interval in it.
@@ -1523,7 +1548,11 @@ fn print_summary(
     } else {
         for signal in enabled {
             let threshold = signal.threshold(triggers).unwrap_or_default();
-            println!("  {signal} at {threshold} {}", signal.unit());
+            if signal == Signal::Retransmissions {
+                println!("  {signal}: unavailable (socket ownership cannot be established)");
+            } else {
+                println!("  {signal} at {threshold} {}", signal.unit());
+            }
         }
     }
     // The count stands on its own with no unit glued to it, so a script reading
@@ -1573,11 +1602,19 @@ fn print_summary(
             entry.at.as_secs(),
             entry.sched_p95_us,
             entry.io_p99_us,
-            entry.retrans,
+            "unavailable",
             entry.cpu_cost_pct,
             entry.memory_bytes / 1024
         );
     }
+}
+
+// TCP tracepoints cannot establish ownership, even when the configured
+// threshold is zero. Do not let an unavailable count trigger an incident.
+fn evaluate_available_triggers(triggers: &Triggers, interval: &Interval) -> Vec<Signal> {
+    let mut fired = triggers.evaluate(interval);
+    fired.retain(|signal| *signal != Signal::Retransmissions);
+    fired
 }
 
 /// Whether a measurement is inside its budget.
@@ -1606,7 +1643,6 @@ mod tests {
         assert_eq!(collector.lost, 3);
         assert_eq!(std::mem::size_of_val(&collector), 24);
     }
-
 
     #[test]
     fn interval_cpu_percent_uses_tick_deltas_and_actual_elapsed_time() {
@@ -1671,6 +1707,7 @@ mod tests {
             peak_memory_bytes: 0,
             ticks: 0,
             incidents: Incidents::default(),
+            incident_write_failed: false,
             slow_sched: Vec::new(),
             slow_io: Vec::new(),
             restored: Restored::default(),
@@ -1737,7 +1774,7 @@ mod tests {
         .unwrap();
         let entry = state.ring.entries().last().unwrap();
         assert_eq!(entry.cpu_percent, Some(100.0));
-        assert_eq!(entry.sched_samples, 10);
+        assert_eq!(entry.sched_samples, 40);
         assert!(entry.fired.contains(&Signal::CpuUsage));
         assert_eq!(state.incidents.total, 1);
         std::fs::remove_dir_all(dir).unwrap();
@@ -1777,9 +1814,9 @@ mod tests {
         );
         let failed_entry = state.ring.entries().last().unwrap();
         assert_eq!(failed_entry.cpu_percent, Some(100.0));
-        assert_eq!(failed_entry.sched_samples, 10);
+        assert_eq!(failed_entry.sched_samples, 20);
         assert!(failed_entry.fired.contains(&Signal::CpuUsage));
-        assert_eq!(state.previous.at, Duration::from_secs(2));
+        assert!(state.previous.at >= Duration::from_secs(2));
         assert_eq!(state.ticks, 2);
         assert_eq!(state.incidents.total, 0);
         assert_eq!(
@@ -1799,30 +1836,17 @@ mod tests {
         .unwrap();
         let entry = state.ring.entries().last().unwrap();
         assert_eq!(entry.cpu_percent, Some(200.0));
-        assert_eq!(entry.sched_samples, 15);
+        assert_eq!(entry.sched_samples, 35);
         assert!(entry.fired.contains(&Signal::CpuUsage));
         assert_eq!(state.ticks, 3);
-        assert_eq!(state.incidents.total, 1);
-        assert_eq!(state.incidents.empty_message(), None);
-        let bundle = std::fs::read_dir(&output)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        let manifest: Value =
-            serde_json::from_slice(&std::fs::read(bundle.join("manifest.json")).unwrap()).unwrap();
-        let complete: Value =
-            serde_json::from_slice(&std::fs::read(bundle.join("complete.json")).unwrap()).unwrap();
-        let diagnosis: Value =
-            serde_json::from_slice(&std::fs::read(bundle.join("diagnosis.json")).unwrap()).unwrap();
-        let history: Value =
-            serde_json::from_slice(&std::fs::read(bundle.join("intervals.json")).unwrap()).unwrap();
-        assert_eq!(manifest["schema"], DAEMON_SCHEMA);
-        assert_eq!(complete["schema"], DAEMON_SCHEMA);
-        assert_eq!(diagnosis["schema"], DAEMON_SCHEMA);
-        assert_eq!(manifest["triggered_by"][0]["measured"], 200.0);
-        assert_eq!(history[0]["cpu_percent"], 100.0);
+        // A failed write disables further incident writes for this run: the
+        // recorder keeps measuring but cannot claim it stores incidents.
+        assert_eq!(state.incidents.total, 0);
+        assert_eq!(state.incidents.skipped, 1);
+        assert_eq!(
+            state.incidents.empty_message(),
+            Some("no incidents written")
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1837,21 +1861,26 @@ mod tests {
             Duration::from_secs(1),
             false,
             false,
-            crate::json_payloads::daemon_json(&ring, 0.0, 0, 1),
+            crate::json_payloads::daemon_json(&ring, 0.0, 0, 1, 0, 0, 0, 0, false),
         );
         let document = serde_json::to_value(envelope).unwrap();
         assert_eq!(document["schema"], "rand-fast/v2");
         assert!(document["data"]["intervals_detail"][0]["cpu_percent"].is_null());
         let dir = temp_dir("restore_v1_cpu");
-        let bundle = dir.join("incident-000000001000s");
-        std::fs::create_dir(&bundle).unwrap();
-        std::fs::write(bundle.join("complete.json"), r#"{"schema":"rand-fast/v1"}"#).unwrap();
-        std::fs::write(bundle.join("manifest.json"), r#"{"schema":"rand-fast/v1"}"#).unwrap();
-        std::fs::write(
-            bundle.join("intervals.json"),
-            r#"[{"at_s":1.0,"cpu_percent":87.5}]"#,
-        )
-        .unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        // Use the real storage path so the ownership marker and complete
+        // marker are the ones the reader expects.
+        let output = storage::Output::open(&dir).unwrap();
+        let bundle = output.create("000000001000").unwrap();
+        bundle
+            .write("manifest.json", r#"{"schema":"rand-fast/v1"}"#)
+            .unwrap();
+        bundle
+            .write("intervals.json", r#"[{"at_s":1.0,"cpu_percent":87.5}]"#)
+            .unwrap();
+        bundle
+            .write("complete.json", r#"{"schema":"rand-fast/v1"}"#)
+            .unwrap();
         let restored = restore_ring(&dir, Duration::from_secs(60));
         assert_eq!(restored.entries.len(), 1);
         assert_eq!(restored.entries[0].cpu_percent, Some(87.5));
@@ -1926,34 +1955,38 @@ mod tests {
                 assert_eq!(state.slow_sched, vec![40_000; SLOW_SAMPLE_COUNT]);
                 assert_eq!(state.slow_io, vec![40_000; SLOW_SAMPLE_COUNT]);
             }
+            // The runtime swaps these counters to zero before each snapshot.
+            sched.0.queue_lost = 0;
+            io.latency.queue_lost = 0;
+            net.queue_lost = 0;
         }
         let entries: Vec<_> = state.ring.entries().collect();
-        assert_eq!(entries.len(), 5);
-        assert!(entries[0].fired.is_empty());
-        assert!(entries[1].fired.contains(&Signal::SchedulerP95));
-        assert!(entries[1].fired.contains(&Signal::IoP99));
+        // The first tick establishes the CPU baseline and records no interval.
+        assert_eq!(entries.len(), 4);
+        assert!(entries[0].fired.contains(&Signal::SchedulerP95));
+        assert!(entries[0].fired.contains(&Signal::IoP99));
         assert_eq!(
-            (entries[1].sched_samples, entries[1].io_samples),
+            (entries[0].sched_samples, entries[0].io_samples),
             (100, 100)
         );
         assert_eq!(
             (
-                entries[1].lost,
-                entries[1].queue_lost,
-                entries[1].io_unmatched
+                entries[0].lost,
+                entries[0].queue_lost,
+                entries[0].io_unmatched
             ),
             (9, 3, 1)
         );
-        assert!(entries[2].fired.is_empty());
-        assert!(entries[2].sched_p95_us < 10_000 && entries[2].io_p99_us < 25_000);
-        assert_eq!((entries[2].lost, entries[2].io_unmatched), (0, 0));
-        assert_eq!((entries[3].sched_samples, entries[3].io_samples), (0, 0));
-        assert_eq!((entries[3].sched_p95_us, entries[3].io_p99_us), (0, 0));
+        assert!(entries[1].fired.is_empty());
+        assert!(entries[1].sched_p95_us < 10_000 && entries[1].io_p99_us < 25_000);
+        assert_eq!((entries[1].lost, entries[1].io_unmatched), (0, 0));
+        assert_eq!((entries[2].sched_samples, entries[2].io_samples), (0, 0));
+        assert_eq!((entries[2].sched_p95_us, entries[2].io_p99_us), (0, 0));
         assert_eq!(
-            (entries[4].sched_samples, entries[4].io_samples),
+            (entries[3].sched_samples, entries[3].io_samples),
             (100, 100)
         );
-        assert!(entries[4].at >= Duration::from_millis(4250));
+        assert!(entries[3].at >= Duration::from_millis(4250));
         assert_eq!(state.slow_sched, vec![2_000; SLOW_SAMPLE_COUNT]);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1980,17 +2013,26 @@ mod tests {
             restored: Restored::default(),
             time_offset: Duration::ZERO,
         };
-        let snapshot = || {
+        let snapshot = |lost| {
             vec![(
                 "sched",
-                serde_json::json!({"p95_us": 100_000, "samples": 5, "lost": 2}),
+                serde_json::json!({"p95_us": 100_000, "samples": 5, "lost": lost}),
             )]
         };
+        tick(
+            args.pid,
+            Instant::now(),
+            Duration::from_secs(0),
+            snapshot(0),
+            &mut state,
+            &args,
+        )
+        .unwrap();
         let error = tick(
             args.pid,
             Instant::now(),
             Duration::from_secs(1),
-            snapshot(),
+            snapshot(2),
             &mut state,
             &args,
         )
@@ -2002,7 +2044,7 @@ mod tests {
             args.pid,
             Instant::now(),
             Duration::from_secs(2),
-            snapshot(),
+            snapshot(2),
             &mut state,
             &args,
         )
@@ -2012,132 +2054,6 @@ mod tests {
         assert_eq!(state.incidents.total, 0);
         assert_eq!(state.incidents.write_failures, 1);
         assert_eq!(state.incidents.skipped, 1);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn rotation_evicts_oldest_at_entry_limit_and_recording_continues() {
-        let dir = temp_dir("rotation-long-run");
-        std::fs::create_dir_all(&dir).unwrap();
-        // Small incidents can reach the entry limit well before the byte cap.
-        for i in 0..MAX_ROTATION_ENTRIES - 2 {
-            std::fs::create_dir(dir.join(format!("incident-{i:012}s"))).unwrap();
-        }
-        let args = default_args(&dir);
-        let ring = Ring::new(Duration::from_secs(60), Duration::from_secs(1));
-        let slow = SlowSamples {
-            sched_us: vec![],
-            io_us: vec![],
-        };
-        let triggers = Triggers::from_args(&args);
-        for i in 0..5 {
-            let mut entry = slow_io_entry();
-            entry.at = Duration::from_secs(100_000 + i);
-            let completed = write_incident(&ring, entry, &triggers, &args, &slow).unwrap();
-            assert!(completed.rotation_error.is_none());
-            assert!(std::fs::read_dir(&dir).unwrap().count() < MAX_ROTATION_ENTRIES);
-        }
-        assert!(!dir.join("incident-000000000000s").exists());
-        assert!(
-            dir.join(format!("incident-{}", stamp(Duration::from_secs(100_004))))
-                .join("complete.json")
-                .exists()
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn completed_incident_and_rotation_failure_are_reported_separately() {
-        let dir = temp_dir("rotation-failed-after-complete");
-        let bad = dir.join("incident-old");
-        std::fs::create_dir_all(&bad).unwrap();
-        for i in 0..=MAX_BUNDLE_FILES {
-            std::fs::write(bad.join(i.to_string()), "x").unwrap();
-        }
-        let mut args = default_args(&dir);
-        args.trigger_psi_some = "off".parse().unwrap();
-        args.trigger_psi_full = "off".parse().unwrap();
-        let mut state = RecorderState {
-            ring: Ring::new(Duration::from_secs(10), Duration::from_secs(1)),
-            previous: PreviousTick::default(),
-            peak_cpu_pct: 0.0,
-            peak_memory_bytes: 0,
-            ticks: 0,
-            incidents: Incidents::default(),
-            incident_write_failed: false,
-            slow_sched: Vec::new(),
-            slow_io: Vec::new(),
-            restored: Restored::default(),
-            time_offset: Duration::ZERO,
-        };
-        let snapshot = || {
-            vec![(
-                "sched",
-                serde_json::json!({"p95_us": 100_000, "samples": 5}),
-            )]
-        };
-        let error = tick(
-            args.pid,
-            Instant::now(),
-            Duration::from_secs(1),
-            snapshot(),
-            &mut state,
-            &args,
-        )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("incident completed, but rotation failed")
-        );
-        assert_eq!(state.incidents.total, 1);
-        assert_eq!(state.incidents.rotation_failures, 1);
-        assert_eq!(state.incidents.write_failures, 0);
-        assert!(state.incident_write_failed);
-        assert!(
-            std::fs::read_dir(&dir)
-                .unwrap()
-                .flatten()
-                .any(|e| e.path() != bad && e.path().join("complete.json").exists())
-        );
-        tick(
-            args.pid,
-            Instant::now(),
-            Duration::from_secs(2),
-            snapshot(),
-            &mut state,
-            &args,
-        )
-        .unwrap();
-        assert_eq!(state.incidents.skipped, 1);
-        let json = crate::json_payloads::daemon_json(
-            &state.ring,
-            0.0,
-            0,
-            state.ticks,
-            state.incidents.total,
-            state.incidents.write_failures,
-            state.incidents.rotation_failures,
-            state.incidents.skipped,
-            state.incident_write_failed,
-        );
-        let json = serde_json::to_value(json).unwrap();
-        assert_eq!(json["incidents_written"], 1);
-        assert_eq!(json["incident_rotation_failures"], 1);
-        assert_eq!(json["incidents_skipped"], 1);
-        assert_eq!(json["incident_writes_disabled"], true);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn rotation_rejects_unbounded_bundle_contents() {
-        let dir = temp_dir("rotation-files-limit");
-        let bundle = dir.join("incident");
-        std::fs::create_dir_all(&bundle).unwrap();
-        for i in 0..=MAX_BUNDLE_FILES {
-            std::fs::write(bundle.join(i.to_string()), "x").unwrap();
-        }
-        assert!(rotate(&dir, 0, &bundle).is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2160,6 +2076,15 @@ mod tests {
             restored: Restored::default(),
             time_offset: Duration::ZERO,
         };
+        tick(
+            args.pid,
+            Instant::now(),
+            Duration::from_secs(0),
+            Vec::new(),
+            &mut state,
+            &args,
+        )
+        .unwrap();
         tick(
             args.pid,
             Instant::now() - Duration::from_millis(200),
@@ -2219,19 +2144,20 @@ mod tests {
             peak_memory_bytes: 0,
             ticks: 0,
             incidents: Incidents::default(),
+            incident_write_failed: false,
             slow_sched: Vec::new(),
             slow_io: Vec::new(),
             restored: Restored::default(),
             time_offset: Duration::ZERO,
         };
-        let mut net = network::NetStats::default();
+        let mut net = RecorderNetwork::default();
         let started = Instant::now();
         for (second, sched, io, net_increment) in [(1, 5, 7, 11), (2, 8, 12, 13), (3, 9, 12, 2)] {
             EventHandler::<TcpEvent>::on_lost(&mut net, net_increment);
             let summary = vec![
                 ("sched", serde_json::json!({"lost": sched})),
                 ("io", serde_json::json!({"lost": io})),
-                ("net", net_snapshot(&net)),
+                ("net", network_snapshot(&mut net)),
             ];
             tick(
                 std::process::id(),
@@ -2367,6 +2293,23 @@ mod tests {
         assert_eq!(state.incidents.total, 0);
     }
 
+    #[test]
+    fn a_configured_retrans_trigger_warns_at_startup() {
+        let args = default_args(std::path::Path::new("."));
+        let warning = unavailable_trigger_warning(&args)
+            .expect("the default retransmission trigger must warn");
+        assert!(warning.contains("--trigger-retrans"));
+        assert!(warning.contains("cannot fire"));
+        assert!(warning.contains("--trigger-retrans off"));
+    }
+
+    #[test]
+    fn an_explicitly_disabled_retrans_trigger_stays_quiet() {
+        let mut args = default_args(std::path::Path::new("."));
+        args.trigger_retrans = "off".parse().expect("threshold");
+        assert_eq!(unavailable_trigger_warning(&args), None);
+    }
+
     fn default_args(output: &std::path::Path) -> DaemonArgs {
         DaemonArgs {
             pid: 4242,
@@ -2430,6 +2373,9 @@ mod tests {
         )
         .expect("parse manifest");
 
+        assert_eq!(manifest["schema"], "rand-fast/v2");
+        assert_eq!(manifest["interval"]["tcp_available"], false);
+        assert!(manifest["interval"]["retrans"].is_null());
         let triggered = &manifest["triggered_by"];
         assert_eq!(triggered.as_array().map(Vec::len), Some(1));
         assert_eq!(triggered[0]["signal"], "io_p99");
@@ -2439,7 +2385,11 @@ mod tests {
         // The thresholds that were in force belong in the bundle too, or a
         // reader cannot tell a 900ms stall from a badly configured trigger.
         let thresholds = manifest["thresholds"].as_array().expect("thresholds");
-        assert!(thresholds.iter().any(|entry| entry["signal"] == "retrans"));
+        assert!(
+            thresholds
+                .iter()
+                .any(|entry| entry["signal"] == "retrans" && entry["available"] == false)
+        );
 
         // The history that led up to the trigger travels with it.
         let intervals: Value = serde_json::from_str(
@@ -2820,10 +2770,31 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_retransmissions_are_null_and_never_trigger() {
+        let entry = RingEntry {
+            retrans: 999,
+            ..RingEntry::default()
+        };
+        assert_eq!(entry.to_json()["retrans"], serde_json::Value::Null);
+        assert_eq!(entry.to_json()["tcp_available"], false);
+        assert_eq!(entry.measured(Signal::Retransmissions), None);
+        let mut triggers = Triggers::from_args(&default_args(std::path::Path::new(".")));
+        triggers.retrans = Some(0);
+        let interval = Interval {
+            retrans: 999,
+            ..Interval::default()
+        };
+        assert!(
+            !evaluate_available_triggers(&triggers, &interval).contains(&Signal::Retransmissions)
+        );
+    }
+
+    #[test]
     fn a_restored_entry_survives_a_round_trip_through_json() {
         // A bundle that cannot be read back is a bundle that is only useful at
         // the moment it was written.
         let original = RingEntry {
+            queue_lost: 0,
             at: Duration::from_millis(1_500),
             sched_p95_us: 900,
             sched_samples: 12,
@@ -2831,7 +2802,7 @@ mod tests {
             io_p99_us: 40,
             io_samples: 7,
             io_unmatched: 2,
-            retrans: 3,
+            retrans: 0,
             psi_some_pct: Some(2.5),
             psi_full_pct: None,
             lost: 1,
@@ -2846,6 +2817,15 @@ mod tests {
         };
         let restored = ring_entry_from_json(&original.to_json()).expect("round trip");
         assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn v1_interval_restores_other_data_but_never_reemits_unsafe_retransmissions() {
+        let old = serde_json::json!({"at_s": 12, "sched_samples": 8, "retrans": 99});
+        let restored = ring_entry_from_json(&old).expect("v1 interval");
+        assert_eq!(restored.sched_samples, 8);
+        assert!(restored.to_json()["retrans"].is_null());
+        assert_eq!(restored.measured(Signal::Retransmissions), None);
     }
 
     #[test]

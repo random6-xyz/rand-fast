@@ -350,7 +350,8 @@ impl Output {
                 continue;
             }
             let mut text = String::new();
-            file.take(max_bytes.saturating_add(1)).read_to_string(&mut text)?;
+            file.take(max_bytes.saturating_add(1))
+                .read_to_string(&mut text)?;
             if text.len() as u64 > max_bytes {
                 anyhow::bail!("restored interval history exceeds {max_bytes} bytes");
             }
@@ -538,7 +539,7 @@ mod tests {
         old.write("summary.txt", &"x".repeat(50)).unwrap();
         let current = output.create("000000002000s").unwrap();
         current.write("summary.txt", &"y".repeat(20)).unwrap();
-        assert_eq!(output.read_latest().unwrap(), Some("[]".to_string()));
+        assert_eq!(output.read_latest(1024).unwrap(), Some("[]".to_string()));
         let old_size = output.inspect(OsStr::new(old.name())).unwrap().unwrap();
         let current_size = output.inspect(OsStr::new(current.name())).unwrap().unwrap();
         let retained = 104 + 80 + current_size;

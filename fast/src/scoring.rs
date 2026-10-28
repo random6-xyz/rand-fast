@@ -254,7 +254,7 @@ fn score_network(evidence: &Evidence) -> Option<Severity> {
             evidence,
         ),
         evidence: format!(
-            "{:.0}% of {} us off-CPU waiting on a socket; retransmission rate unavailable (transmitted segment count not collected)",
+            "{:.0}% of {} us off-CPU waiting on a socket; TCP attribution and retransmission rate unavailable",
             evidence.offcpu_network_ratio.clamp(0.0, 1.0) * 100.0,
             evidence.offcpu_total_us
         ),
@@ -521,6 +521,8 @@ mod tests {
         let evidence = Evidence {
             net_samples: 20_000,
             retransmissions: 20_000,
+            tcp_available: false,
+            retrans_ratio: None,
             ..idle()
         };
         assert!(score(&evidence).is_empty());
@@ -538,6 +540,17 @@ mod tests {
                 .iter()
                 .any(|item| item.contains("rate unavailable"))
         );
+    }
+
+    #[test]
+    fn unavailable_tcp_is_not_scored_even_with_stale_values() {
+        let evidence = Evidence {
+            net_samples: 20_000,
+            retrans_ratio: Some(0.9),
+            tcp_available: false,
+            ..idle()
+        };
+        assert!(!score(&evidence).iter().any(|d| d.cause == "Network"));
     }
 
     #[test]
