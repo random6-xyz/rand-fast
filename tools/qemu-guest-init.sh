@@ -120,7 +120,7 @@ fi
 export FAST=/bin/fast
 export SCHED_WORKLOAD=/bin/sched-workload
 export FAST_WORKLOAD=/bin/fast-workload
-export OUT_DIR=/tmp/fast-smoke
+export OUT_DIR=/fast-smoke
 export IO_HOG_PATH
 
 # The per-run collection window is passed on the kernel command line as

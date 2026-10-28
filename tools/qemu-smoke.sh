@@ -17,7 +17,7 @@
 #
 # Environment overrides:
 #   DURATION    per-run collection length (default 5s)
-#   OUT_DIR     where raw reports are written (default /tmp/fast-smoke)
+#   OUT_DIR     where raw reports are written (default /fast-smoke)
 #   IO_HOG_PATH file the io-hog reads; put it on a real block device (not
 #               tmpfs) so block_rq_* tracepoints fire (default /tmp/fast-workload-io)
 #
@@ -29,7 +29,7 @@ FAST=${FAST:-./fast}
 SCHED_WORKLOAD=${SCHED_WORKLOAD:-./sched-workload}
 FAST_WORKLOAD=${FAST_WORKLOAD:-./fast-workload}
 DURATION=${DURATION:-5s}
-OUT_DIR=${OUT_DIR:-/tmp/fast-smoke}
+OUT_DIR=${OUT_DIR:-/fast-smoke}
 IO_HOG_PATH=${IO_HOG_PATH:-/tmp/fast-workload-io}
 FAILURES=0
 PID_MAX_ORIGINAL=
