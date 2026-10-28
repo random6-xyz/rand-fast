@@ -173,7 +173,11 @@ cp "$ROOT/tools/qemu-smoke.sh" "$STAGE/tools/qemu-smoke.sh"
 cp "$ROOT/tools/qemu-guest-init.sh" "$STAGE/init"
 
 log "packing the initramfs"
-( cd "$STAGE" && find . | cpio -o -H newc 2>/dev/null | gzip -1 ) > "$INITRAMFS" \
+# The initramfs is packed by an unprivileged user, but the guest runs as
+# root on a root-owned rootfs. Without --owner the archive preserves the
+# host uid, and the incident store correctly refuses to write under an
+# ancestor that belongs to a different unprivileged user.
+( cd "$STAGE" && find . | cpio -o -H newc --owner=0:0 2>/dev/null | gzip -1 ) > "$INITRAMFS" \
     || die "failed to pack the initramfs"
 
 # --- boot -------------------------------------------------------------------
