@@ -948,7 +948,7 @@ pub fn run(args: DaemonArgs) -> Result<()> {
     }
     storage::Output::open(&args.output).with_context(|| {
         format!(
-            "unsafe incident output {}; use a trusted directory (see fast/INCIDENT-MIGRATION.md)",
+            "unsafe incident output {}; use a trusted directory (see docs/reference.md)",
             args.output.display()
         )
     })?;

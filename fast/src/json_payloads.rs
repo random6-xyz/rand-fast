@@ -4,8 +4,8 @@
 //! whole schema can be read in one place, and that the naming rules the
 //! envelope documents are applied uniformly: latencies in microseconds with a
 //! `_us` suffix, rates per second with `_per_s`, byte counts in bytes with
-//! `_bytes`, and an unknown value omitted rather than serialised as null,
-//! except for the explicitly unavailable v2 retransmission ratio.
+//! `_bytes`. V2 uses null for explicitly unavailable measurements, including
+//! TCP data and daemon interval CPU usage.
 
 use std::time::Duration;
 
