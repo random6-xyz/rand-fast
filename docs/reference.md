@@ -164,11 +164,46 @@ all fields are numeric.
   scope.
 - Tracepoint layouts are checked at startup. An unrecognized layout is rejected
   rather than interpreted using unverified offsets. See the requirements in the
-  [README](../README.md#requirements).
+  [README](../README.md#requirements) and the support policy below.
 - PSI may be unavailable when the kernel lacks `CONFIG_PSI`. Data loss and
   approximate recorder percentiles can affect interpretation.
 - Collection has overhead. On the QEMU fixtures, the recorded daemon peak was
   around 4–7% of one CPU; the cost depends on the workload and host.
+
+### Tested kernels and support policy
+
+The compatibility matrix pins a source tarball, a checksum, a configuration
+profile and a build record for each cell. A version is advertised as supported
+only when its required real-kernel verifier and collector checks pass; a boot
+or a skipped check is never evidence of support.
+
+| CI cell | Kernel | Scheduler, CPU, block I/O, off-CPU, memory | TCP attribution |
+| --- | --- | --- | --- |
+| `6.1.191` | 6.1.191 | supported | unavailable |
+| `6.6.161` | 6.6.161 | supported | unavailable |
+| `6.12.115` | 6.12.115 | supported | unavailable |
+| `7.2.15` | 7.2.15 | supported | unavailable |
+| `6.12.115-nopsi` | 6.12.115 | supported; PSI unavailable is explicit | unavailable |
+
+Layout fixtures also exist for 6.12.105 and 7.2.0-rc6, the kernels that were
+validated before the matrix was introduced. They are retained as regression
+fixtures for the same layout family as 6.12.115 and 7.2.15, but they are not
+separate CI cells and are not advertised as independently supported cells.
+
+The layout fixtures record the exact consumed tracepoint fields for each
+kernel. 6.1 and 6.6 expose `tcp_probe` without an `skaddr` field, so the
+existing TCP profile is not applicable there; TCP is disabled on every kernel
+for the ownership reason below, and the matrix therefore tests the non-TCP
+collectors. PSI is enabled in the matrix profiles, and the separate 6.12.115
+`nopsi` cell proves that missing memory pressure information is reported as
+unavailable rather than as zero.
+
+To add a kernel: pin its tarball URL and SHA256 in `tools/kernel/kernels.tsv`
+with a configuration profile, add the matrix cell, build the image, capture the
+tracefs formats the collectors read, add a fixture and make the fixture test
+validate every consumed field, then record the cell result in this table. A
+layout change is handled by adding an explicit verified profile, never by
+loosening the comparison to guessed offsets.
 
 ### TCP attribution
 

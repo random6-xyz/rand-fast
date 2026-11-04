@@ -13,8 +13,10 @@ A flight recorder can also retain recent intervals when a trigger fires.
 - Permission to load eBPF and open perf events: root, or `CAP_BPF` and
   `CAP_PERFMON` on kernel 5.8+, or `CAP_SYS_ADMIN` on older kernels.
 - Recognized scheduler, block-request, and TCP tracepoint layouts. Unrecognized
-  layouts are rejected at startup; layouts have been verified on Linux 6.12.105
-  and 7.2.0-rc6.
+  layouts are rejected at startup. The CI matrix pins Linux 6.1.191, 6.6.161,
+  6.12.115 and 7.2.15, plus a PSI-off 6.12.115 cell; layout fixtures also cover
+  6.12.105 and 7.2.0-rc6. See the
+  [support policy](docs/reference.md#tested-kernels-and-support-policy).
 
 TCP RTT and retransmission attribution is **unavailable**: the tracepoints do
 not reliably identify a socket's owning process. Network ranking may still use
