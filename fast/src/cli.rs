@@ -381,7 +381,7 @@ pub struct DaemonArgs {
     ///
     /// The path must have trusted owners, no symlinks, and no group/other-writable
     /// output directory. If HOME is unavailable or not absolute, non-root uses
-    /// /tmp/rand-fast-UID/incidents. See fast/INCIDENT-MIGRATION.md for upgrades.
+    /// /tmp/rand-fast-UID/incidents. See docs/reference.md for upgrades.
     #[arg(long, default_value_os_t = default_daemon_output())]
     pub output: std::path::PathBuf,
 

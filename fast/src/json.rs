@@ -37,9 +37,9 @@
 //! The `schema` field is the contract. Within a major version, fields are only
 //! added, never removed or retyped; a breaking change bumps the number. A
 //! consumer should ignore fields it does not recognise, which is what makes
-//! adding one safe. `net` and `diagnose` use v2 because the invalid v1
-//! retransmission ratio is now null instead of a number. Other commands remain
-//! on v1. Consumers must dispatch on both schema and command.
+//! adding one safe. `net`, `diagnose`, and `daemon` use v2 for unavailable
+//! measurements; other commands remain on v1. Consumers must dispatch on both
+//! schema and command.
 
 use std::time::Duration;
 
