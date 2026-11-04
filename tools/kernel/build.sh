@@ -6,37 +6,42 @@
 # tools/kernel/config.fragment, and the result is cached by version + fragment
 # hash so repeated CI runs do not rebuild it. Nothing here needs host root.
 #
-# Usage: tools/kernel/build.sh <version> [--force]
+# Usage: tools/kernel/build.sh <id> [--force]
 # Prints the absolute bzImage path on stdout. Diagnostics go to stderr.
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 TSV="$ROOT/tools/kernel/kernels.tsv"
-FRAGMENT="$ROOT/tools/kernel/config.fragment"
 CACHE=${KERNEL_CACHE:-"$HOME/.cache/rand-fast-kernels"}
 JOBS=${KERNEL_JOBS:-$( (getconf _NPROCESSORS_ONLN || nproc) 2>/dev/null || echo 4 )}
 
 usage() {
-    echo "usage: tools/kernel/build.sh <version> [--force]" >&2
+    echo "usage: tools/kernel/build.sh <id> [--force]" >&2
     exit 2
 }
 
 [ $# -ge 1 ] || usage
-VERSION=$1
+ID=$1
 FORCE=0
 [ "${2:-}" = "--force" ] && FORCE=1
 
-row=$(awk -F '\t' -v v="$VERSION" '$1 == v { print; exit }' "$TSV")
+row=$(awk -F '\t' -v v="$ID" '$1 == v { print; exit }' "$TSV")
 [ -n "$row" ] || {
-    echo "kernel-build: $VERSION is not pinned in $TSV" >&2
+    echo "kernel-build: $ID is not pinned in $TSV" >&2
     exit 1
 }
-URL=$(printf '%s\n' "$row" | cut -f2)
-SHA256=$(printf '%s\n' "$row" | cut -f3)
-TOOLCHAIN=$(printf '%s\n' "$row" | cut -f4)
-PROFILE=$(printf '%s\n' "$row" | cut -f5)
-[ "$PROFILE" = default ] || {
-    echo "kernel-build: unsupported config profile: $PROFILE" >&2
+VERSION=$(printf '%s\n' "$row" | cut -f2)
+PROFILE=$(printf '%s\n' "$row" | cut -f3)
+URL=$(printf '%s\n' "$row" | cut -f4)
+SHA256=$(printf '%s\n' "$row" | cut -f5)
+TOOLCHAIN=$(printf '%s\n' "$row" | cut -f6)
+if [ "$PROFILE" = default ]; then
+    FRAGMENT="$ROOT/tools/kernel/config.fragment"
+else
+    FRAGMENT="$ROOT/tools/kernel/config.$PROFILE.fragment"
+fi
+[ -r "$FRAGMENT" ] || {
+    echo "kernel-build: no config fragment for profile $PROFILE" >&2
     exit 1
 }
 [ "$TOOLCHAIN" = gcc ] || {
@@ -45,16 +50,18 @@ PROFILE=$(printf '%s\n' "$row" | cut -f5)
 }
 
 config_sha=$(sha256sum "$FRAGMENT" | awk '{print $1}')
-out="$CACHE/$VERSION"
+out="$CACHE/$ID"
 meta="$out/meta.txt"
-expected_meta="version=$VERSION
+expected_meta="id=$ID
+version=$VERSION
+profile=$PROFILE
 toolchain=$TOOLCHAIN
 config_sha256=$config_sha
 tarball_sha256=$SHA256"
 
 if [ "$FORCE" -eq 0 ] && [ -s "$out/bzImage" ] && [ -f "$meta" ] \
     && [ "$(cat "$meta")" = "$expected_meta" ]; then
-    echo "kernel-build: reusing cached $VERSION" >&2
+    echo "kernel-build: reusing cached $ID" >&2
     printf '%s\n' "$out/bzImage"
     exit 0
 fi
@@ -76,7 +83,7 @@ actual=$(sha256sum "$tarball" | awk '{print $1}')
     exit 1
 }
 
-work="$CACHE/build/$VERSION"
+work="$CACHE/build/$ID"
 rm -rf "$work"
 mkdir -p "$work/obj"
 # A failed build must not leave a multi-GiB tree in the cache.
@@ -89,7 +96,7 @@ src="$work/linux-$VERSION"
     exit 1
 }
 
-echo "kernel-build: defconfig + required facilities for $VERSION" >&2
+echo "kernel-build: defconfig + required facilities for $ID ($PROFILE)" >&2
 make -C "$src" O="$work/obj" ARCH=x86_64 defconfig >/dev/null
 "$src/scripts/kconfig/merge_config.sh" -m -O "$work/obj" \
     "$work/obj/.config" "$FRAGMENT" >/dev/null
@@ -103,12 +110,17 @@ make -C "$src" O="$work/obj" ARCH=x86_64 -j"$JOBS" bzImage >/dev/null
 missing=""
 for symbol in CONFIG_BPF CONFIG_BPF_SYSCALL CONFIG_BPF_EVENTS CONFIG_DEBUG_INFO_BTF \
     CONFIG_FTRACE CONFIG_TRACEPOINTS CONFIG_KPROBES CONFIG_PERF_EVENTS \
-    CONFIG_PSI CONFIG_VIRTIO_BLK CONFIG_EXT4_FS CONFIG_SERIAL_8250_CONSOLE \
+    CONFIG_VIRTIO_BLK CONFIG_EXT4_FS CONFIG_SERIAL_8250_CONSOLE \
     CONFIG_IKCONFIG_PROC; do
     if ! grep -q "^$symbol=y" "$work/obj/.config"; then
         missing="$missing $symbol"
     fi
 done
+if [ "$PROFILE" = nopsi ]; then
+    grep -q '^# CONFIG_PSI is not set' "$work/obj/.config" || missing="$missing CONFIG_PSI-disabled"
+else
+    grep -q '^CONFIG_PSI=y' "$work/obj/.config" || missing="$missing CONFIG_PSI=y"
+fi
 if [ -n "$missing" ]; then
     echo "kernel-build: required configuration missing:$missing" >&2
     echo "kernel-build: see $work/obj/.config" >&2
@@ -119,9 +131,16 @@ cp "$work/obj/arch/x86/boot/bzImage" "$out/bzImage"
 cp "$work/obj/.config" "$out/config"
 cat "$src/include/config/kernel.release" >"$out/kernel.release" 2>/dev/null \
     || cat "$work/obj/include/config/kernel.release" >"$out/kernel.release"
+release=$(cat "$out/kernel.release")
+[ "$release" = "$VERSION" ] || {
+    echo "kernel-build: built release '$release' does not match pinned version '$VERSION'" >&2
+    exit 1
+}
 printf '%s\n' "$expected_meta" >"$meta"
 {
+    echo "id=$ID"
     echo "version=$VERSION"
+    echo "profile=$PROFILE"
     echo "source=$URL"
     echo "sha256=$SHA256"
     echo "config_sha256=$config_sha"

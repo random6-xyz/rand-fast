@@ -7,12 +7,14 @@
 # small machine-readable cell record for the job artifact.
 #
 # Usage: tools/check-qemu-results.sh --log <guest.log> --kernel <version>
-#        [--accelerator kvm|tcg] [--scenarios N] [--output <cell.json>]
+#        [--accelerator kvm|tcg] --psi yes|no [--scenarios N]
+#        [--output <cell.json>]
 set -u
 
 log=""
 kernel=""
 accelerator=""
+psi=""
 scenarios=""
 output=""
 
@@ -21,10 +23,11 @@ while [ $# -gt 0 ]; do
         --log) log=$2; shift 2 ;;
         --kernel) kernel=$2; shift 2 ;;
         --accelerator) accelerator=$2; shift 2 ;;
+        --psi) psi=$2; shift 2 ;;
         --scenarios) scenarios=$2; shift 2 ;;
         --output) output=$2; shift 2 ;;
         -h|--help)
-            sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -43,15 +46,16 @@ done
     exit 2
 }
 
+problems=""
+
 if [ -z "$scenarios" ]; then
     table=$(dirname "$0")/scenarios.sh
     scenarios=$(sed -n 's/^SCENARIO_COUNT=\([0-9][0-9]*\)$/\1/p' "$table" 2>/dev/null)
 fi
 case "$scenarios" in
-    ''|*[!0-9]*) problems="scenarios-unknown" ;;
+    ''|*[!0-9]*) problems="$problems scenarios-unknown" ;;
+    0) problems="$problems scenarios-zero" ;;
 esac
-
-problems=""
 
 require() {
     grep -Fq -- "$1" "$log" || problems="$problems missing:$2"
@@ -77,6 +81,25 @@ require "memory verifier: pass" "memory-verifier"
 require "net collection: pass" "net-collection"
 require "diagnose verifier: pass" "diagnose-verifier"
 require "TCP unavailable contract: pass" "tcp-contract"
+
+# PSI is a genuine optional capability. The caller states what this image was
+# built with, and the guest proves it from /proc rather than from the build
+# record: unavailable must be reported as unavailable, never as zero pressure.
+case "$psi" in
+    yes|no) ;;
+    "") problems="$problems psi-missing" ;;
+    *) problems="$problems psi-argument=$psi" ;;
+esac
+case "$psi" in
+    yes)
+        require "guest: pressure/memory available" "psi-available"
+        require "guest: config PSI=y" "psi-config"
+        ;;
+    no)
+        require "guest: pressure/memory unavailable" "psi-unavailable"
+        require "guest: config PSI=disabled" "psi-config-disabled"
+        ;;
+esac
 
 # The guest records which accelerator it actually used; the caller may pin it
 # (a self-hosted runner with KVM), and a mismatch is a failure. When omitted,
@@ -117,8 +140,8 @@ if [ -n "$problems" ]; then
 fi
 
 if [ -n "$output" ]; then
-    printf '{"schema":"rand-fast/qemu-cell/v1","kernel":"%s","accelerator":"%s","scenario_count":%s,"scenarios_passed":%s,"result":"%s","log":"%s","problems":"%s"}\n' \
-        "$kernel" "${accelerator:-unknown}" "${scenarios:-0}" "${passed_scenarios:-0}" \
+    printf '{"schema":"rand-fast/qemu-cell/v1","kernel":"%s","accelerator":"%s","psi":"%s","scenario_count":%s,"scenarios_passed":%s,"result":"%s","log":"%s","problems":"%s"}\n' \
+        "$kernel" "${accelerator:-unknown}" "${psi:-unknown}" "${scenarios:-0}" "${passed_scenarios:-0}" \
         "$result" "$log" "${problems# }" >"$output"
 fi
 
