@@ -9,6 +9,8 @@ scenario_kind_0='positive'
 scenario_duration_0='4'
 scenario_prereqs_0='tracefs btf'
 scenario_fixture_0='sched-workloadhog--duration6s--workers1'
+scenario_measured_0='cpu_percent'
+scenario_expected_0='CPU contention'
 scenario_bg_0_count=0
 scenario_check_0() {
     measured_min cpu_percent 5
@@ -21,6 +23,8 @@ scenario_kind_1='positive'
 scenario_duration_1='4'
 scenario_prereqs_1='tracefs btf cpu2'
 scenario_fixture_1='sched-workloadtarget--duration6s--period5ms'
+scenario_measured_1='cpu_percent sched_p95_us'
+scenario_expected_1='Scheduler latency'
 scenario_bg_1_count=2
 scenario_bg_1_0='sched-workloadhog--duration8s--workers8'
 scenario_bg_1_1='sched-workloadhog--duration8s--workers8'
@@ -28,6 +32,7 @@ scenario_check_1() {
     measured_min sched_p95_us 1000
     measured_max cpu_percent 80
     contains_any 'Scheduler latency'
+    report_p95_min 1000
     report_ops_min 1
 }
 
@@ -36,6 +41,8 @@ scenario_kind_2='positive'
 scenario_duration_2='4'
 scenario_prereqs_2='tracefs btf block_device'
 scenario_fixture_2='fast-workloadio-hog--duration6s--workers2--path@IO_HOG_PATH@--size-mib64'
+scenario_measured_2='io_samples'
+scenario_expected_2='Disk I/O'
 scenario_bg_2_count=0
 scenario_check_2() {
     measured_min io_samples 1
@@ -48,6 +55,8 @@ scenario_kind_3='positive'
 scenario_duration_3='4'
 scenario_prereqs_3='tracefs btf'
 scenario_fixture_3='fast-workloadlock-hog--duration6s--workers16--hold-ms1'
+scenario_measured_3='offcpu_futex_ratio offcpu_samples'
+scenario_expected_3='Lock contention'
 scenario_bg_3_count=0
 scenario_check_3() {
     measured_min offcpu_samples 100
@@ -61,6 +70,8 @@ scenario_kind_4='positive'
 scenario_duration_4='4'
 scenario_prereqs_4='tracefs btf'
 scenario_fixture_4='fast-workloadmem-hog--duration6s--workers1--size-mib1024'
+scenario_measured_4='minor_faults_per_s'
+scenario_expected_4='Memory pressure'
 scenario_bg_4_count=0
 scenario_check_4() {
     measured_min minor_faults_per_s 100
@@ -73,6 +84,8 @@ scenario_kind_5='positive'
 scenario_duration_5='4'
 scenario_prereqs_5='tracefs btf'
 scenario_fixture_5='fast-workloadnet-hog--duration6s--workers2--delay-ms600'
+scenario_measured_5='offcpu_network_ratio offcpu_samples'
+scenario_expected_5='Network'
 scenario_bg_5_count=0
 scenario_check_5() {
     measured_min offcpu_samples 10
@@ -86,6 +99,8 @@ scenario_kind_6='mixed'
 scenario_duration_6='4'
 scenario_prereqs_6='tracefs btf block_device'
 scenario_fixture_6='fast-workloadmixed-hog--duration6s--workers16--hold-ms1--path@IO_HOG_PATH@--size-mib32--io-workers1'
+scenario_measured_6='io_samples offcpu_futex_ratio'
+scenario_expected_6='Lock contentionDisk I/O'
 scenario_bg_6_count=0
 scenario_check_6() {
     measured_min io_samples 1
@@ -99,11 +114,14 @@ scenario_kind_7='positive'
 scenario_duration_7='4'
 scenario_prereqs_7='tracefs btf'
 scenario_fixture_7='fast-workloadnet-hog--duration6s--workers2--peer-delay-ms100'
+scenario_measured_7='offcpu_network_ratio offcpu_samples'
+scenario_expected_7='Network'
 scenario_bg_7_count=0
 scenario_check_7() {
     measured_min offcpu_samples 10
     measured_min offcpu_network_ratio 0.1
     contains_any 'Network'
+    report_p95_min 50000
     report_ops_min 1
 }
 
@@ -112,10 +130,11 @@ scenario_kind_8='control'
 scenario_duration_8='4'
 scenario_prereqs_8='tracefs btf'
 scenario_fixture_8='sched-workloadtarget--duration6s--period50ms'
+scenario_measured_8='cpu_percent sched_samples'
+scenario_expected_8=''
 scenario_bg_8_count=0
 scenario_check_8() {
     measured_max cpu_percent 20
-    measured_min cpu_samples 1
     measured_min sched_samples 1
     exclude_causes 'CPU contention' 'Scheduler latency' 'Disk I/O' 'Lock contention' 'Memory pressure' 'Network'
     report_ops_min 1

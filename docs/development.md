@@ -62,7 +62,37 @@ measurement, and `--ready-file` replaces fixed sleeps during startup.
 Scenario kinds separate proof from ranking work: `positive` cases must produce
 the declared measurement and at least one declared cause, `mixed` cases must
 produce both declared signals and one accepted cause, and the `control` case
-must not report any bottleneck cause. Ranking accuracy is evaluated separately.
+must not report any bottleneck cause.
+
+### Ranking accuracy
+
+Ranking accuracy is measured separately by `tools/rank-eval.sh`, which repeats
+every declared scenario (`RANK_REPETITIONS`, default 3), keeps each diagnose
+document and fixture report under `$OUT_DIR/rank/raw/`, and writes
+`runs.tsv`, `rank-report.json`, and `rank-summary.txt`. The guest has no shared
+filesystem with the host, so the guest init prints the report, the row table,
+the summary, and every raw document into the console log that `qemu-run.sh`
+keeps as `$OUT_DIR/guest.log`; those are the CI artifacts. A host run leaves
+the same content as files under `$RANK_OUT`.
+
+The report separates two things that must not be confused:
+
+- **Deterministic checks**: every run must satisfy its scenario's declared
+  measurements and causes, including the control's excluded causes. A single
+  violation fails the run.
+- **Descriptive rates**: top-1 and top-3 rates, control false positives,
+  missing-evidence runs, and lost-event runs are published so a systematic
+  misclassification can be argued from data rather than guessed at.
+
+Scoring is changed only when these rates show a reproduced misclassification;
+the raw documents stay in the artifact set so the change can be checked. One
+limitation is visible in the data rather than hidden by it: a fixture whose
+target sleeps between cycles reports that self-imposed sleep as `Other waiting`,
+so scheduler contention can be the second cause (top-3) while `Other waiting`
+keeps the top-1 share. The manifest therefore requires the scheduler signal to
+be present and ranked, not to outrank the fixture's own sleep.
+Enable the evaluation with `RANK_EVAL=1 tools/qemu-run.sh` (the guest repeats
+the matrix once more and gates on the deterministic checks).
 
 ### QEMU gate
 
@@ -74,6 +104,7 @@ requirements above.
 
 ```bash
 KERNEL=/path/to/bzImage tools/qemu-run.sh --duration 5s
+RANK_EVAL=1 KERNEL=/path/to/bzImage tools/qemu-run.sh
 ```
 
 The runner builds release binaries and an initramfs, boots the guest under KVM,

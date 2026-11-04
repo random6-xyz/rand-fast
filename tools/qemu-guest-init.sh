@@ -123,6 +123,9 @@ export FAST=/bin/fast
 export SCHED_WORKLOAD=/bin/sched-workload
 export FAST_WORKLOAD=/bin/fast-workload
 export OUT_DIR=/fast-smoke
+export FAST_ACCEL=${FAST_ACCEL:-unknown}
+export RANK_EVAL=${RANK_EVAL:-0}
+export RANK_REPETITIONS=${RANK_REPETITIONS:-3}
 export IO_HOG_PATH
 export FAST_BLOCK_DEVICE
 
@@ -135,6 +138,9 @@ if [ -r /proc/cmdline ]; then
         case "$arg" in
         fast.duration=*) DURATION=${arg#fast.duration=} ;;
         fast.smoke_case=tcp-unavailable) export QEMU_SMOKE_TEST_CASE=tcp-unavailable ;;
+        fast.accel=*) export FAST_ACCEL=${arg#fast.accel=} ;;
+        fast.rank_eval=*) export RANK_EVAL=${arg#fast.rank_eval=} ;;
+        fast.rank_repetitions=*) export RANK_REPETITIONS=${arg#fast.rank_repetitions=} ;;
         esac
     done
 fi
@@ -157,6 +163,23 @@ for f in "$OUT_DIR"/*.txt; do
 done
 # The diagnose scenario documents are single-line JSON, so they are dumped
 # wrapped rather than raw, to keep the console log readable.
+if [ -r "$OUT_DIR/rank/runs.tsv" ]; then
+    echo "----- $OUT_DIR/rank/runs.tsv -----"
+    cat "$OUT_DIR/rank/runs.tsv"
+fi
+if [ -r "$OUT_DIR/rank/rank-summary.txt" ]; then
+    echo "----- $OUT_DIR/rank/rank-summary.txt -----"
+    cat "$OUT_DIR/rank/rank-summary.txt"
+fi
+if [ -r "$OUT_DIR/rank/rank-report.json" ]; then
+    echo "----- $OUT_DIR/rank/rank-report.json -----"
+    tr ',' '\n' <"$OUT_DIR/rank/rank-report.json"
+fi
+for f in "$OUT_DIR"/rank/raw/*.json; do
+    [ -f "$f" ] || continue
+    echo "----- $f -----"
+    tr ',' '\n' <"$f"
+done
 for f in "$OUT_DIR"/scenario-*.json; do
     [ -f "$f" ] || continue
     echo "----- $f -----"
