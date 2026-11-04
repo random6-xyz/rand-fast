@@ -615,6 +615,128 @@ check_memory_verdict() {
 # measurements from several streams at once: a process that blocks on a futex
 # must show off-CPU waits, and the same run must also show scheduler latency,
 # because both come out of one collection over one window.
+check_diagnose_progress() {
+    # Progress is an observation, not a report: every assertion here is about
+    # stderr, and the stdout document is checked for byte-level stability.
+    local work="$OUT_DIR/progress"
+    local problems=""
+    rm -rf "$work"
+    mkdir -p "$work"
+
+    "$SCHED_WORKLOAD" target --duration 20s --period 5ms >/dev/null 2>&1 &
+    local alive_pid=$!
+    sleep 0.3
+
+    # Default: no progress flag means no stderr at all.
+    if "$FAST" diagnose --pid "$alive_pid" --duration 1s --format json \
+        >"$work/default.json" 2>"$work/default.err"; then
+        [ -s "$work/default.err" ] && problems="$problems default-stderr"
+        grep -q '"schema":"rand-fast/v2"' "$work/default.json" \
+            || problems="$problems default-json"
+        [ "$(wc -l <"$work/default.json")" -eq 1 ] \
+            || problems="$problems default-not-single-line"
+    else
+        problems="$problems default-exit"
+    fi
+
+    # Enabled with JSON: progress on stderr, exactly one JSON document on stdout.
+    if "$FAST" diagnose --pid "$alive_pid" --duration 2s --progress --format json \
+        >"$work/json.json" 2>"$work/json.err"; then
+        grep -q 'progress: collecting for 2s' "$work/json.err" \
+            || problems="$problems json-start"
+        grep -q 'progress: complete after' "$work/json.err" \
+            || problems="$problems json-complete"
+        grep -q '([0-9][0-9]*%)' "$work/json.err" \
+            || problems="$problems json-update"
+        grep -q '"schema":"rand-fast/v2"' "$work/json.json" \
+            || problems="$problems json-schema"
+        [ "$(wc -l <"$work/json.json")" -eq 1 ] \
+            || problems="$problems json-not-single-line"
+    else
+        problems="$problems json-exit"
+    fi
+
+    # Text report is unchanged as well.
+    if "$FAST" diagnose --pid "$alive_pid" --duration 1s --progress \
+        >"$work/text.out" 2>"$work/text.err"; then
+        grep -q '^Ranked causes' "$work/text.out" \
+            || problems="$problems text-report"
+        grep -q 'progress: complete after' "$work/text.err" \
+            || problems="$problems text-complete"
+    else
+        problems="$problems text-exit"
+    fi
+
+    # A run shorter than the update interval prints start and status only, and
+    # never claims a percentage it did not reach.
+    if "$FAST" diagnose --pid "$alive_pid" --duration 300ms --progress --format json \
+        >"$work/short.json" 2>"$work/short.err"; then
+        grep -q 'progress: collecting for 300ms' "$work/short.err" \
+            || problems="$problems short-start"
+        grep -q 'progress: complete after' "$work/short.err" \
+            || problems="$problems short-complete"
+        [ "$(wc -l <"$work/short.err")" -eq 2 ] \
+            || problems="$problems short-line-count"
+        grep -q '(100%)' "$work/short.err" && problems="$problems short-100"
+    else
+        problems="$problems short-exit"
+    fi
+
+    # Ctrl-C ends the collection; it must not print a completion line.
+    "$FAST" diagnose --pid "$alive_pid" --duration 30s --progress --format json \
+        >"$work/interrupted.json" 2>"$work/interrupted.err" &
+    local interrupted_pid=$!
+    # The interrupt must land after the handler is installed. The first update
+    # line can only appear once the collection loop is running, so wait for it
+    # rather than for a fixed sleep that a slow guest can outrun.
+    local waited=0
+    while [ "$waited" -lt 40 ] && ! grep -q '([0-9][0-9]*%)' "$work/interrupted.err"; do
+        sleep 0.2
+        waited=$((waited + 1))
+    done
+    if ! grep -q '([0-9][0-9]*%)' "$work/interrupted.err"; then
+        problems="$problems interrupt-never-started"
+    fi
+    kill -INT "$interrupted_pid" 2>/dev/null
+    if ! wait "$interrupted_pid"; then
+        problems="$problems interrupt-exit"
+    fi
+    grep -q 'progress: interrupted after' "$work/interrupted.err" \
+        || problems="$problems interrupt-status"
+    grep -q 'progress: complete' "$work/interrupted.err" \
+        && problems="$problems interrupt-complete"
+    grep -q 'progress: failed' "$work/interrupted.err" \
+        && problems="$problems interrupt-failed"
+    grep -q '(100%)' "$work/interrupted.err" \
+        && problems="$problems interrupt-100"
+
+    kill "$alive_pid" 2>/dev/null
+    wait "$alive_pid" 2>/dev/null
+
+    # Target exit ends the collection through the process-exited path. The
+    # fixture is long enough that slow program attachment cannot outlive it.
+    "$SCHED_WORKLOAD" target --duration 3s --period 5ms >/dev/null 2>&1 &
+    local short_target_pid=$!
+    sleep 0.2
+    if "$FAST" diagnose --pid "$short_target_pid" --duration 10s --progress --format json \
+        >"$work/exited.json" 2>"$work/exited.err"; then
+        grep -q 'progress: target exited after' "$work/exited.err" \
+            || problems="$problems exit-status"
+        grep -q 'progress: complete' "$work/exited.err" \
+            && problems="$problems exit-complete"
+    else
+        problems="$problems exit-exit"
+    fi
+
+    if [ -n "$problems" ]; then
+        echo "diagnose progress: FAIL ($problems)"
+        sed 's/^/    /' "$work/json.err" 2>/dev/null | head -5 >&2
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "diagnose progress: default silent, stderr timeline and terminal status correct, stdout unchanged"
+    fi
+}
+
 check_diagnose_parallel() {
     local report="$OUT_DIR/diagnose-load.txt"
     if [ ! -f "$report" ]; then
@@ -1330,6 +1452,7 @@ check_offcpu_ranking
 check_memory_fault_counter
 check_memory_verdict
 check_diagnose_parallel
+check_diagnose_progress
 check_diagnose_ranking
 check_json_document
 check_diagnose_scenarios

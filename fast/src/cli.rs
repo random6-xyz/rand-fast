@@ -300,6 +300,14 @@ pub struct DiagnoseArgs {
     #[arg(long, default_value = "10s", value_parser = parse_duration)]
     pub duration: Duration,
 
+    /// Print collection progress to stderr.
+    ///
+    /// Off by default so the command stays quiet for scripts and for
+    /// `--format json`. Progress goes to stderr even when it is redirected, so
+    /// a captured log keeps the timeline.
+    #[arg(long)]
+    pub progress: bool,
+
     #[command(flatten)]
     pub format: FormatArg,
 }
@@ -458,6 +466,24 @@ mod tests {
             panic!("expected daemon")
         };
         assert_eq!(args.output, std::path::Path::new("/tmp/custom"));
+    }
+
+    #[test]
+    fn diagnose_progress_is_opt_in() {
+        let cli = Cli::try_parse_from(["fast", "diagnose", "--pid", "123"]).unwrap();
+        let Command::Diagnose(args) = cli.command else {
+            panic!("expected diagnose")
+        };
+        assert!(!args.progress);
+
+        let cli = Cli::try_parse_from(["fast", "diagnose", "--pid", "123", "--progress"]).unwrap();
+        let Command::Diagnose(args) = cli.command else {
+            panic!("expected diagnose")
+        };
+        assert!(args.progress);
+        // The flag must not disturb the report format or duration parsing.
+        assert_eq!(args.duration, Duration::from_secs(10));
+        assert_eq!(args.format.format, crate::json::Format::Text);
     }
 
     #[test]

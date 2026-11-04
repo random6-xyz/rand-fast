@@ -642,6 +642,13 @@ pub type TickSummary<'a> = Vec<(&'static str, serde_json::Value)>;
 /// The final returned time becomes the collection's reported elapsed duration.
 pub type TickCallback<'a> = Box<dyn FnMut(Duration, TickSummary<'_>) -> Duration + 'a>;
 
+/// A callback that receives the elapsed time once per tick.
+///
+/// It exists separately from [`TickCallback`] so an opt-in progress display
+/// does not have to take a summary snapshot of every stream. It never changes
+/// how long the collection runs or what the report contains.
+pub type ProgressCallback<'a> = Box<dyn FnMut(Duration) + 'a>;
+
 /// Claims at most one tick in a collection-loop iteration.
 fn should_run_tick(next_tick: Instant, now: Instant, ticked_this_iteration: &mut bool) -> bool {
     if *ticked_this_iteration || now < next_tick {
@@ -659,6 +666,10 @@ pub struct MultiStreams<'a> {
     /// Called periodically and once after the final drain. Each stream defines
     /// its snapshot semantics. `None` for a collection that only reports at the end.
     pub on_tick: Option<TickCallback<'a>>,
+    /// Called periodically while the collection runs. Never called after the
+    /// final drain: a caller that needs a terminal status reports it from the
+    /// returned [`CollectionSummary`].
+    pub on_progress: Option<ProgressCallback<'a>>,
 }
 
 /// Runs several perf event streams from one eBPF object over one channel.
@@ -680,12 +691,13 @@ pub fn run_multi_collection<'a>(
     let MultiStreams {
         mut streams,
         mut on_tick,
+        mut on_progress,
     } = consumers;
     if streams.is_empty() {
         bail!("at least one event stream is required");
     }
-    if options.tick_interval.is_zero() && on_tick.is_some() {
-        bail!("a tick interval of zero would never produce a summary");
+    if options.tick_interval.is_zero() && (on_tick.is_some() || on_progress.is_some()) {
+        bail!("a tick interval of zero would never produce a summary or an update");
     }
 
     let mode_map = bpf.take_map("MODE").context("eBPF map MODE is missing")?;
@@ -808,16 +820,22 @@ pub fn run_multi_collection<'a>(
             }
         }
 
-        if let Some(tick) = on_tick.as_mut()
+        if (on_tick.is_some() || on_progress.is_some())
             && should_run_tick(next_tick, Instant::now(), &mut ticked_this_iteration)
         {
             let at = started.elapsed();
             // At the duration boundary the final drain owns the tick; emitting
-            // here as well would create a duplicate zero-length interval.
+            // here as well would create a duplicate zero-length interval and a
+            // progress line for a run that has already finished.
             if !multi_collection_duration_expired(options.duration, at) {
-                collect_stream_losses(&losses, &mut streams);
-                // Snapshot only events already dispatched by the consumer.
-                emit_multi_tick(&mut streams, tick, at);
+                if let Some(tick) = on_tick.as_mut() {
+                    collect_stream_losses(&losses, &mut streams);
+                    // Snapshot only events already dispatched by the consumer.
+                    emit_multi_tick(&mut streams, tick, at);
+                }
+                if let Some(progress) = on_progress.as_mut() {
+                    progress(at);
+                }
             }
             // Drifted forward from now rather than from the last tick, so a slow
             // callback does not make the interval shorter every time and end

@@ -23,6 +23,16 @@ daemon defaults to `0s`, meaning it runs until interrupted or the process
 exits. Durations accept values such as `10s` and `500ms`. `cpu --frequency`
 defaults to 99 Hz; `io --threshold` defaults to `10ms`.
 
+`fast diagnose --progress` writes collection progress to stderr: a start
+line, one update per second, and one final status line (`complete`,
+`interrupted`, `target exited`, or `failed`). The start line is written once
+collection begins, after every program is attached; a failure while loading
+or attaching prints only the ordinary error. Progress is written even when stderr is redirected and
+when `--format json` is selected; stdout and the JSON document are unchanged.
+Intermediate updates stop below 100%, so only a collection that actually
+finished prints a completion line. A run shorter than the update interval
+prints the start and final status only.
+
 ```bash
 sudo fast diagnose --pid 1234 --duration 10s --format json
 sudo fast cpu --pid 1234 --duration 10s --frequency 99
