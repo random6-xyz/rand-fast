@@ -30,6 +30,8 @@ jq -r '
     def q: @sh;
     def us: "\u001f";
     def argv: map(gsub(us; "")) | join(us);
+    def expected: ((.expect.top1 // []) + (.expect.contains_any // []))
+        | map(gsub(us; "")) | join(us);
     def checks:
         (if .expect.measured then
             (.expect.measured | to_entries[]
@@ -39,6 +41,7 @@ jq -r '
         (if .expect.top1 then "    top1_any \((.expect.top1 | map(q) | join(" ")))" else empty end),
         (if .expect.contains_any then "    contains_any \((.expect.contains_any | map(q) | join(" ")))" else empty end),
         (if .expect.exclude then "    exclude_causes \((.expect.exclude | map(q) | join(" ")))" else empty end),
+        (if .expect.report_p95_min_us then "    report_p95_min \(.expect.report_p95_min_us)" else empty end),
         "    report_ops_min 1";
 
     "#!/bin/sh",
@@ -53,6 +56,8 @@ jq -r '
         "scenario_duration_\($i)=\(.duration_s | tostring | q)",
         "scenario_prereqs_\($i)=\((.prerequisites // []) | join(" ") | q)",
         "scenario_fixture_\($i)=\(.fixture | argv | q)",
+        "scenario_measured_\($i)=\((.expect.measured // {}) | keys | join(" ") | q)",
+        "scenario_expected_\($i)=\(expected | q)",
         "scenario_bg_\($i)_count=\((.background // []) | length)",
         ((.background // []) | to_entries[]
             | "scenario_bg_\($i)_\(.key)=\(.value | argv | q)"),

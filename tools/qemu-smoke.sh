@@ -73,6 +73,9 @@ for binary in "$FAST" "$SCHED_WORKLOAD" "$FAST_WORKLOAD"; do
     fi
 done
 
+# The scenario library is also used by tools/rank-eval.sh.
+. "$(dirname "$0")/scenarios-lib.sh"
+
 echo "kernel: $(uname -r)"
 echo "duration: $DURATION"
 echo
@@ -762,128 +765,6 @@ check_json_document() {
 # stored as US-separated words, so an argument may contain spaces without any
 # shell evaluation at run time. Every scenario gets one pass/fail line; a
 # missing required prerequisite is a failure, not a skip.
-top_cause() {
-    sed -n 's/.*"causes":\[{"cause":"\([^"]*\)".*/\1/p' "$1" | head -1
-}
-
-SCENARIOS_SH=${SCENARIOS_SH:-"$(dirname "$0")/scenarios.sh"}
-
-start_workload() {
-    # start_workload <packed-argv> <log> <ready-file> <report>
-    local packed="$1" log="$2" ready="$3" report="$4"
-    local old_ifs=$IFS
-    # Substitute before splitting so a path with spaces stays one word.
-    packed=$(printf '%s' "$packed" | sed "s|@IO_HOG_PATH@|$IO_HOG_PATH|g")
-    # A fixture argument is data, never a pattern: pathname expansion would
-    # turn a future "*" or "?" into whatever file happens to match.
-    set -f
-    IFS=$(printf '\037')
-    set -- $packed
-    IFS=$old_ifs
-    set +f
-    "$@" --ready-file "$ready" --report "$report" >"$log" 2>&1 &
-}
-
-wait_for_ready() {
-    # wait_for_ready <pid> <ready-file>
-    local pid="$1" file="$2" waited=0
-    while [ "$waited" -lt 100 ] && [ ! -f "$file" ]; do
-        kill -0 "$pid" 2>/dev/null || break
-        sleep 0.1
-        waited=$((waited + 1))
-    done
-    [ -f "$file" ]
-}
-
-wait_for_exit() {
-    # wait_for_exit <pid> <tenths-of-a-second>
-    local pid="$1" limit="$2" waited=0
-    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$limit" ]; do
-        sleep 0.1
-        waited=$((waited + 1))
-    done
-}
-
-prereq_ok() {
-    case "$1" in
-        tracefs)
-            [ -r /sys/kernel/tracing/events/sched/sched_wakeup/format ] \
-                || [ -r /sys/kernel/debug/tracing/events/sched/sched_wakeup/format ]
-            ;;
-        btf) [ -r /sys/kernel/btf/vmlinux ] ;;
-        block_device) [ "${FAST_BLOCK_DEVICE:-0}" = "1" ] ;;
-        cpu2) [ "$(grep -c '^processor' /proc/cpuinfo)" -ge 2 ] ;;
-        *) return 1 ;;
-    esac
-}
-
-json_number() {
-    # json_number <file> <key>
-    sed -n "s/.*\"$2\":\(-\{0,1\}[0-9][0-9.]*\).*/\1/p" "$1" | head -1
-}
-
-json_causes() {
-    tr ',' '\n' < "$1" | sed -n 's/.*"cause":"\([^"]*\)".*/\1/p'
-}
-
-# The check helpers append to scenario_problems. The scenario loop turns the
-# accumulated list into one pass/fail line and keeps the raw JSON on failure.
-measured_min() {
-    local value
-    value=$(json_number "$SCENARIO_JSON" "$1")
-    if [ -z "$value" ] || ! awk -v a="$value" -v b="$2" 'BEGIN { exit (a + 0 >= b + 0) ? 0 : 1 }'; then
-        scenario_problems="$scenario_problems $1>=${2}(got ${value:-none})"
-    fi
-}
-
-measured_max() {
-    local value
-    value=$(json_number "$SCENARIO_JSON" "$1")
-    if [ -z "$value" ] || ! awk -v a="$value" -v b="$2" 'BEGIN { exit (a + 0 <= b + 0) ? 0 : 1 }'; then
-        scenario_problems="$scenario_problems $1<=${2}(got ${value:-none})"
-    fi
-}
-
-top1_any() {
-    local top wanted
-    top=$(top_cause "$SCENARIO_JSON")
-    if [ -z "$top" ]; then
-        scenario_problems="$scenario_problems no-cause"
-        return
-    fi
-    for wanted in "$@"; do
-        [ "$top" = "$wanted" ] && return 0
-    done
-    scenario_problems="$scenario_problems top1=${top}(expected $*)"
-}
-
-contains_any() {
-    local causes wanted
-    causes=$(json_causes "$SCENARIO_JSON")
-    for wanted in "$@"; do
-        printf '%s\n' "$causes" | grep -Fqx "$wanted" && return 0
-    done
-    scenario_problems="$scenario_problems missing-cause($*)"
-}
-
-exclude_causes() {
-    local causes unwanted
-    causes=$(json_causes "$SCENARIO_JSON")
-    for unwanted in "$@"; do
-        if printf '%s\n' "$causes" | grep -Fqx "$unwanted"; then
-            scenario_problems="$scenario_problems unexpected=${unwanted}"
-        fi
-    done
-}
-
-report_ops_min() {
-    local ops
-    ops=$(json_number "$SCENARIO_REPORT" ops)
-    if [ -z "$ops" ] || [ "$ops" -lt "$1" ]; then
-        scenario_problems="$scenario_problems report-ops=${ops:-none}"
-    fi
-}
-
 run_scenario() {
     # run_scenario <index>
     local i="$1"
@@ -982,6 +863,23 @@ check_diagnose_scenarios() {
 }
 
 # Proves the documented zero-duration daemon default runs until its target exits.
+# Repeats every declared scenario and gates on its deterministic checks. The
+# descriptive rates (top-1, top-3, control false positives, lost events) are
+# published alongside the raw documents; they do not decide pass/fail.
+check_diagnose_accuracy() {
+    if [ "${RANK_EVAL:-0}" != "1" ]; then
+        echo "ranking accuracy: deferred (set RANK_EVAL=1 to repeat every scenario)"
+        return
+    fi
+    local output="$OUT_DIR/rank"
+    if "$(dirname "$0")/rank-eval.sh"; then
+        echo "ranking accuracy: every run satisfied its declared checks (see $output/rank-report.json)"
+    else
+        echo "ranking accuracy: FAIL (a run violated its declared checks; see $output/runs.tsv)"
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
 check_daemon_infinite_default() {
     local dir="$OUT_DIR/daemon-infinite"
     local report="$OUT_DIR/daemon-infinite.txt"
@@ -1271,7 +1169,7 @@ check_daemon_storage() {
     # and a restart after a clean exit never exercises that path.
     "$FAST" daemon --pid "$target_pid" --duration 300s \
         --interval 1s --window 120s --output "$dir" --max-disk-bytes "$cap" \
-        --trigger-sched-p95 200us \
+        --trigger-sched-p95 100us \
         --trigger-io-p99 off --trigger-retrans off \
         --trigger-psi-some off --trigger-psi-full off \
         --restore false \
@@ -1328,7 +1226,7 @@ check_daemon_storage() {
     sleep 0.3
     "$FAST" daemon --pid "$target_pid" --duration "$TRIGGER_RUN" \
         --interval 1s --window 120s --output "$dir" --max-disk-bytes "$cap" \
-        --trigger-sched-p95 200us \
+        --trigger-sched-p95 100us \
         --trigger-io-p99 off --trigger-retrans off \
         --trigger-psi-some off --trigger-psi-full off \
         >"$second_log" 2>&1 || true
@@ -1438,12 +1336,12 @@ trigger_flags() {
         ;;
     sched)
         # Chosen from the two measured regimes rather than picked. The 32-worker
-        # lock fixture saturates the run queue enough to put p95 above 200us,
+        # lock fixture saturates the run queue enough to put p95 above 100us,
         # while the idle baseline remains well below it. The
         # production default of 10ms is far above what this fixture produces and
         # is deliberately not used here: it would be a threshold the fixture
         # could never reach, which would test nothing.
-        echo "--trigger-sched-p95 200us --trigger-io-p99 off --trigger-retrans off"
+        echo "--trigger-sched-p95 100us --trigger-io-p99 off --trigger-retrans off"
         echo "--trigger-psi-some off --trigger-psi-full off --trigger-cpu off"
         ;;
     *)
@@ -1482,6 +1380,7 @@ check_diagnose_parallel
 check_diagnose_ranking
 check_json_document
 check_diagnose_scenarios
+check_diagnose_accuracy
 check_daemon_infinite_default
 check_daemon_budget
 check_daemon_triggers
