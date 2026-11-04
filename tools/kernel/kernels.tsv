@@ -1,0 +1,4 @@
+# Pinned kernel images used by the real-kernel QEMU gate.
+# Columns: version, source URL, sha256, toolchain, config profile.
+# The version must match what the guest reports from `uname -r`.
+6.12.115	https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.115.tar.xz	0ec90fe4b20422b1b664b77e6d2dde22b40bd41e7eb2cad8ac8739a4749cb1bb	gcc	default

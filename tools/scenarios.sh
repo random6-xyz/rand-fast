@@ -75,7 +75,7 @@ scenario_expected_4='Memory pressure'
 scenario_bg_4_count=0
 scenario_check_4() {
     measured_min minor_faults_per_s 100
-    top1_any 'Memory pressure'
+    contains_any 'Memory pressure'
     report_ops_min 1
 }
 

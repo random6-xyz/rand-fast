@@ -22,6 +22,8 @@
 #   DURATION   per-run collection length passed to the matrix (default 5s)
 #   RANK_EVAL  1 repeats every scenario for the accuracy report (default 0)
 #   RANK_REPETITIONS  runs per scenario when RANK_EVAL=1 (default 3)
+#   QEMU_TIMEOUT  seconds before the guest is killed (default 1800)
+#   ACCEL      auto, kvm or tcg (default auto: KVM when /dev/kvm is usable)
 #   QEMU_SMOKE_CASE  all or tcp-unavailable (default all)
 #
 # Exit status: 0 when the guest smoke run succeeded, 1 otherwise.
@@ -39,6 +41,8 @@ MEM_MB=${MEM_MB:-2048}
 OUT_DIR=${OUT_DIR:-/tmp/fast-qemu}
 DURATION=${DURATION:-5s}
 QEMU_SMOKE_CASE=${QEMU_SMOKE_CASE:-all}
+QEMU_TIMEOUT=${QEMU_TIMEOUT:-1800}
+ACCEL_MODE=${ACCEL:-auto}
 RANK_EVAL=${RANK_EVAL:-0}
 RANK_REPETITIONS=${RANK_REPETITIONS:-3}
 case "$QEMU_SMOKE_CASE" in all|tcp-unavailable) ;; *) echo "qemu-run: invalid QEMU_SMOKE_CASE" >&2; exit 2 ;; esac
@@ -84,6 +88,14 @@ log() { printf 'qemu-run: %s\n' "$*"; }
 die() { printf 'qemu-run: %s\n' "$*" >&2; exit 1; }
 
 [ -r "$KERNEL" ] || die "kernel not readable: $KERNEL (set KERNEL=<bzImage>)"
+case "$QEMU_TIMEOUT" in
+    ''|*[!0-9]*) die "QEMU_TIMEOUT must be a positive integer: $QEMU_TIMEOUT" ;;
+esac
+[ "$QEMU_TIMEOUT" -gt 0 ] || die "QEMU_TIMEOUT must be greater than zero"
+case "$ACCEL_MODE" in
+    auto|kvm|tcg) ;;
+    *) die "ACCEL must be auto, kvm or tcg: $ACCEL_MODE" ;;
+esac
 command -v qemu-system-x86_64 >/dev/null 2>&1 || die "qemu-system-x86_64 not found"
 command -v cpio >/dev/null 2>&1 || die "cpio not found"
 BUSYBOX=$(command -v busybox 2>/dev/null) || die "busybox not found"
@@ -196,28 +208,45 @@ log "packing the initramfs"
     || die "failed to pack the initramfs"
 
 # --- boot -------------------------------------------------------------------
+# Hosted CI has no /dev/kvm, so the TCG path is the one that runs there and has
+# to be reproducible on a KVM host too. ACCEL=tcg forces it; ACCEL=kvm refuses
+# to silently fall back.
 KVM=off
-if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
-    KVM=on
-    log "KVM available"
-else
-    log "KVM unavailable, falling back to TCG emulation (slow)"
-fi
+case "$ACCEL_MODE" in
+    kvm)
+        if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+            die "ACCEL=kvm was requested but /dev/kvm is not readable and writable"
+        fi
+        KVM=on
+        log "KVM forced by ACCEL=kvm"
+        ;;
+    tcg)
+        log "TCG forced by ACCEL=tcg"
+        ;;
+    auto)
+        if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            KVM=on
+            log "KVM available"
+        else
+            log "KVM unavailable, falling back to TCG emulation (slow)"
+        fi
+        ;;
+esac
 
 log "booting the guest (${CPUS} vCPU, ${MEM_MB} MiB, duration $DURATION)"
 rm -f "$LOG"
 # The guest powers itself off at the end of the run, so a bounded timeout
 # only guards against a hang.
 if [ "$KVM" = on ]; then
-    ACCEL="-enable-kvm"
+    ACCEL_FLAG="-enable-kvm"
     ACCEL_NAME=kvm
 else
-    ACCEL=""
+    ACCEL_FLAG=""
     ACCEL_NAME=tcg
 fi
 
 # shellcheck disable=SC2086
-timeout 1800 qemu-system-x86_64 $ACCEL \
+timeout "$QEMU_TIMEOUT" qemu-system-x86_64 $ACCEL_FLAG \
     -m "$MEM_MB" -smp "$CPUS" \
     -kernel "$KERNEL" -initrd "$INITRAMFS" \
     -append "console=ttyS0 rdinit=/init loglevel=3 panic=-1 fast.duration=$DURATION fast.smoke_case=$QEMU_SMOKE_CASE fast.accel=$ACCEL_NAME fast.rank_eval=$RANK_EVAL fast.rank_repetitions=$RANK_REPETITIONS" \
@@ -228,7 +257,7 @@ QEMU_RC=$?
 
 log "guest log: $LOG"
 if [ "$QEMU_RC" -ne 0 ]; then
-    printf 'qemu-run: qemu exited with %s (124 means the 1800s timeout hit)\n' "$QEMU_RC" >&2
+    printf 'qemu-run: qemu exited with %s (124 means the %ss timeout hit)\n' "$QEMU_RC" "$QEMU_TIMEOUT" >&2
 fi
 
 # --- report -----------------------------------------------------------------
@@ -250,11 +279,24 @@ printf '\n===== smoke reports =====\n'
 sed -n '/^=== reports ===/,$p' "$LOG" 2>/dev/null \
     | sed -n '/^----- .*\.txt -----/,$p' | tail -n +2
 
+{
+    echo "exit=$QEMU_RC"
+    echo "result=$RESULT"
+    echo "accelerator=$ACCEL_NAME"
+    echo "timeout_s=$QEMU_TIMEOUT"
+    echo "kernel=$KERNEL"
+    echo "cpus=$CPUS"
+    echo "duration=$DURATION"
+    echo "rank_eval=$RANK_EVAL"
+} >"$OUT_DIR/qemu-status.txt"
+
 if [ "$KEEP" -eq 0 ]; then
-    rm -rf "$STAGE"
-    log "removed the staging tree (pass --keep to retain it)"
+    # The scratch disk is hundreds of MiB and is never reused, so a default run
+    # leaves only the log and the diagnostics behind.
+    rm -rf "$STAGE" "$IO_IMG"
+    log "removed the staging tree and scratch disk (pass --keep to retain them)"
 else
-    log "kept $STAGE and $INITRAMFS"
+    log "kept $STAGE, $INITRAMFS and $IO_IMG"
 fi
 
 exit "$RESULT"

@@ -51,6 +51,23 @@ else
     fi
 fi
 
+# The accelerator override must reject a typo instead of silently choosing one.
+tmp_kernel=$(mktemp) || exit 1
+if output=$(ACCEL=bogus KERNEL="$tmp_kernel" sh "$QEMU_RUN" 2>&1); then
+    echo "test-qemu-run: FAIL invalid ACCEL was accepted"
+    FAILURES=$((FAILURES + 1))
+else
+    status=$?
+    if [ "$status" -eq 1 ] && printf '%s\n' "$output" | grep -Fq 'ACCEL must be auto, kvm or tcg'; then
+        echo "test-qemu-run: invalid ACCEL rejected"
+    else
+        echo "test-qemu-run: FAIL invalid ACCEL had unexpected result (status=$status)"
+        printf '%s\n' "$output"
+        FAILURES=$((FAILURES + 1))
+    fi
+fi
+rm -f "$tmp_kernel"
+
 if [ "$FAILURES" -ne 0 ]; then
     echo "test-qemu-run: $FAILURES failure(s)" >&2
     exit 1
