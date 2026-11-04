@@ -20,6 +20,13 @@
 #   OUT_DIR     where raw reports are written (default /fast-smoke)
 #   IO_HOG_PATH file the io-hog reads; put it on a real block device (not
 #               tmpfs) so block_rq_* tracepoints fire (default /tmp/fast-workload-io)
+#   FAST_BLOCK_DEVICE
+#               1 only when IO_HOG_PATH is on a real block device; the guest
+#               sets it after mounting its virtio disk, and a host run must set
+#               it explicitly or block-device scenarios fail as unsatisfied
+#   SCENARIOS_SH
+#               generated scenario table (default: scenarios.sh beside this
+#               script); regenerate it with tools/scenarios-generate.sh
 #
 # Exit status: 0 when every verifier load and idle/load collection succeeded,
 # 1 otherwise (failures are also counted in the summary).
@@ -749,92 +756,229 @@ check_json_document() {
     fi
 }
 
-# Proves the ranking puts the real bottleneck first.
+# Proves each declared scenario produces the signal it claims.
 #
-# The unit tests in fast/src/scoring.rs prove the scoring against synthetic
-# measurements. This proves it against real workloads: five processes, each
-# with exactly one thing wrong, and each expected to be ranked on that thing.
-#
-# Every scenario runs `fast diagnose --format json` and reads the first entry of
-# the causes array, so what is checked is the number a consumer would act on
-# rather than the human report beside it.
-#
-# The document is a single compact line, so the first cause is extracted by
-# matching the array's opening entry rather than by any JSON parsing, which the
-# guest's awk cannot do.
+# The scenario table is generated from tools/scenarios.json. Fixture argv is
+# stored as US-separated words, so an argument may contain spaces without any
+# shell evaluation at run time. Every scenario gets one pass/fail line; a
+# missing required prerequisite is a failure, not a skip.
 top_cause() {
     sed -n 's/.*"causes":\[{"cause":"\([^"]*\)".*/\1/p' "$1" | head -1
 }
 
-# scenario <name> <expected cause> <expected cause prefix> <fixture...>
-scenario() {
-    local name="$1" expected="$2" prefix="$3"
-    shift 3
-    local duration="${SCENARIO_DURATION:-4s}"
-    local json="$OUT_DIR/scenario-$name.json"
+SCENARIOS_SH=${SCENARIOS_SH:-"$(dirname "$0")/scenarios.sh"}
 
-    # The remaining arguments are the fixture command. Arrays are not available
-    # in a POSIX shell, so the command is run through a small indirection.
-    "$@" >"$OUT_DIR/scenario-$name-fixture.log" 2>&1 &
-    local fixture_pid=$!
-    sleep 0.4
-    if ! "$FAST" diagnose --pid "$fixture_pid" --duration "$duration" --format json \
-        >"$json" 2>"$OUT_DIR/scenario-$name.err"; then
-        echo "diagnose scenario $name: FAIL (diagnose could not run; see $OUT_DIR/scenario-$name.err)"
-        head -3 "$OUT_DIR/scenario-$name.err" | sed 's/^/    /' >&2
-        FAILURES=$((FAILURES + 1))
-        kill "$fixture_pid" 2>/dev/null
-        wait "$fixture_pid" 2>/dev/null
+start_workload() {
+    # start_workload <packed-argv> <log> <ready-file> <report>
+    local packed="$1" log="$2" ready="$3" report="$4"
+    local old_ifs=$IFS
+    # Substitute before splitting so a path with spaces stays one word.
+    packed=$(printf '%s' "$packed" | sed "s|@IO_HOG_PATH@|$IO_HOG_PATH|g")
+    # A fixture argument is data, never a pattern: pathname expansion would
+    # turn a future "*" or "?" into whatever file happens to match.
+    set -f
+    IFS=$(printf '\037')
+    set -- $packed
+    IFS=$old_ifs
+    set +f
+    "$@" --ready-file "$ready" --report "$report" >"$log" 2>&1 &
+}
+
+wait_for_ready() {
+    # wait_for_ready <pid> <ready-file>
+    local pid="$1" file="$2" waited=0
+    while [ "$waited" -lt 100 ] && [ ! -f "$file" ]; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    [ -f "$file" ]
+}
+
+wait_for_exit() {
+    # wait_for_exit <pid> <tenths-of-a-second>
+    local pid="$1" limit="$2" waited=0
+    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$limit" ]; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+}
+
+prereq_ok() {
+    case "$1" in
+        tracefs)
+            [ -r /sys/kernel/tracing/events/sched/sched_wakeup/format ] \
+                || [ -r /sys/kernel/debug/tracing/events/sched/sched_wakeup/format ]
+            ;;
+        btf) [ -r /sys/kernel/btf/vmlinux ] ;;
+        block_device) [ "${FAST_BLOCK_DEVICE:-0}" = "1" ] ;;
+        cpu2) [ "$(grep -c '^processor' /proc/cpuinfo)" -ge 2 ] ;;
+        *) return 1 ;;
+    esac
+}
+
+json_number() {
+    # json_number <file> <key>
+    sed -n "s/.*\"$2\":\(-\{0,1\}[0-9][0-9.]*\).*/\1/p" "$1" | head -1
+}
+
+json_causes() {
+    tr ',' '\n' < "$1" | sed -n 's/.*"cause":"\([^"]*\)".*/\1/p'
+}
+
+# The check helpers append to scenario_problems. The scenario loop turns the
+# accumulated list into one pass/fail line and keeps the raw JSON on failure.
+measured_min() {
+    local value
+    value=$(json_number "$SCENARIO_JSON" "$1")
+    if [ -z "$value" ] || ! awk -v a="$value" -v b="$2" 'BEGIN { exit (a + 0 >= b + 0) ? 0 : 1 }'; then
+        scenario_problems="$scenario_problems $1>=${2}(got ${value:-none})"
+    fi
+}
+
+measured_max() {
+    local value
+    value=$(json_number "$SCENARIO_JSON" "$1")
+    if [ -z "$value" ] || ! awk -v a="$value" -v b="$2" 'BEGIN { exit (a + 0 <= b + 0) ? 0 : 1 }'; then
+        scenario_problems="$scenario_problems $1<=${2}(got ${value:-none})"
+    fi
+}
+
+top1_any() {
+    local top wanted
+    top=$(top_cause "$SCENARIO_JSON")
+    if [ -z "$top" ]; then
+        scenario_problems="$scenario_problems no-cause"
         return
     fi
-    kill "$fixture_pid" 2>/dev/null
-    wait "$fixture_pid" 2>/dev/null
+    for wanted in "$@"; do
+        [ "$top" = "$wanted" ] && return 0
+    done
+    scenario_problems="$scenario_problems top1=${top}(expected $*)"
+}
 
-    local actual
-    actual=$(top_cause "$json")
-    if [ -z "$actual" ]; then
-        echo "diagnose scenario $name: FAIL (no cause was ranked; the fixture produced no signal)"
-        head -c 300 "$json" | sed 's/^/    /' >&2
+contains_any() {
+    local causes wanted
+    causes=$(json_causes "$SCENARIO_JSON")
+    for wanted in "$@"; do
+        printf '%s\n' "$causes" | grep -Fqx "$wanted" && return 0
+    done
+    scenario_problems="$scenario_problems missing-cause($*)"
+}
+
+exclude_causes() {
+    local causes unwanted
+    causes=$(json_causes "$SCENARIO_JSON")
+    for unwanted in "$@"; do
+        if printf '%s\n' "$causes" | grep -Fqx "$unwanted"; then
+            scenario_problems="$scenario_problems unexpected=${unwanted}"
+        fi
+    done
+}
+
+report_ops_min() {
+    local ops
+    ops=$(json_number "$SCENARIO_REPORT" ops)
+    if [ -z "$ops" ] || [ "$ops" -lt "$1" ]; then
+        scenario_problems="$scenario_problems report-ops=${ops:-none}"
+    fi
+}
+
+run_scenario() {
+    # run_scenario <index>
+    local i="$1"
+    local name kind duration prereqs fixture bg_count bg
+    eval "name=\$scenario_tag_$i"
+    eval "kind=\$scenario_kind_$i"
+    eval "duration=\$scenario_duration_$i"
+    eval "prereqs=\$scenario_prereqs_$i"
+    eval "fixture=\$scenario_fixture_$i"
+    eval "bg_count=\$scenario_bg_${i}_count"
+
+    local missing="" prereq
+    for prereq in $prereqs; do
+        prereq_ok "$prereq" || missing="$missing $prereq"
+    done
+    if [ -n "$missing" ]; then
+        echo "diagnose scenario $name: FAIL (required prerequisite missing:$missing)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    local json="$OUT_DIR/scenario-$name.json"
+    local report="$OUT_DIR/scenario-$name-report.json"
+    local ready="$OUT_DIR/scenario-$name.ready"
+    rm -f "$json" "$report" "$ready" \
+        "$OUT_DIR/scenario-$name-fixture.log" "$OUT_DIR/scenario-$name.err"
+
+    start_workload "$fixture" "$OUT_DIR/scenario-$name-fixture.log" "$ready" "$report"
+    local fixture_pid=$!
+    local bg_pids=""
+    local j=0
+    while [ "$j" -lt "$bg_count" ]; do
+        eval "bg=\$scenario_bg_${i}_${j}"
+        start_workload "$bg" "$OUT_DIR/scenario-$name-bg-$j.log" \
+            "$OUT_DIR/scenario-$name-bg-$j.ready" "$OUT_DIR/scenario-$name-bg-$j.json"
+        bg_pids="$bg_pids $!"
+        j=$((j + 1))
+    done
+
+    local problems=""
+    wait_for_ready "$fixture_pid" "$ready" || problems="$problems fixture-not-ready"
+    j=0
+    for bg_pid in $bg_pids; do
+        wait_for_ready "$bg_pid" "$OUT_DIR/scenario-$name-bg-$j.ready" \
+            || problems="$problems bg-$j-not-ready"
+        j=$((j + 1))
+    done
+
+    if [ -z "$problems" ]; then
+        if ! "$FAST" diagnose --pid "$fixture_pid" --duration "${duration}s" --format json \
+            >"$json" 2>"$OUT_DIR/scenario-$name.err"; then
+            problems="$problems diagnose-exit"
+        fi
+    fi
+
+    # Let the fixture finish so its independent --report exists; a fixture that
+    # ignores its own duration is killed and its missing report fails the case.
+    wait_for_exit "$fixture_pid" 70
+    SCENARIO_JSON="$json"
+    SCENARIO_REPORT="$report"
+    scenario_problems="$problems"
+    if [ ! -s "$json" ] && ! printf '%s' "$problems" | grep -q 'diagnose-exit'; then
+        scenario_problems="$scenario_problems no-document"
+    elif [ -s "$json" ] && ! printf '%s' "$problems" | grep -q 'diagnose-exit'; then
+        "scenario_check_$i"
+    fi
+
+    kill "$fixture_pid" $bg_pids 2>/dev/null
+    wait "$fixture_pid" 2>/dev/null
+    for bg_pid in $bg_pids; do
+        wait "$bg_pid" 2>/dev/null
+    done
+
+    if [ -n "$scenario_problems" ]; then
+        echo "diagnose scenario $name: FAIL ($scenario_problems)"
+        head -c 300 "$json" 2>/dev/null | sed 's/^/    /' >&2
         echo >&2
         FAILURES=$((FAILURES + 1))
-        return
-    fi
-    if [ "$actual" != "$prefix" ]; then
-        echo "diagnose scenario $name: FAIL (ranked '$actual' first, expected '$prefix')"
-        FAILURES=$((FAILURES + 1))
     else
-        echo "diagnose scenario $name: $actual first, as expected (expected $expected)"
+        echo "diagnose scenario $name: pass ($kind, ${duration}s, fixture report checked)"
     fi
 }
 
 check_diagnose_scenarios() {
-    # One bottleneck at a time. The CPU case is a single busy-spinning worker,
-    # because two workers on eight vCPUs is not contention and the report
-    # should not claim otherwise.
-    scenario cpu "CPU contention" "CPU contention" \
-        "$SCHED_WORKLOAD" hog --duration 30s --workers 1
-
-    # A real block device, because reads served from tmpfs never reach the
-    # block tracepoints at all.
-    scenario io "Disk I/O" "Disk I/O" \
-        "$FAST_WORKLOAD" io-hog --duration 30s --workers 2 --path "$IO_HOG_PATH" --size-mib 256
-
-    scenario lock "Lock contention" "Lock contention" \
-        "$FAST_WORKLOAD" lock-hog --duration 30s --workers 16 --hold-ms 1
-
-    # Large enough to make the process reclaim for itself, which is the only
-    # per-process memory signal available on a kernel built without PSI and with
-    # no swap device. Sized to stay under the guest's memory: an oversized
-    # fixture is OOM-killed in a fraction of a second, which produces a run too
-    # short to measure anything and would test the fixture rather than the
-    # ranking.
-    scenario memory "Memory pressure" "Memory pressure" \
-        "$FAST_WORKLOAD" mem-hog --duration 30s --workers 1 --size-mib 1024
-
-    # The cycling receive window creates socket waits; the Network ranking
-    # now depends on those waits, not on retransmission counts.
-    scenario network "Network" "Network" \
-        "$FAST_WORKLOAD" net-hog --duration 30s --workers 2 --delay-ms 600
+    if [ ! -r "$SCENARIOS_SH" ]; then
+        echo "diagnose scenarios: FAIL (missing $SCENARIOS_SH; run tools/scenarios-generate.sh)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    . "$SCENARIOS_SH"
+    local i=0
+    while [ "$i" -lt "${SCENARIO_COUNT:-0}" ]; do
+        run_scenario "$i"
+        i=$((i + 1))
+    done
 }
 
 # Proves the documented zero-duration daemon default runs until its target exits.
@@ -1138,6 +1282,10 @@ check_daemon_storage() {
     # there is a window worth recovering rather than before anything exists.
     if ! wait_for_bundles "$dir" 2 90; then
         echo "daemon storage: FAIL (the recorder wrote no bundle in 90s)"
+        echo "--- recorder log ---" >&2
+        sed 's/^/    /' "$first_log" 2>/dev/null | head -30 >&2
+        echo "--- output directory ---" >&2
+        ls -la "$dir" 2>/dev/null | sed 's/^/    /' >&2
         FAILURES=$((FAILURES + 1))
         cleanup_killed_pid "$target_pid"
         return
@@ -1145,7 +1293,8 @@ check_daemon_storage() {
     # Let it keep going so there are more incidents than the cap can hold, then
     # kill it. A run long enough to have needed rotation is the only way the
     # rotation check means anything.
-    wait_for_bundles "$dir" 2 90
+    # The first wait proved a window exists; this sleep is what makes the run
+    # outgrow the cap, so rotation has to run before the kill.
     sleep 20
     kill -9 "$daemon_pid" 2>/dev/null
     wait "$daemon_pid" 2>/dev/null

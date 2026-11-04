@@ -177,6 +177,7 @@ stage_iproute2_tool ss \
     || log "WARNING: ss not found on the host; the RTT cross-check will be skipped"
 
 cp "$ROOT/tools/qemu-smoke.sh" "$STAGE/tools/qemu-smoke.sh"
+cp "$ROOT/tools/scenarios.sh" "$STAGE/tools/scenarios.sh"
 cp "$ROOT/tools/qemu-guest-init.sh" "$STAGE/init"
 
 log "packing the initramfs"
