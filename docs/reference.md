@@ -218,4 +218,7 @@ The TCP tracepoint programs are not attached and emit no events. Omitted TCP
 events cannot be counted per target without reliable attribution, and perf
 loss counts do not include those omissions. Restoring this feature requires a
 verified ownership source and socket lifetime identity covering sharing, exit,
-destruction, and reuse, plus corresponding lifecycle tests.
+destruction, and reuse, plus corresponding lifecycle tests. The
+[ownership design](tcp-ownership-design.md) records the candidate sources, the
+prototype result, and the evidence required before enabling; the prototype did
+not establish positive attribution, so the feature remains off.
