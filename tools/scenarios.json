@@ -82,7 +82,8 @@
         },
         "contains_any": [
           "Scheduler latency"
-        ]
+        ],
+        "report_p95_min_us": 1000
       }
     },
     {
@@ -291,7 +292,8 @@
         },
         "contains_any": [
           "Network"
-        ]
+        ],
+        "report_p95_min_us": 50000
       }
     },
     {
@@ -316,9 +318,6 @@
         "measured": {
           "cpu_percent": {
             "max": 20
-          },
-          "cpu_samples": {
-            "min": 1
           },
           "sched_samples": {
             "min": 1

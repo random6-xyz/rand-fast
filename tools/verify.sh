@@ -9,7 +9,8 @@
 #   5. test-qemu-smoke.sh     mock verifier/load failures propagate and children stop
 #   6. test-qemu-run.sh       documented argument forms reach the help path
 #   7. test-scenarios.sh      the scenario manifest and generated table agree
-#   8. check-license-metadata.sh every workspace package declares both licenses
+#   8. test-rank-eval.sh      the ranking gate rejects missing/empty/wrong runs
+#   9. check-license-metadata.sh every workspace package declares both licenses
 #
 # The eBPF verifier needs a real kernel; tools/qemu-smoke.sh runs that inside
 # the QEMU guest and is a separate, manual step.
@@ -40,6 +41,7 @@ step 'cargo test' cargo test --workspace
 step 'QEMU smoke failure propagation' tools/test-qemu-smoke.sh
 step 'QEMU runner argument parsing' tools/test-qemu-run.sh
 step 'scenario manifest' tools/test-scenarios.sh
+step 'ranking evaluation gate' tools/test-rank-eval.sh
 step 'license metadata' tools/check-license-metadata.sh
 
 printf '\n'

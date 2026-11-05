@@ -20,6 +20,8 @@
 #   MEM_MB     guest memory in MiB (default 2048)
 #   OUT_DIR    where the guest log is written (default /tmp/fast-qemu)
 #   DURATION   per-run collection length passed to the matrix (default 5s)
+#   RANK_EVAL  1 repeats every scenario for the accuracy report (default 0)
+#   RANK_REPETITIONS  runs per scenario when RANK_EVAL=1 (default 3)
 #   QEMU_SMOKE_CASE  all or tcp-unavailable (default all)
 #
 # Exit status: 0 when the guest smoke run succeeded, 1 otherwise.
@@ -37,6 +39,8 @@ MEM_MB=${MEM_MB:-2048}
 OUT_DIR=${OUT_DIR:-/tmp/fast-qemu}
 DURATION=${DURATION:-5s}
 QEMU_SMOKE_CASE=${QEMU_SMOKE_CASE:-all}
+RANK_EVAL=${RANK_EVAL:-0}
+RANK_REPETITIONS=${RANK_REPETITIONS:-3}
 case "$QEMU_SMOKE_CASE" in all|tcp-unavailable) ;; *) echo "qemu-run: invalid QEMU_SMOKE_CASE" >&2; exit 2 ;; esac
 KEEP=0
 
@@ -178,6 +182,9 @@ stage_iproute2_tool ss \
 
 cp "$ROOT/tools/qemu-smoke.sh" "$STAGE/tools/qemu-smoke.sh"
 cp "$ROOT/tools/scenarios.sh" "$STAGE/tools/scenarios.sh"
+cp "$ROOT/tools/scenarios-lib.sh" "$STAGE/tools/scenarios-lib.sh"
+cp "$ROOT/tools/rank-eval.sh" "$STAGE/tools/rank-eval.sh"
+cp "$ROOT/tools/scenarios.json" "$STAGE/tools/scenarios.json"
 cp "$ROOT/tools/qemu-guest-init.sh" "$STAGE/init"
 
 log "packing the initramfs"
@@ -203,15 +210,17 @@ rm -f "$LOG"
 # only guards against a hang.
 if [ "$KVM" = on ]; then
     ACCEL="-enable-kvm"
+    ACCEL_NAME=kvm
 else
     ACCEL=""
+    ACCEL_NAME=tcg
 fi
 
 # shellcheck disable=SC2086
 timeout 1800 qemu-system-x86_64 $ACCEL \
     -m "$MEM_MB" -smp "$CPUS" \
     -kernel "$KERNEL" -initrd "$INITRAMFS" \
-    -append "console=ttyS0 rdinit=/init loglevel=3 panic=-1 fast.duration=$DURATION fast.smoke_case=$QEMU_SMOKE_CASE" \
+    -append "console=ttyS0 rdinit=/init loglevel=3 panic=-1 fast.duration=$DURATION fast.smoke_case=$QEMU_SMOKE_CASE fast.accel=$ACCEL_NAME fast.rank_eval=$RANK_EVAL fast.rank_repetitions=$RANK_REPETITIONS" \
     -nographic -no-reboot -monitor none \
     -drive "file=$IO_IMG,format=raw,if=virtio" \
     < /dev/null > "$LOG" 2>&1
