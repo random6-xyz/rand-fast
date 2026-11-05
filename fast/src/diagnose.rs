@@ -130,6 +130,10 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
     let initial_tids =
         process::thread_ids(pid).with_context(|| format!("cannot enumerate threads for {pid}"))?;
 
+    let mut progress = args
+        .progress
+        .then(|| crate::progress::ProgressReporter::new(std::io::stderr(), args.duration));
+
     // One object and one load. Every collector below shares the same target
     // thread map and the same stop handling, so loading once and sharing one
     // reader loop is not just faster: it is the only way every signal is
@@ -169,48 +173,94 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
         | COLLECT_OFFCPU
         | COLLECT_MEMORY;
 
-    let summary = runtime::run_multi_collection(
-        &mut bpf,
-        &mut target_tids,
-        &mut runtime::NoPendingCleanup,
-        &mut BTreeSet::new(),
-        &initial_tids,
-        runtime::MultiCollectionOptions {
-            pid,
-            duration: args.duration,
-            mode,
-            // Diagnose reports once at the end, so it never ticks.
-            tick_interval: std::time::Duration::ZERO,
-            // A short report wants its events as soon as they arrive.
-            poll_interval: runtime::DEFAULT_POLL_INTERVAL,
-        },
-        runtime::MultiStreams {
-            streams: vec![
-                runtime::EventStream::of::<SchedulerLatencyEvent, _>(
-                    "EVENTS",
-                    PERF_PAGE_COUNT,
-                    &mut sched_stats,
-                ),
-                runtime::EventStream::of::<CpuSampleEvent, _>(
-                    "CPU_EVENTS",
-                    PERF_PAGE_COUNT,
-                    &mut cpu_stats,
-                ),
-                runtime::EventStream::of::<IoEvent, _>("IO_EVENTS", PERF_PAGE_COUNT, &mut io_stats),
-                runtime::EventStream::of::<TcpEvent, _>(
-                    "NET_EVENTS",
-                    PERF_PAGE_COUNT,
-                    &mut net_stats,
-                ),
-                runtime::EventStream::of::<OffCpuEvent, _>(
-                    "OFFCPU_EVENTS",
-                    PERF_PAGE_COUNT,
-                    &mut offcpu_stats,
-                ),
-            ],
-            on_tick: None,
-        },
-    )?;
+    // The collection loop owns the clock, so progress rides its tick timer
+    // instead of starting a second timer that could disagree with it. With
+    // progress off the tick stays disabled, exactly as before.
+    let tick_interval = if args.progress {
+        crate::progress::UPDATE_INTERVAL
+    } else {
+        std::time::Duration::ZERO
+    };
+
+    // Announce only once every program is attached, so the start line and the
+    // update clock describe the same window. A setup failure produces the
+    // ordinary error and no progress timeline that would imply collection ran.
+    if let Some(progress) = progress.as_mut() {
+        progress.started();
+    }
+
+    let collected = {
+        let on_progress: Option<runtime::ProgressCallback<'_>> = progress
+            .as_mut()
+            .map(|reporter| Box::new(move |elapsed| reporter.update(elapsed)) as _);
+        runtime::run_multi_collection(
+            &mut bpf,
+            &mut target_tids,
+            &mut runtime::NoPendingCleanup,
+            &mut BTreeSet::new(),
+            &initial_tids,
+            runtime::MultiCollectionOptions {
+                pid,
+                duration: args.duration,
+                mode,
+                tick_interval,
+                // A short report wants its events as soon as they arrive.
+                poll_interval: runtime::DEFAULT_POLL_INTERVAL,
+            },
+            runtime::MultiStreams {
+                streams: vec![
+                    runtime::EventStream::of::<SchedulerLatencyEvent, _>(
+                        "EVENTS",
+                        PERF_PAGE_COUNT,
+                        &mut sched_stats,
+                    ),
+                    runtime::EventStream::of::<CpuSampleEvent, _>(
+                        "CPU_EVENTS",
+                        PERF_PAGE_COUNT,
+                        &mut cpu_stats,
+                    ),
+                    runtime::EventStream::of::<IoEvent, _>(
+                        "IO_EVENTS",
+                        PERF_PAGE_COUNT,
+                        &mut io_stats,
+                    ),
+                    runtime::EventStream::of::<TcpEvent, _>(
+                        "NET_EVENTS",
+                        PERF_PAGE_COUNT,
+                        &mut net_stats,
+                    ),
+                    runtime::EventStream::of::<OffCpuEvent, _>(
+                        "OFFCPU_EVENTS",
+                        PERF_PAGE_COUNT,
+                        &mut offcpu_stats,
+                    ),
+                ],
+                on_tick: None,
+                on_progress,
+            },
+        )
+    };
+
+    let summary = match collected {
+        Ok(summary) => {
+            if let Some(progress) = progress.as_mut() {
+                if summary.interrupted {
+                    progress.interrupted(summary.elapsed);
+                } else if summary.process_exited {
+                    progress.target_exited(summary.elapsed);
+                } else {
+                    progress.completed(summary.elapsed);
+                }
+            }
+            summary
+        }
+        Err(error) => {
+            if let Some(progress) = progress.as_mut() {
+                progress.failed();
+            }
+            return Err(error);
+        }
+    };
 
     cpu::detach_sampler(&mut bpf, cpu_links);
     // Usage is a difference between two readings, so the end-of-window

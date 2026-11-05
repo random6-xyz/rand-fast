@@ -1076,6 +1076,7 @@ pub fn run(args: DaemonArgs) -> Result<()> {
                 }
                 state.previous.at.saturating_sub(state.time_offset)
             })),
+            on_progress: None,
         },
     )?;
 

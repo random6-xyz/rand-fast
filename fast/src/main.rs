@@ -12,6 +12,7 @@ mod network;
 mod offcpu;
 mod output;
 mod process;
+mod progress;
 mod runtime;
 mod scoring;
 mod stats;
