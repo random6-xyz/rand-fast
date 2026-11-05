@@ -34,11 +34,35 @@ The build produces `target/release/fast`, `target/release/sched-workload`, and
 5. `tools/test-qemu-smoke.sh`: mock verifier/load failure propagation and child
    cleanup
 6. `tools/test-qemu-run.sh`: runner argument handling
-7. `tools/check-license-metadata.sh`: workspace license metadata
+7. `tools/test-scenarios.sh`: the scenario manifest and the generated guest
+   table agree, including fixture-argument quoting
+8. `tools/check-license-metadata.sh`: workspace license metadata
 
 The gate succeeds only when the script exits zero. The eBPF verifier and real
 kernel behavior require the separate QEMU gate below; a host-only gate is not a
 substitute for it.
+
+### Diagnosis scenarios
+
+`tools/scenarios.json` is the single source of truth for the diagnosis matrix:
+each scenario declares its fixture, optional background commands, the
+prerequisites it genuinely needs, its collection duration, and the evidence the
+guest must observe. `tools/scenarios-generate.sh` turns it into the
+dependency-free `tools/scenarios.sh` table that `tools/qemu-smoke.sh` sources;
+`tools/test-scenarios.sh` fails the gate when the two disagree. Edit the JSON,
+rerun the generator, and commit both.
+
+A required prerequisite that is missing fails the scenario. The only
+prerequisites currently declared are `tracefs`, `btf`, a real `block_device`
+(the guest's ext4 virtio disk), and `cpu2`; PSI is not required by any
+scenario. Fixtures write `--report` JSON themselves, so each case has an
+independent record of its operations and latency next to the collector's
+measurement, and `--ready-file` replaces fixed sleeps during startup.
+
+Scenario kinds separate proof from ranking work: `positive` cases must produce
+the declared measurement and at least one declared cause, `mixed` cases must
+produce both declared signals and one accepted cause, and the `control` case
+must not report any bottleneck cause. Ranking accuracy is evaluated separately.
 
 ### QEMU gate
 

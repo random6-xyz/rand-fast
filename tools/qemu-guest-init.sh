@@ -47,10 +47,12 @@ ip link set lo up
 # /mnt/io when the mount actually succeeded; otherwise fall back to the
 # default tmpfs path (which collects no block_rq_* samples).
 IO_HOG_PATH=/tmp/fast-workload-io
+FAST_BLOCK_DEVICE=0
 if [ -e /dev/vda ]; then
     mkdir -p /mnt/io
     if /bin/mount2 /dev/vda ext4 /mnt/io; then
         IO_HOG_PATH=/mnt/io/fast-workload-io
+        FAST_BLOCK_DEVICE=1
         echo "guest: block device /dev/vda mounted at /mnt/io"
     else
         echo "guest: block device mount FAILED; io-hog falls back to tmpfs"
@@ -122,6 +124,7 @@ export SCHED_WORKLOAD=/bin/sched-workload
 export FAST_WORKLOAD=/bin/fast-workload
 export OUT_DIR=/fast-smoke
 export IO_HOG_PATH
+export FAST_BLOCK_DEVICE
 
 # The per-run collection window is passed on the kernel command line as
 # fast.duration=<value> so the host helper can change it without rebuilding
@@ -141,20 +144,20 @@ sh /tools/qemu-smoke.sh
 rc=$?
 echo "=== smoke run finished with rc=$rc ==="
 echo "=== fixture logs ==="
-for f in /tmp/fast-smoke/*-fixture.log; do
+for f in "$OUT_DIR"/*-fixture.log; do
     [ -f "$f" ] || continue
     echo "----- $f -----"
     cat "$f"
 done
 echo "=== reports ==="
-for f in /tmp/fast-smoke/*.txt; do
+for f in "$OUT_DIR"/*.txt; do
     [ -f "$f" ] || continue
     echo "----- $f -----"
     cat "$f"
 done
 # The diagnose scenario documents are single-line JSON, so they are dumped
 # wrapped rather than raw, to keep the console log readable.
-for f in /tmp/fast-smoke/scenario-*.json; do
+for f in "$OUT_DIR"/scenario-*.json; do
     [ -f "$f" ] || continue
     echo "----- $f -----"
     tr ',' '\n' <"$f"
@@ -163,7 +166,7 @@ done
 # inspectable from the log rather than only asserted by the checks. The first
 # bundle of each case is the one written for the earliest interval that tripped.
 echo "=== incident bundles ==="
-for dir in /tmp/fast-smoke/trigger-*/incident-*/; do
+for dir in "$OUT_DIR"/trigger-*/incident-*/; do
     [ -d "$dir" ] || continue
     case "$dir" in
     *io/incident-*) first=1 ;;

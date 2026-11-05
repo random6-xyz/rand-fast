@@ -47,10 +47,26 @@ enum Mode {
     /// Allocation and page-fault churn (validates `fast memory`).
     #[command(name = "mem-hog")]
     Mem(MemHogArgs),
+    /// Futex contention and real block I/O in one process (mixed bottleneck).
+    #[command(name = "mixed-hog")]
+    Mixed(MixedHogArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+struct CommonArgs {
+    /// Write a machine-readable report here when the workload finishes.
+    #[arg(long, value_name = "PATH")]
+    report: Option<PathBuf>,
+    /// Create this file once the workload is ready to be observed.
+    #[arg(long, value_name = "PATH")]
+    ready_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
 struct IoHogArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+
     /// How long the workload should run.
     #[arg(long, value_parser = parse_duration)]
     duration: Duration,
@@ -100,10 +116,14 @@ struct IoWorkerArgs {
     cursor: Arc<AtomicU64>,
     bytes_read: Arc<AtomicU64>,
     bytes_written: Arc<AtomicU64>,
+    latencies: Arc<LatencySamples>,
 }
 
 #[derive(Debug, Clone, Args)]
 struct NetHogArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+
     /// How long the workload should run.
     #[arg(long, value_parser = parse_duration)]
     duration: Duration,
@@ -131,10 +151,21 @@ struct NetHogArgs {
     /// still in flight when it shuts and the sender has something to resend.
     #[arg(long, default_value_t = 8, value_name = "KB")]
     rcvbuf_kb: u64,
+
+    /// Delay before the echo server replies, in milliseconds.
+    ///
+    /// This models a slow remote peer: the connection is healthy, but each
+    /// request waits for the server. The client-side round-trip measurement
+    /// is an independent reference for what the collector should see.
+    #[arg(long, default_value_t = 0, value_name = "MS")]
+    peer_delay_ms: u64,
 }
 
 #[derive(Debug, Clone, Args)]
 struct LockHogArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+
     /// How long the workload should run.
     #[arg(long, value_parser = parse_duration)]
     duration: Duration,
@@ -150,6 +181,9 @@ struct LockHogArgs {
 
 #[derive(Debug, Clone, Args)]
 struct ThreadExitArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+
     /// How long the churn workload should run.
     #[arg(long, value_parser = parse_duration)]
     duration: Duration,
@@ -165,6 +199,9 @@ struct ThreadExitArgs {
 
 #[derive(Debug, Clone, Args)]
 struct MemHogArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+
     /// How long the workload should run.
     #[arg(long, value_parser = parse_duration)]
     duration: Duration,
@@ -178,6 +215,36 @@ struct MemHogArgs {
     size_mib: usize,
 }
 
+#[derive(Debug, Clone, Args)]
+struct MixedHogArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+
+    /// How long the workload should run.
+    #[arg(long, value_parser = parse_duration)]
+    duration: Duration,
+
+    /// Number of threads contending on one futex word.
+    #[arg(long, default_value_t = 8)]
+    workers: usize,
+
+    /// Time to sleep while holding the lock, in milliseconds.
+    #[arg(long, default_value_t = 0, value_name = "MS")]
+    hold_ms: u64,
+
+    /// File the I/O workers read with O_DIRECT.
+    #[arg(long, default_value = "/tmp/fast-workload-io")]
+    path: PathBuf,
+
+    /// File size in MiB.
+    #[arg(long, default_value_t = 32)]
+    size_mib: u64,
+
+    /// Number of O_DIRECT reader threads in the same process.
+    #[arg(long, default_value_t = 1)]
+    io_workers: usize,
+}
+
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     let result = match cli.mode {
@@ -186,6 +253,7 @@ fn main() -> std::process::ExitCode {
         Mode::Lock(args) => run_lock_hog(args),
         Mode::ThreadExit(args) => run_thread_exit_hog(args),
         Mode::Mem(args) => run_mem_hog(args),
+        Mode::Mixed(args) => run_mixed_hog(args),
     };
 
     if let Err(error) = result {
@@ -240,7 +308,9 @@ fn run_io_hog(args: IoHogArgs) -> Result<(), String> {
             "sequential"
         },
     );
+    mark_ready(&args.common)?;
 
+    let latencies = Arc::new(LatencySamples::default());
     let cursor = Arc::new(AtomicU64::new(0));
     let bytes_read = Arc::new(AtomicU64::new(0));
     let bytes_written = Arc::new(AtomicU64::new(0));
@@ -260,6 +330,7 @@ fn run_io_hog(args: IoHogArgs) -> Result<(), String> {
             cursor: Arc::clone(&cursor),
             bytes_read: Arc::clone(&bytes_read),
             bytes_written: Arc::clone(&bytes_written),
+            latencies: Arc::clone(&latencies),
         };
         handles.push(
             thread::Builder::new()
@@ -285,6 +356,14 @@ fn run_io_hog(args: IoHogArgs) -> Result<(), String> {
             bytes_read.load(Ordering::Relaxed),
         );
     }
+    write_report(
+        &args.common,
+        "io-hog",
+        args.duration,
+        reads + writes,
+        latencies.percentiles(),
+        &[("workers", args.workers as u64)],
+    )?;
     Ok(())
 }
 
@@ -317,6 +396,7 @@ fn io_worker(args: IoWorkerArgs) -> Result<(), String> {
         cursor,
         bytes_read,
         bytes_written,
+        latencies,
     } = args;
     let file = open_direct(&path, write)?;
     let fd = file.as_raw_fd();
@@ -350,11 +430,17 @@ fn io_worker(args: IoWorkerArgs) -> Result<(), String> {
         }
 
         let n = unsafe {
-            if write {
+            let started = Instant::now();
+            let result = if write {
                 libc::pwrite(fd, buffer.cast(), CHUNK_SIZE, offset as libc::off_t)
             } else {
                 libc::pread(fd, buffer.cast(), CHUNK_SIZE, offset as libc::off_t)
-            }
+            };
+            // The elapsed time includes the syscall only, not the flush, so
+            // the report describes request service time rather than the
+            // durability cost an unrelated signal would add.
+            latencies.record(started.elapsed());
+            result
         };
         if n < 0 {
             let error = std::io::Error::last_os_error();
@@ -418,28 +504,33 @@ fn run_net_hog(args: NetHogArgs) -> Result<(), String> {
         .port();
 
     println!(
-        "net-hog pid: {} endpoint: 127.0.0.1:{port} workers: {} delay: {}ms",
+        "net-hog pid: {} endpoint: 127.0.0.1:{port} workers: {} delay: {}ms peer-delay: {}ms",
         std::process::id(),
         args.workers,
         args.delay_ms,
+        args.peer_delay_ms,
     );
+    mark_ready(&args.common)?;
 
     let round_trips = Arc::new(AtomicU64::new(0));
     let sent = Arc::new(AtomicU64::new(0));
+    let latencies = Arc::new(LatencySamples::default());
     let deadline = Instant::now() + args.duration;
     let stalling = args.delay_ms > 0;
     let delay = Duration::from_millis(args.delay_ms);
+    let peer_delay = Duration::from_millis(args.peer_delay_ms);
     let rcvbuf_kb = args.rcvbuf_kb;
 
     let server = thread::Builder::new()
         .name("net-hog-server".to_string())
-        .spawn(move || echo_server(listener, deadline, delay, stalling, rcvbuf_kb))
+        .spawn(move || echo_server(listener, deadline, delay, stalling, rcvbuf_kb, peer_delay))
         .map_err(|error| format!("failed to spawn server: {error}"))?;
 
     let mut handles = Vec::with_capacity(args.workers);
     for worker in 0..args.workers {
         let round_trips = Arc::clone(&round_trips);
         let sent = Arc::clone(&sent);
+        let latencies = Arc::clone(&latencies);
         handles.push(
             thread::Builder::new()
                 .name(format!("net-hog-client-{worker}"))
@@ -447,7 +538,7 @@ fn run_net_hog(args: NetHogArgs) -> Result<(), String> {
                     if stalling {
                         net_client_stall(port, deadline, &sent)
                     } else {
-                        net_client(port, deadline, &round_trips)
+                        net_client(port, deadline, &round_trips, &latencies)
                     }
                 })
                 .map_err(|error| format!("failed to spawn client: {error}"))?,
@@ -469,6 +560,21 @@ fn run_net_hog(args: NetHogArgs) -> Result<(), String> {
             round_trips.load(Ordering::Relaxed),
         );
     }
+    write_report(
+        &args.common,
+        "net-hog",
+        args.duration,
+        if stalling {
+            sent.load(Ordering::Relaxed)
+        } else {
+            round_trips.load(Ordering::Relaxed)
+        },
+        latencies.percentiles(),
+        &[
+            ("workers", args.workers as u64),
+            ("peer_delay_ms", args.peer_delay_ms),
+        ],
+    )?;
     Ok(())
 }
 
@@ -478,6 +584,7 @@ fn echo_server(
     delay: Duration,
     stalling: bool,
     rcvbuf_kb: u64,
+    peer_delay: Duration,
 ) {
     let _ = listener.set_nonblocking(true);
     while Instant::now() < deadline + Duration::from_secs(1) {
@@ -485,7 +592,7 @@ fn echo_server(
             Ok((stream, _addr)) => {
                 let _ = thread::Builder::new()
                     .name("net-hog-echo".to_string())
-                    .spawn(move || echo_connection(stream, delay, stalling, rcvbuf_kb));
+                    .spawn(move || echo_connection(stream, delay, stalling, rcvbuf_kb, peer_delay));
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(10));
@@ -502,6 +609,7 @@ fn echo_connection(
     delay: Duration,
     stalling: bool,
     rcvbuf_kb: u64,
+    peer_delay: Duration,
 ) {
     let mut buffer = [0u8; 1024];
     if !stalling {
@@ -509,6 +617,11 @@ fn echo_connection(
             match stream.read(&mut buffer) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    if !peer_delay.is_zero() {
+                        // Deliberate remote-side think time: the connection is
+                        // healthy, so this is a slow peer rather than loss.
+                        thread::sleep(peer_delay);
+                    }
                     if stream.write_all(&buffer[..n]).is_err() {
                         break;
                     }
@@ -591,7 +704,12 @@ fn net_client_stall(port: u16, deadline: Instant, sent: &AtomicU64) -> Result<()
     Ok(())
 }
 
-fn net_client(port: u16, deadline: Instant, round_trips: &AtomicU64) -> Result<(), String> {
+fn net_client(
+    port: u16,
+    deadline: Instant,
+    round_trips: &AtomicU64,
+    latencies: &LatencySamples,
+) -> Result<(), String> {
     let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
         .map_err(|error| format!("connect 127.0.0.1:{port}: {error}"))?;
     let _ = stream.set_nodelay(true);
@@ -603,12 +721,14 @@ fn net_client(port: u16, deadline: Instant, round_trips: &AtomicU64) -> Result<(
     let mut response = [0u8; 256];
 
     while Instant::now() < deadline {
+        let started = Instant::now();
         stream
             .write_all(&request)
             .map_err(|error| format!("write: {error}"))?;
         stream
             .read_exact(&mut response)
             .map_err(|error| format!("read: {error}"))?;
+        latencies.record(started.elapsed());
         black_box(response[0]);
         round_trips.fetch_add(1, Ordering::Relaxed);
     }
@@ -632,16 +752,19 @@ fn run_lock_hog(args: LockHogArgs) -> Result<(), String> {
     // Leak the futex word so raw pointers handed to threads stay valid.
     let futex_word: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
     let acquisitions = Arc::new(AtomicU64::new(0));
+    let latencies = Arc::new(LatencySamples::default());
     let deadline = Instant::now() + args.duration;
     let hold = Duration::from_millis(args.hold_ms);
+    mark_ready(&args.common)?;
 
     let mut handles = Vec::with_capacity(args.workers);
     for worker in 0..args.workers {
         let acquisitions = Arc::clone(&acquisitions);
+        let latencies = Arc::clone(&latencies);
         handles.push(
             thread::Builder::new()
                 .name(format!("lock-hog-{worker}"))
-                .spawn(move || lock_worker(futex_word, deadline, hold, &acquisitions))
+                .spawn(move || lock_worker(futex_word, deadline, hold, &acquisitions, &latencies))
                 .map_err(|error| format!("failed to spawn lock worker: {error}"))?,
         );
     }
@@ -651,6 +774,14 @@ fn run_lock_hog(args: LockHogArgs) -> Result<(), String> {
         "lock-hog: {} acquisitions",
         acquisitions.load(Ordering::Relaxed),
     );
+    write_report(
+        &args.common,
+        "lock-hog",
+        args.duration,
+        acquisitions.load(Ordering::Relaxed),
+        latencies.percentiles(),
+        &[("workers", args.workers as u64), ("hold_ms", args.hold_ms)],
+    )?;
     Ok(())
 }
 
@@ -667,6 +798,7 @@ fn run_thread_exit_hog(args: ThreadExitArgs) -> Result<(), String> {
     let reused = Arc::new(AtomicU64::new(0));
     let deadline = Instant::now() + args.duration;
     let sleep = Duration::from_millis(args.sleep_ms);
+    mark_ready(&args.common)?;
 
     while Instant::now() < deadline {
         let mut handles = Vec::with_capacity(args.workers);
@@ -702,6 +834,14 @@ fn run_thread_exit_hog(args: ThreadExitArgs) -> Result<(), String> {
         created.load(Ordering::Relaxed),
         reused.load(Ordering::Relaxed)
     );
+    write_report(
+        &args.common,
+        "thread-exit-hog",
+        args.duration,
+        created.load(Ordering::Relaxed),
+        None,
+        &[("reused_tids", reused.load(Ordering::Relaxed))],
+    )?;
     Ok(())
 }
 
@@ -710,6 +850,7 @@ fn lock_worker(
     deadline: Instant,
     hold: Duration,
     acquisitions: &AtomicU64,
+    latencies: &LatencySamples,
 ) -> Result<(), String> {
     let word = futex_word as *const AtomicU32 as *mut u32;
     let futex_wait = libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG;
@@ -718,6 +859,9 @@ fn lock_worker(
 
     while Instant::now() < deadline {
         // Acquire: spin once, then park in the kernel on the contended word.
+        // The time from here to the successful exchange is the wait the
+        // collector should see, independently of its own off-CPU accounting.
+        let wait_started = Instant::now();
         loop {
             match futex_word.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed) {
                 Ok(_) => break,
@@ -736,6 +880,7 @@ fn lock_worker(
                 },
             }
         }
+        latencies.record(wait_started.elapsed());
 
         // Optional hold time makes a deliberate lock bottleneck rank ahead of
         // CPU use in deterministic diagnostic scenarios.
@@ -781,6 +926,7 @@ fn run_mem_hog(args: MemHogArgs) -> Result<(), String> {
     let bytes_faulted = Arc::new(AtomicU64::new(0));
     let deadline = Instant::now() + args.duration;
     let size = args.size_mib * 1024 * 1024;
+    mark_ready(&args.common)?;
 
     let mut handles = Vec::with_capacity(args.workers);
     for worker in 0..args.workers {
@@ -800,6 +946,99 @@ fn run_mem_hog(args: MemHogArgs) -> Result<(), String> {
         rounds.load(Ordering::Relaxed),
         bytes_faulted.load(Ordering::Relaxed) / (1024 * 1024),
     );
+    write_report(
+        &args.common,
+        "mem-hog",
+        args.duration,
+        rounds.load(Ordering::Relaxed),
+        None,
+        &[
+            ("workers", args.workers as u64),
+            ("bytes_faulted", bytes_faulted.load(Ordering::Relaxed)),
+        ],
+    )?;
+    Ok(())
+}
+
+fn run_mixed_hog(args: MixedHogArgs) -> Result<(), String> {
+    if args.workers < 2 {
+        return Err("workers must be at least two for contention".to_string());
+    }
+    if args.io_workers == 0 {
+        return Err("io-workers must be greater than zero".to_string());
+    }
+    if args.size_mib == 0 {
+        return Err("size-mib must be greater than zero".to_string());
+    }
+
+    let file_size = args.size_mib * 1024 * 1024;
+    prepare_file(&args.path, file_size)?;
+    println!(
+        "mixed-hog pid: {} file: {} lock-workers: {} io-workers: {}",
+        std::process::id(),
+        args.path.display(),
+        args.workers,
+        args.io_workers,
+    );
+
+    let futex_word: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(0)));
+    let acquisitions = Arc::new(AtomicU64::new(0));
+    let lock_latencies = Arc::new(LatencySamples::default());
+    let bytes_read = Arc::new(AtomicU64::new(0));
+    let bytes_written = Arc::new(AtomicU64::new(0));
+    let cursor = Arc::new(AtomicU64::new(0));
+    let deadline = Instant::now() + args.duration;
+    let hold = Duration::from_millis(args.hold_ms);
+
+    let mut handles = Vec::with_capacity(args.workers + args.io_workers);
+    for worker in 0..args.workers {
+        let acquisitions = Arc::clone(&acquisitions);
+        let latencies = Arc::clone(&lock_latencies);
+        handles.push(
+            thread::Builder::new()
+                .name(format!("mixed-lock-{worker}"))
+                .spawn(move || lock_worker(futex_word, deadline, hold, &acquisitions, &latencies))
+                .map_err(|error| format!("failed to spawn lock worker: {error}"))?,
+        );
+    }
+    for worker in 0..args.io_workers {
+        let worker_args = IoWorkerArgs {
+            path: args.path.clone(),
+            file_size,
+            random: true,
+            same_sector: false,
+            write: false,
+            flush: false,
+            worker,
+            deadline,
+            cursor: Arc::clone(&cursor),
+            bytes_read: Arc::clone(&bytes_read),
+            bytes_written: Arc::clone(&bytes_written),
+            latencies: Arc::new(LatencySamples::default()),
+        };
+        handles.push(
+            thread::Builder::new()
+                .name(format!("mixed-io-{worker}"))
+                .spawn(move || io_worker(worker_args))
+                .map_err(|error| format!("failed to spawn io worker: {error}"))?,
+        );
+    }
+    mark_ready(&args.common)?;
+
+    join_workers(handles)?;
+    let reads = bytes_read.load(Ordering::Relaxed) / CHUNK_SIZE as u64;
+    write_report(
+        &args.common,
+        "mixed-hog",
+        args.duration,
+        acquisitions.load(Ordering::Relaxed) + reads,
+        lock_latencies.percentiles(),
+        &[
+            ("workers", args.workers as u64),
+            ("io_workers", args.io_workers as u64),
+            ("io_reads", reads),
+        ],
+    )?;
     Ok(())
 }
 
@@ -859,4 +1098,116 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
         return Err("duration must be greater than zero".to_string());
     }
     Ok(duration)
+}
+
+/// Upper bound on retained latency samples per fixture.
+///
+/// A 30s run at tens of thousands of operations per second would otherwise
+/// accumulate millions of samples and distort the memory signal the fixture is
+/// supposed to produce. The first samples are kept rather than a random
+/// sample, so the report is deterministic for a deterministic workload.
+const MAX_LATENCY_SAMPLES: usize = 200_000;
+
+/// Latency samples shared by the worker threads.
+#[derive(Default)]
+struct LatencySamples {
+    samples: Mutex<Vec<u32>>,
+}
+
+impl LatencySamples {
+    fn record(&self, elapsed: Duration) {
+        let micros = elapsed.as_micros().min(u32::MAX as u128) as u32;
+        if let Ok(mut samples) = self.samples.lock()
+            && samples.len() < MAX_LATENCY_SAMPLES
+        {
+            samples.push(micros);
+        }
+    }
+
+    fn percentiles(&self) -> Option<(u32, u32, u32)> {
+        let mut samples = self.samples.lock().ok()?.clone();
+        if samples.is_empty() {
+            return None;
+        }
+        samples.sort_unstable();
+        Some((
+            percentile(&samples, 50),
+            percentile(&samples, 95),
+            percentile(&samples, 99),
+        ))
+    }
+}
+
+/// Nearest-rank percentile over an ascending slice.
+fn percentile(sorted: &[u32], pct: usize) -> u32 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = (pct * sorted.len()).div_ceil(100).max(1);
+    sorted[rank - 1]
+}
+
+/// Creates the readiness marker the QEMU matrix waits for instead of sleeping.
+fn mark_ready(common: &CommonArgs) -> Result<(), String> {
+    if let Some(path) = &common.ready_file {
+        std::fs::write(path, b"ready\n")
+            .map_err(|error| format!("write {}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Writes the machine-readable reference measurement for this run.
+///
+/// The report is written by the fixture, not by the collector, so it is an
+/// independent record of what the workload actually did. It is only written
+/// after a normal finish, which keeps a killed run from looking measured.
+fn write_report(
+    common: &CommonArgs,
+    workload: &str,
+    duration: Duration,
+    ops: u64,
+    latency: Option<(u32, u32, u32)>,
+    extra: &[(&str, u64)],
+) -> Result<(), String> {
+    let Some(path) = &common.report else {
+        return Ok(());
+    };
+    let mut body = format!(
+        "{{\"workload\":\"{workload}\",\"pid\":{},\"duration_ms\":{},\"ops\":{ops}",
+        std::process::id(),
+        duration.as_millis()
+    );
+    if let Some((p50, p95, p99)) = latency {
+        body.push_str(&format!(
+            ",\"latency_us\":{{\"p50\":{p50},\"p95\":{p95},\"p99\":{p99}}}"
+        ));
+    }
+    for (name, value) in extra {
+        body.push_str(&format!(",\"{name}\":{value}"));
+    }
+    body.push_str("}\n");
+    std::fs::write(path, body).map_err(|error| format!("write {}: {error}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percentile_uses_nearest_rank() {
+        let values = [1, 2, 3, 4];
+        assert_eq!(percentile(&values, 50), 2);
+        assert_eq!(percentile(&values, 95), 4);
+        assert_eq!(percentile(&values, 0), 1);
+        assert_eq!(percentile(&[], 95), 0);
+    }
+
+    #[test]
+    fn latency_samples_report_p50_p95_p99() {
+        let samples = LatencySamples::default();
+        for value in [1u32, 2, 3, 4, 100] {
+            samples.record(Duration::from_micros(value as u64));
+        }
+        assert_eq!(samples.percentiles(), Some((3, 100, 100)));
+    }
 }
