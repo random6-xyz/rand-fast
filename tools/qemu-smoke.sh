@@ -245,6 +245,20 @@ if [ "${QEMU_SMOKE_TEST_CASE:-}" = "tcp-unavailable" ]; then
     finish
 fi
 
+if [ "${QEMU_SMOKE_TEST_CASE:-}" = "bench" ]; then
+    mkdir -p "$OUT_DIR/bench"
+    if "$FAST_BENCH" --fast "$FAST" --workload "$FAST_WORKLOAD" \
+        --duration "$BENCH_DURATION" --repetitions "$BENCH_REPETITIONS" \
+        --warmup "$BENCH_WARMUP" --modes "$BENCH_MODES" \
+        --io-path "$IO_HOG_PATH" --out "$OUT_DIR/bench"; then
+        echo "benchmark: pass"
+    else
+        echo "benchmark: FAIL"
+        FAILURES=$((FAILURES + 1))
+    fi
+    finish
+fi
+
 run_sched_case
 run_case cpu "$SCHED_WORKLOAD" hog --duration 30s --workers 8
 run_case io "$FAST_WORKLOAD" io-hog --duration 30s --workers 2 --path "$IO_HOG_PATH"

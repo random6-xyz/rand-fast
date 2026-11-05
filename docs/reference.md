@@ -205,6 +205,14 @@ validate every consumed field, then record the cell result in this table. A
 layout change is handled by adding an explicit verified profile, never by
 loosening the comparison to guessed offsets.
 
+### Overhead measurement
+
+`tools/bench.sh` records paired baseline/instrumented runs for CPU, I/O, lock
+and network workloads and writes `target/bench-report.json`. It reports target
+throughput and latency, collector CPU and peak RSS, event loss, and the
+kernel/accelerator metadata. The benchmark is reproducible locally and in CI;
+see [the benchmark guide](benchmark.md).
+
 ### TCP attribution
 
 TCP RTT and retransmission attribution is disabled. `tcp_probe` can run on the
