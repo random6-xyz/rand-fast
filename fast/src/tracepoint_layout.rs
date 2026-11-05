@@ -1,15 +1,16 @@
 //! Guards the fixed tracepoint payload offsets used by the eBPF programs.
 //!
-//! These offsets were verified against Linux 6.12.105 and Linux 7.2.0-rc6.
-//! Before attaching an offset-reading program, compare the live tracefs format
-//! with that known layout. A mismatch must stop collection rather than turn
-//! into plausible-looking but corrupt samples.
+//! These offsets were verified against the checked-in layout fixtures:
+//! 6.1.191, 6.6.161, 6.12.105, 6.12.115, 7.2.0-rc6 and 7.2.15. Before attaching
+//! an offset-reading program, compare the live tracefs format with that known
+//! layout. A mismatch must stop collection rather than turn into
+//! plausible-looking but corrupt samples.
 
 use std::{collections::HashMap, fs, path::Path};
 
 use anyhow::{Context, Result, bail};
 
-const VERIFIED_KERNELS: &str = "Linux 6.12.105 and Linux 7.2.0-rc6";
+const VERIFIED_KERNELS: &str = "Linux 6.1.191, 6.6.161, 6.12.105, 6.12.115, 7.2.0-rc6 and 7.2.15";
 const TRACEFS_EVENT_ROOTS: [&str; 2] = [
     "/sys/kernel/tracing/events",
     "/sys/kernel/debug/tracing/events",
@@ -341,8 +342,12 @@ fn parse_attribute(attributes: &str, name: &str) -> Option<usize> {
 mod tests {
     use super::*;
 
+    const LINUX_6_1_191: &str = include_str!("../tests/fixtures/tracepoints/linux-6.1.191.txt");
+    const LINUX_6_6_161: &str = include_str!("../tests/fixtures/tracepoints/linux-6.6.161.txt");
     const LINUX_6_12_105: &str = include_str!("../tests/fixtures/tracepoints/linux-6.12.105.txt");
+    const LINUX_6_12_115: &str = include_str!("../tests/fixtures/tracepoints/linux-6.12.115.txt");
     const LINUX_7_2_RC6: &str = include_str!("../tests/fixtures/tracepoints/linux-7.2.0-rc6.txt");
+    const LINUX_7_2_15: &str = include_str!("../tests/fixtures/tracepoints/linux-7.2.15.txt");
 
     fn section<'a>(fixture: &'a str, event: &str) -> &'a str {
         let marker = format!("name: {event}");
@@ -370,10 +375,60 @@ mod tests {
         }
     }
 
+    /// The 6.1 and 6.6 `tcp_probe` tracepoint has no `skaddr` field. TCP is
+    /// disabled on every kernel, so this is a documented gap rather than a
+    /// supported measurement; the non-TCP collectors must still validate.
+    fn assert_non_tcp_fixture_matches(fixture: &str) {
+        for spec in EVENTS.iter().filter(|spec| spec.category != "tcp") {
+            validate_format(spec, section(fixture, spec.name))
+                .unwrap_or_else(|error| panic!("{} / {}: {error:#}", spec.category, spec.name));
+        }
+    }
+
     #[test]
     fn verified_kernel_layout_fixtures_match_all_consumed_fields() {
         assert_fixture_matches(LINUX_6_12_105);
+        assert_fixture_matches(LINUX_6_12_115);
         assert_fixture_matches(LINUX_7_2_RC6);
+        assert_fixture_matches(LINUX_7_2_15);
+    }
+
+    #[test]
+    fn older_lts_fixtures_match_every_non_tcp_collector() {
+        assert_non_tcp_fixture_matches(LINUX_6_1_191);
+        assert_non_tcp_fixture_matches(LINUX_6_6_161);
+    }
+
+    #[test]
+    fn tcp_probe_without_skaddr_is_rejected_not_guessed() {
+        let spec = EVENTS
+            .iter()
+            .find(|spec| spec.category == "tcp" && spec.name == "tcp_probe")
+            .unwrap();
+        for fixture in [LINUX_6_1_191, LINUX_6_6_161] {
+            let error = validate_format(spec, section(fixture, "tcp_probe"))
+                .expect_err("a tcp_probe without skaddr must not validate");
+            assert!(
+                error.to_string().contains("skaddr"),
+                "the error must name the missing field: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_drifted_offset_is_rejected_rather_than_interpreted() {
+        let spec = EVENTS
+            .iter()
+            .find(|spec| spec.name == "sched_switch")
+            .unwrap();
+        let drifted = section(LINUX_6_12_115, "sched_switch")
+            .replace("offset:32;size:8;", "offset:40;size:8;");
+        let error =
+            validate_format(spec, &drifted).expect_err("a moved prev_state field must be rejected");
+        assert!(
+            error.to_string().contains("unsupported tracepoint layout"),
+            "the error must say the layout is unsupported: {error}"
+        );
     }
 
     #[test]
