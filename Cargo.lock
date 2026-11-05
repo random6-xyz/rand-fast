@@ -374,6 +374,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fast-bench"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "humantime",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "fast-common"
 version = "0.2.1"
 dependencies = [

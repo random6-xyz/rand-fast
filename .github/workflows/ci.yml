@@ -100,3 +100,46 @@ jobs:
           kernel-id: ${{ matrix.id }}
           kernel-version: ${{ matrix.version }}
           psi: ${{ matrix.psi }}
+
+  benchmark:
+    name: Collector overhead benchmark
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'benchmark')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust-ebpf
+      - name: Install QEMU and kernel build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            qemu-system-x86 busybox-static cpio gcc libc6-dev e2fsprogs \
+            bc flex bison libelf-dev libssl-dev dwarves zstd xz-utils
+      - name: Restore the pinned kernel
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/rand-fast-kernels/6.12.115
+          key: kernel-${{ runner.os }}-6.12.115-${{ hashFiles('tools/kernel/kernels.tsv', 'tools/kernel/config.fragment', 'tools/kernel/config.nopsi.fragment', 'tools/kernel/build.sh') }}
+      - name: Build the pinned kernel
+        run: |
+          kernel=$(tools/kernel/build.sh 6.12.115)
+          echo "KERNEL=$kernel" >>"$GITHUB_ENV"
+      - name: Run the paired benchmark
+        env:
+          OUT_DIR: ${{ runner.temp }}/bench
+          BENCH_OUT: ${{ runner.temp }}/bench-report.json
+          BENCH_DURATION: 3s
+          BENCH_REPETITIONS: '1'
+          CPUS: '4'
+          QEMU_TIMEOUT: '4200'
+        run: tools/bench.sh
+      - name: Upload the benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-report
+          path: |
+            ${{ runner.temp }}/bench-report.json
+            ${{ runner.temp }}/bench/guest.log
+          if-no-files-found: warn
+          retention-days: 14

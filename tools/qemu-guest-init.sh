@@ -122,7 +122,12 @@ fi
 export FAST=/bin/fast
 export SCHED_WORKLOAD=/bin/sched-workload
 export FAST_WORKLOAD=/bin/fast-workload
+export FAST_BENCH=/bin/fast-bench
 export OUT_DIR=/fast-smoke
+export BENCH_DURATION=${BENCH_DURATION:-3s}
+export BENCH_REPETITIONS=${BENCH_REPETITIONS:-1}
+export BENCH_WARMUP=${BENCH_WARMUP:-0}
+export BENCH_MODES=${BENCH_MODES:-cpu,io,lock,net}
 export FAST_ACCEL
 export RANK_EVAL=${RANK_EVAL:-0}
 export RANK_REPETITIONS=${RANK_REPETITIONS:-3}
@@ -138,9 +143,14 @@ if [ -r /proc/cmdline ]; then
         case "$arg" in
         fast.duration=*) DURATION=${arg#fast.duration=} ;;
         fast.smoke_case=tcp-unavailable) export QEMU_SMOKE_TEST_CASE=tcp-unavailable ;;
+        fast.smoke_case=bench) export QEMU_SMOKE_TEST_CASE=bench ;;
         fast.accel=*) export FAST_ACCEL=${arg#fast.accel=} ;;
         fast.rank_eval=*) export RANK_EVAL=${arg#fast.rank_eval=} ;;
         fast.rank_repetitions=*) export RANK_REPETITIONS=${arg#fast.rank_repetitions=} ;;
+        fast.bench_duration=*) export BENCH_DURATION=${arg#fast.bench_duration=} ;;
+        fast.bench_repetitions=*) export BENCH_REPETITIONS=${arg#fast.bench_repetitions=} ;;
+        fast.bench_warmup=*) export BENCH_WARMUP=${arg#fast.bench_warmup=} ;;
+        fast.bench_modes=*) export BENCH_MODES=${arg#fast.bench_modes=} ;;
         esac
     done
 fi
@@ -176,6 +186,11 @@ for f in "$OUT_DIR"/*.txt; do
     echo "----- $f -----"
     cat "$f"
 done
+if [ -f "$OUT_DIR/bench/report.json" ]; then
+    echo "----- bench-report-begin -----"
+    cat "$OUT_DIR/bench/report.json"
+    echo "----- bench-report-end -----"
+fi
 # The diagnose scenario documents are single-line JSON, so they are dumped
 # wrapped rather than raw, to keep the console log readable.
 if [ -r "$OUT_DIR/rank/runs.tsv" ]; then

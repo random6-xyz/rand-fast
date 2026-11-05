@@ -45,7 +45,11 @@ QEMU_TIMEOUT=${QEMU_TIMEOUT:-1800}
 ACCEL_MODE=${ACCEL:-auto}
 RANK_EVAL=${RANK_EVAL:-0}
 RANK_REPETITIONS=${RANK_REPETITIONS:-3}
-case "$QEMU_SMOKE_CASE" in all|tcp-unavailable) ;; *) echo "qemu-run: invalid QEMU_SMOKE_CASE" >&2; exit 2 ;; esac
+BENCH_DURATION=${BENCH_DURATION:-3s}
+BENCH_REPETITIONS=${BENCH_REPETITIONS:-1}
+BENCH_WARMUP=${BENCH_WARMUP:-0}
+BENCH_MODES=${BENCH_MODES:-cpu,io,lock,net}
+case "$QEMU_SMOKE_CASE" in all|tcp-unavailable|bench) ;; *) echo "qemu-run: invalid QEMU_SMOKE_CASE" >&2; exit 2 ;; esac
 KEEP=0
 
 while [ "$#" -gt 0 ]; do
@@ -148,7 +152,8 @@ cp "$OUT_DIR/mount2" "$STAGE/bin/mount2"
 # Without this symlink the guest panics with "Failed to execute /init (-2)".
 ln -s busybox "$STAGE/bin/sh"
 cp "$FAST" "$STAGE/bin/fast"
-for binary in sched-workload fast-workload; do
+for binary in sched-workload fast-workload fast-bench; do
+    [ -x "$ROOT/target/release/$binary" ] || die "missing target/release/$binary"
     cp "$ROOT/target/release/$binary" "$STAGE/bin/$binary"
 done
 
@@ -249,7 +254,7 @@ fi
 timeout "$QEMU_TIMEOUT" qemu-system-x86_64 $ACCEL_FLAG \
     -m "$MEM_MB" -smp "$CPUS" \
     -kernel "$KERNEL" -initrd "$INITRAMFS" \
-    -append "console=ttyS0 rdinit=/init loglevel=3 panic=-1 fast.duration=$DURATION fast.smoke_case=$QEMU_SMOKE_CASE fast.accel=$ACCEL_NAME fast.rank_eval=$RANK_EVAL fast.rank_repetitions=$RANK_REPETITIONS" \
+    -append "console=ttyS0 rdinit=/init loglevel=3 panic=-1 fast.duration=$DURATION fast.smoke_case=$QEMU_SMOKE_CASE fast.accel=$ACCEL_NAME fast.rank_eval=$RANK_EVAL fast.rank_repetitions=$RANK_REPETITIONS fast.bench_duration=$BENCH_DURATION fast.bench_repetitions=$BENCH_REPETITIONS fast.bench_warmup=$BENCH_WARMUP fast.bench_modes=$BENCH_MODES" \
     -nographic -no-reboot -monitor none \
     -drive "file=$IO_IMG,format=raw,if=virtio" \
     < /dev/null > "$LOG" 2>&1
