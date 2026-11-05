@@ -123,7 +123,7 @@ export FAST=/bin/fast
 export SCHED_WORKLOAD=/bin/sched-workload
 export FAST_WORKLOAD=/bin/fast-workload
 export OUT_DIR=/fast-smoke
-export FAST_ACCEL=${FAST_ACCEL:-unknown}
+export FAST_ACCEL
 export RANK_EVAL=${RANK_EVAL:-0}
 export RANK_REPETITIONS=${RANK_REPETITIONS:-3}
 export IO_HOG_PATH
@@ -145,6 +145,7 @@ if [ -r /proc/cmdline ]; then
     done
 fi
 echo "guest: collection duration $DURATION"
+echo "guest: accelerator ${FAST_ACCEL:-unknown}"
 
 sh /tools/qemu-smoke.sh
 rc=$?

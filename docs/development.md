@@ -5,7 +5,8 @@
 - `fast/`: CLI, collectors, diagnosis, reporting, and flight recorder.
 - `fast-ebpf/`: eBPF programs loaded into the kernel.
 - `fast-common/`: types shared by kernel and userspace.
-- `tools/`: verification, QEMU runner, release packaging, and test workloads.
+- `tools/`: verification, QEMU runner, release packaging, test workloads, and
+  the pinned kernel pipeline under `tools/kernel/`.
 - `fast/tests/fixtures/tracepoints/`: tracepoint layout test fixtures.
 
 ## Build
@@ -36,7 +37,11 @@ The build produces `target/release/fast`, `target/release/sched-workload`, and
 6. `tools/test-qemu-run.sh`: runner argument handling
 7. `tools/test-scenarios.sh`: the scenario manifest and the generated guest
    table agree, including fixture-argument quoting
-8. `tools/check-license-metadata.sh`: workspace license metadata
+8. `tools/test-rank-eval.sh`: the ranking gate rejects missing, empty, and wrong
+   runs
+9. `tools/test-qemu-ci.sh`: the CI guest-log audit rejects partial runs
+10. `tools/test-kernel-build.sh`: the kernel pin table and build failure paths
+11. `tools/check-license-metadata.sh`: workspace license metadata
 
 The gate succeeds only when the script exits zero. The eBPF verifier and real
 kernel behavior require the separate QEMU gate below; a host-only gate is not a
@@ -63,6 +68,33 @@ Scenario kinds separate proof from ranking work: `positive` cases must produce
 the declared measurement and at least one declared cause, `mixed` cases must
 produce both declared signals and one accepted cause, and the `control` case
 must not report any bottleneck cause.
+
+### Real-kernel CI gate
+
+The `qemu-real-kernel` job in `.github/workflows/ci.yml` runs on every pull
+request and main push. It provisions QEMU and kernel build tools, builds the
+kernel pinned in `tools/kernel/kernels.tsv` from its verified tarball with
+`tools/kernel/config.fragment`, boots the guest with
+`tools/qemu-run.sh`, and audits the guest log with
+`tools/check-qemu-results.sh`.
+
+The audit is what makes the job meaningful: a missing BTF/tracefs facility, a
+required verifier check that did not run, an unexpected `SKIP`, a scenario
+failure, the wrong kernel version, or a non-zero guest exit fails the job.
+The only accepted skip is the documented TCP unavailable one. The job always
+uploads the guest log, the kernel config and build record, the cell record, and
+the loader diagnostics, including on failure. The kernel cache is keyed by the
+version, the config fragment, and the build script, so a source change rebuilds
+and an unchanged matrix does not.
+
+GitHub-hosted runners have no `/dev/kvm`, so the job runs under QEMU's TCG
+emulation with a 70-minute guest timeout and a 180-minute job timeout; the
+kernel build dominates the first uncached run. The same path is reproducible on
+a KVM host with `ACCEL=tcg CPUS=2 tools/qemu-run.sh`. `QEMU_TIMEOUT` bounds the guest
+and `CPUS`/`MEM_MB` keep the guest inside the runner. A self-hosted runner with
+`/dev/kvm` uses KVM automatically and records the accelerator in the log. The
+local reproduction is the same command sequence documented above, with the
+`KERNEL` path printed by `tools/kernel/build.sh 6.12.115`.
 
 ### Ranking accuracy
 
@@ -98,9 +130,12 @@ the matrix once more and gates on the deterministic checks).
 
 Run the real-kernel tests inside QEMU without host root. Provide an appropriate
 kernel image explicitly; the runner's built-in default points to a
-machine-specific build path. The host also needs KVM access, `qemu-system-x86_64`,
-`cpio`, `busybox`, a C compiler capable of static linking, and the source build
-requirements above.
+machine-specific build path. The host needs `qemu-system-x86_64`, `cpio`, `busybox`, `e2fsprogs`, a C
+compiler capable of static linking, and the source build requirements above.
+KVM is used when `/dev/kvm` is usable; otherwise the runner falls back to TCG.
+`ACCEL=auto|kvm|tcg` overrides that choice (`kvm` fails instead of falling
+back, `tcg` forces the emulated path used by GitHub-hosted runners), and
+`QEMU_TIMEOUT` bounds the guest.
 
 ```bash
 KERNEL=/path/to/bzImage tools/qemu-run.sh --duration 5s
@@ -120,6 +155,9 @@ diagnosis ranking, daemon triggers and storage, and the TCP-unavailable
 contract. TCP programs are deliberately not attached; the guest reports
 `TCP verifier: SKIP` rather than claiming a verifier pass.
 
-The last recorded storage/collection matrix passed on bpf-next 7.2.0-rc6 with
-8 vCPUs and no `CONFIG_PSI`. Latency and cost vary by host; only explicit smoke
-script thresholds are acceptance criteria.
+The CI gate uses the pinned Linux 6.12.115 build with `CONFIG_PSI=y`, four
+vCPUs, and TCG on GitHub-hosted runners; local validation uses the
+kernel-server bpf-next 7.2.0-rc6 image with KVM and eight vCPUs. Latency and
+cost vary by accelerator and host; only explicit smoke script thresholds are
+acceptance criteria, and the accelerator is recorded in the guest log and the
+cell artifact.
