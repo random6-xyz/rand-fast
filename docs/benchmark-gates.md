@@ -52,7 +52,8 @@ re-running the benchmark.
 
 The committed baseline (`bench/baseline-6.12.115-tcg-4cpu.json`) was produced by
 the `Collector overhead benchmark` CI job (run 41962142998, 2026-02) on the
-pinned 6.12.115 kernel under TCG with four vCPUs, using the same
+pinned 6.12.115 kernel under TCG with four vCPUs, and the gate was validated by
+run 41966031153 on PR #84, using the same
 `BENCH_DURATION`, `BENCH_REPETITIONS` and `BENCH_WARMUP` as the gate. It must be
 refreshed only from a green run of unchanged code, and the refresh commit must include the
 job URL and date. KVM and TCG baselines are separate files.
