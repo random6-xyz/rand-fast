@@ -103,7 +103,7 @@ jobs:
 
   benchmark:
     name: Collector overhead benchmark
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'benchmark')
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'benchmark') || contains(github.event.pull_request.labels.*.name, 'benchmark-gate')
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -141,5 +141,34 @@ jobs:
           path: |
             ${{ runner.temp }}/bench-report.json
             ${{ runner.temp }}/bench/guest.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  benchmark-gate:
+    name: Overhead regression gate
+    if: contains(github.event.pull_request.labels.*.name, 'benchmark-gate')
+    needs: benchmark
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the benchmark report
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-report
+          path: ${{ runner.temp }}/bench-artifact
+      - name: Compare with the calibrated baseline
+        run: |
+          tools/bench-check.sh \
+            --baseline bench/baseline-6.12.115-tcg-4cpu.json \
+            --candidate "${{ runner.temp }}/bench-artifact/bench-report.json" \
+            --policy tools/bench/policy.json \
+            --output "${{ runner.temp }}/bench-check.json"
+      - name: Upload the gate result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-gate
+          path: ${{ runner.temp }}/bench-check.json
           if-no-files-found: warn
           retention-days: 14

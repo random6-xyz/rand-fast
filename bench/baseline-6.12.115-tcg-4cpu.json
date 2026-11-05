@@ -1,0 +1,176 @@
+{
+  "schema": "rand-fast/bench/v1",
+  "generated_at_unix_s": 1793850135,
+  "metadata": {
+    "kernel": "6.12.115",
+    "cpus": 4,
+    "accelerator": "tcg",
+    "loadavg": "0.41 0.11 0.04 1/77 263",
+    "fast": "/bin/fast",
+    "workload": "/bin/fast-workload",
+    "io_path": "/mnt/io/fast-workload-io"
+  },
+  "duration_ms": 3000,
+  "repetitions": 1,
+  "warmup": 0,
+  "runs": [
+    {
+      "mode": "cpu",
+      "repetition": 0,
+      "baseline": {
+        "order": "baseline",
+        "ops": 348,
+        "p50_us": null,
+        "p95_us": null,
+        "p99_us": null,
+        "wall_ms": 3052
+      },
+      "instrumented": {
+        "order": "instrumented",
+        "ops": 269,
+        "p50_us": null,
+        "p95_us": null,
+        "p99_us": null,
+        "wall_ms": 3865
+      },
+      "collector": {
+        "cpu_pct": 28.92887867533076,
+        "peak_rss_bytes": 45162496,
+        "lost_events": 0,
+        "wall_ms": 3560
+      },
+      "ops_ratio": 0.7729885057471264,
+      "p95_ratio": null,
+      "error": null
+    },
+    {
+      "mode": "io",
+      "repetition": 0,
+      "baseline": {
+        "order": "baseline",
+        "ops": 73457,
+        "p50_us": 79,
+        "p95_us": 106,
+        "p99_us": 153,
+        "wall_ms": 3522
+      },
+      "instrumented": {
+        "order": "instrumented",
+        "ops": 21867,
+        "p50_us": 267,
+        "p95_us": 486,
+        "p99_us": 619,
+        "wall_ms": 4300
+      },
+      "collector": {
+        "cpu_pct": 99.547322258545,
+        "peak_rss_bytes": 45035520,
+        "lost_events": 0,
+        "wall_ms": 3998
+      },
+      "ops_ratio": 0.297684359557292,
+      "p95_ratio": 4.584905660377358,
+      "error": null
+    },
+    {
+      "mode": "lock",
+      "repetition": 0,
+      "baseline": {
+        "order": "baseline",
+        "ops": 2629,
+        "p50_us": 12566,
+        "p95_us": 45700,
+        "p99_us": 72113,
+        "wall_ms": 3053
+      },
+      "instrumented": {
+        "order": "instrumented",
+        "ops": 2298,
+        "p50_us": 13835,
+        "p95_us": 52061,
+        "p99_us": 80539,
+        "wall_ms": 3843
+      },
+      "collector": {
+        "cpu_pct": 73.98251795754997,
+        "peak_rss_bytes": 45072384,
+        "lost_events": 0,
+        "wall_ms": 3541
+      },
+      "ops_ratio": 0.8740966146823888,
+      "p95_ratio": 1.1391903719912473,
+      "error": null
+    },
+    {
+      "mode": "net",
+      "repetition": 0,
+      "baseline": {
+        "order": "baseline",
+        "ops": 1136,
+        "p50_us": 5220,
+        "p95_us": 5297,
+        "p99_us": 5500,
+        "wall_ms": 4046
+      },
+      "instrumented": {
+        "order": "instrumented",
+        "ops": 1088,
+        "p50_us": 5506,
+        "p95_us": 5646,
+        "p99_us": 5902,
+        "wall_ms": 4335
+      },
+      "collector": {
+        "cpu_pct": 28.50652953684748,
+        "peak_rss_bytes": 45076480,
+        "lost_events": 0,
+        "wall_ms": 4034
+      },
+      "ops_ratio": 0.9577464788732394,
+      "p95_ratio": 1.0658863507645837,
+      "error": null
+    }
+  ],
+  "summary": [
+    {
+      "mode": "cpu",
+      "runs": 1,
+      "valid_runs": 1,
+      "ops_ratio_median": 0.7729885057471264,
+      "p95_ratio_median": null,
+      "collector_cpu_pct_median": 28.92887867533076,
+      "collector_rss_bytes_max": 45162496,
+      "lost_events_max": 0
+    },
+    {
+      "mode": "io",
+      "runs": 1,
+      "valid_runs": 1,
+      "ops_ratio_median": 0.297684359557292,
+      "p95_ratio_median": 4.584905660377358,
+      "collector_cpu_pct_median": 99.547322258545,
+      "collector_rss_bytes_max": 45035520,
+      "lost_events_max": 0
+    },
+    {
+      "mode": "lock",
+      "runs": 1,
+      "valid_runs": 1,
+      "ops_ratio_median": 0.8740966146823888,
+      "p95_ratio_median": 1.1391903719912473,
+      "collector_cpu_pct_median": 73.98251795754997,
+      "collector_rss_bytes_max": 45072384,
+      "lost_events_max": 0
+    },
+    {
+      "mode": "net",
+      "runs": 1,
+      "valid_runs": 1,
+      "ops_ratio_median": 0.9577464788732394,
+      "p95_ratio_median": 1.0658863507645837,
+      "collector_cpu_pct_median": 28.50652953684748,
+      "collector_rss_bytes_max": 45076480,
+      "lost_events_max": 0
+    }
+  ]
+}

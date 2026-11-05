@@ -45,8 +45,9 @@ re-running the benchmark.
 
 ## Baseline
 
-The committed baseline is produced by the `Collector overhead benchmark` CI job
-on the pinned 6.12.115 kernel under TCG with four vCPUs, using the same
+The committed baseline (`bench/baseline-6.12.115-tcg-4cpu.json`) was produced by
+the `Collector overhead benchmark` CI job (run 41962142998, 2026-02) on the
+pinned 6.12.115 kernel under TCG with four vCPUs, using the same
 `BENCH_DURATION`, `BENCH_REPETITIONS` and `BENCH_WARMUP` as the gate. It must be
 refreshed only from a green run of unchanged code, and the refresh commit must include the
 job URL and date. KVM and TCG baselines are separate files.
@@ -64,12 +65,14 @@ Rollback is the same procedure with the previous baseline file. A baseline is
 never edited in place to make a failing candidate pass; a real change in
 overhead needs a reviewed baseline refresh.
 
-## Current wiring
+## CI wiring
 
-The checker, policy, calibration and tests are present. The committed baseline
-and the CI gate job are activated only after a green benchmark artifact from
-the pinned CI environment is available; until then the benchmark job remains
-report-only. The baseline is never a locally produced report.
+The `Overhead regression gate` job runs when a PR carries the
+`benchmark-gate` label. It depends on the report-only benchmark job, downloads
+its artifact, compares it with the committed TCG baseline, and uploads the
+check JSON even on failure. The benchmark job remains report-only on
+`schedule`, `workflow_dispatch` and the `benchmark` label; only
+`benchmark-gate` enforces thresholds.
 
 ## Demonstrating the gate
 
