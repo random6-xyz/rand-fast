@@ -211,7 +211,8 @@ loosening the comparison to guessed offsets.
 and network workloads and writes `target/bench-report.json`. It reports target
 throughput and latency, collector CPU and peak RSS, event loss, and the
 kernel/accelerator metadata. The benchmark is reproducible locally and in CI;
-see [the benchmark guide](benchmark.md).
+see [the benchmark guide](benchmark.md). Calibrated thresholds and the baseline
+refresh procedure are in [the gate policy](benchmark-gates.md).
 
 ### TCP attribution
 

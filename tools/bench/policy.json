@@ -1,0 +1,35 @@
+{
+  "schema": "rand-fast/bench-policy/v1",
+  "calibration": {
+    "samples": "2 KVM A/B runs, 2 TCG A/B runs, 2 repetitions per mode",
+    "noise_pct": 4,
+    "reviewed": "2026-02"
+  },
+  "min_valid_runs": 1,
+  "required_modes": [
+    "cpu",
+    "io",
+    "lock",
+    "net"
+  ],
+  "metrics": {
+    "ops_ratio": {
+      "enforced": true,
+      "max_drop_pct": 20
+    },
+    "p95_ratio": {
+      "enforced": false,
+      "max_increase_pct": 50
+    },
+    "collector_cpu_pct": {
+      "enforced": false,
+      "max_increase_pct": 50,
+      "absolute_slack": 2.0
+    },
+    "lost_events": {
+      "enforced": true,
+      "max_absolute": 100,
+      "max_increase": 50
+    }
+  }
+}

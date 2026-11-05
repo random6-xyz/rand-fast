@@ -23,10 +23,12 @@ KERNEL="$KERNEL" OUT_DIR="$OUT_DIR" QEMU_SMOKE_CASE=bench \
     QEMU_TIMEOUT="$QEMU_TIMEOUT" \
     "$ROOT/tools/qemu-run.sh" --duration "$BENCH_DURATION"
 
-tr -d '\r' <"$OUT_DIR/guest.log" | awk '
-    /^----- bench-report-begin -----$/{inside=1; next}
-    /^----- bench-report-end -----$/{inside=0}
-    inside' >"$BENCH_OUT"
+tr -d '\r' <"$OUT_DIR/guest.log" \
+    | grep -vE '^ *\[[[:space:]]*[0-9]+\.[0-9]+\]' \
+    | awk '
+        /^----- bench-report-begin -----$/{inside=1; next}
+        /^----- bench-report-end -----$/{inside=0}
+        inside' >"$BENCH_OUT"
 
 if [ ! -s "$BENCH_OUT" ]; then
     echo "bench: no report found in $OUT_DIR/guest.log" >&2

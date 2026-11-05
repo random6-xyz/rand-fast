@@ -12,8 +12,9 @@
 #   8. test-rank-eval.sh      the ranking gate rejects missing/empty/wrong runs
 #   9. test-qemu-ci.sh        the CI guest-log audit rejects partial runs
 #  10. test-bench.sh          the paired benchmark accepts valid and rejects zero-work runs
-#  11. test-kernel-build.sh   the kernel pin table and build failure paths
-#  11. check-license-metadata.sh every workspace package declares both licenses
+#  11. test-bench-check.sh    calibrated gate detects regressions and missing data
+#  12. test-kernel-build.sh   the kernel pin table and build failure paths
+#  13. check-license-metadata.sh every workspace package declares both licenses
 #
 # The eBPF verifier needs a real kernel; tools/qemu-smoke.sh runs that inside
 # the QEMU guest and is a separate, manual step.
@@ -47,6 +48,7 @@ step 'scenario manifest' tools/test-scenarios.sh
 step 'ranking evaluation gate' tools/test-rank-eval.sh
 step 'QEMU CI result audit' tools/test-qemu-ci.sh
 step 'benchmark harness' tools/test-bench.sh
+step 'benchmark gate' tools/test-bench-check.sh
 step 'kernel build contract' tools/test-kernel-build.sh
 step 'license metadata' tools/check-license-metadata.sh
 

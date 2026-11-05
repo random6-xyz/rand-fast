@@ -68,9 +68,9 @@ impl Mode {
             Self::Cpu => {
                 args.extend([
                     "--workers".into(),
-                    "8".into(),
-                    "--hold-ms".into(),
-                    "1".into(),
+                    "2".into(),
+                    "--size-mib".into(),
+                    "16".into(),
                 ]);
             }
             Self::Lock => {

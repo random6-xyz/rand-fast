@@ -186,6 +186,11 @@ for f in "$OUT_DIR"/*.txt; do
     echo "----- $f -----"
     cat "$f"
 done
+for f in "$OUT_DIR"/bench/raw/*.log; do
+    [ -f "$f" ] || continue
+    echo "----- $f -----"
+    cat "$f"
+done
 if [ -f "$OUT_DIR/bench/report.json" ]; then
     echo "----- bench-report-begin -----"
     cat "$OUT_DIR/bench/report.json"
