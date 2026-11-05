@@ -9,6 +9,7 @@ set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CHECK="$ROOT/tools/check-qemu-results.sh"
+SCENARIO_COUNT=$(sed -n 's/^SCENARIO_COUNT=//p' "$ROOT/tools/scenarios.sh")
 TMP=$(mktemp -d) || exit 1
 FAILURES=0
 
@@ -28,6 +29,8 @@ guest: kernel 6.12.115
 guest: accelerator tcg
 guest: BTF present
 guest: tracefs mounted
+guest: pressure/memory available
+guest: config PSI=y
 sched verifier: pass (program loaded and attached)
 cpu verifier: pass (program loaded and attached)
 io verifier: pass (program loaded and attached)
@@ -60,7 +63,7 @@ run_check() {
         "$3" "$TMP/good.log"
     fi
     "$CHECK" --log "$TMP/good.log" --kernel 6.12.115 --accelerator tcg \
-        --scenarios 9 --output "$TMP/$name.json" >"$TMP/$name.out" 2>&1
+        --psi yes --scenarios "$SCENARIO_COUNT" --output "$TMP/$name.json" >"$TMP/$name.out" 2>&1
     status=$?
     if [ "$status" -ne "$expected" ]; then
         fail "$name exited $status, expected $expected"
@@ -77,6 +80,7 @@ mutate_accel() { sed -i 's/guest: accelerator tcg/guest: accelerator kvm/' "$1";
 mutate_bootfail() { printf 'Booting the kernel...\nNo working init found.\n' >"$1"; }
 mutate_btf() { sed -i '/guest: BTF present/d' "$1"; }
 mutate_tracefs() { sed -i '/guest: tracefs mounted/d' "$1"; }
+mutate_psi() { sed -i 's/guest: pressure\/memory available/guest: pressure\/memory unavailable/' "$1"; }
 
 run_check good 0
 run_check rc 1 mutate_rc
@@ -88,6 +92,35 @@ run_check accelerator 1 mutate_accel
 run_check bootfail 1 mutate_bootfail
 run_check btf 1 mutate_btf
 run_check tracefs 1 mutate_tracefs
+run_check psi 1 mutate_psi
+if "$CHECK" --log "$TMP/good.log" --kernel 6.12.115 --scenarios bogus --psi yes >/dev/null 2>&1; then
+    fail "a non-numeric scenario count was accepted"
+fi
+if "$CHECK" --log "$TMP/good.log" --kernel 6.12.115 --scenarios 0 --psi yes >/dev/null 2>&1; then
+    fail "a zero scenario count was accepted"
+fi
+if "$CHECK" --log "$TMP/good.log" --kernel 6.12.115 --scenarios "$SCENARIO_COUNT" >/dev/null 2>&1; then
+    fail "a missing --psi declaration was accepted"
+fi
+
+# PSI-off images must prove absence from the guest, and a wrong declaration
+# must fail in both directions.
+make_good_log "$TMP/nopsi.log"
+sed -i \
+    -e 's/guest: pressure\/memory available/guest: pressure\/memory unavailable/' \
+    -e 's/guest: config PSI=y/guest: config PSI=disabled/' \
+    "$TMP/nopsi.log"
+if "$CHECK" --log "$TMP/nopsi.log" --kernel 6.12.115 --psi no \
+    --scenarios "$SCENARIO_COUNT" --output "$TMP/nopsi.json" >"$TMP/nopsi.out" 2>&1; then
+    :
+else
+    fail "a correct PSI-off cell was rejected"
+    sed 's/^/    /' "$TMP/nopsi.out" >&2
+fi
+if "$CHECK" --log "$TMP/nopsi.log" --kernel 6.12.115 --psi yes \
+    --scenarios "$SCENARIO_COUNT" >/dev/null 2>&1; then
+    fail "a PSI-off cell declared as PSI-on was accepted"
+fi
 
 # The cell record is written on both outcomes so a failed job still has one.
 if [ ! -s "$TMP/rc.json" ]; then
@@ -104,4 +137,4 @@ if [ "$FAILURES" -ne 0 ]; then
     echo "test-qemu-ci: $FAILURES case(s) failed" >&2
     exit 1
 fi
-echo "test-qemu-ci: pass, rc, skip, missing-verifier, kernel, scenario, accelerator, boot, BTF and tracefs cases passed"
+echo "test-qemu-ci: pass, rc, skip, missing-verifier, kernel, scenario, accelerator, boot, BTF, tracefs and PSI cases passed"

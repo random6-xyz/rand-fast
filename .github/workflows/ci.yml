@@ -5,6 +5,11 @@ on:
   push:
     branches:
       - main
+  schedule:
+    # The full compatibility matrix also runs weekly, even when nothing changed,
+    # so a runner-image or toolchain drift is visible before a release.
+    - cron: '0 5 * * 1'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -20,71 +25,78 @@ jobs:
         run: tools/verify.sh
 
   qemu-real-kernel:
-    name: Real-kernel QEMU gate
+    name: Real-kernel QEMU gate (6.12.115)
     runs-on: ubuntu-24.04
     timeout-minutes: 180
-    env:
-      KERNEL_VERSION: 6.12.115
     concurrency:
       group: qemu-${{ github.ref }}
       cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-rust-ebpf
-
-      - name: Install QEMU and kernel build tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            qemu-system-x86 busybox-static cpio gcc libc6-dev e2fsprogs \
-            bc flex bison libelf-dev libssl-dev dwarves zstd xz-utils
-
-      - name: Restore the pinned kernel
-        uses: actions/cache@v4
+      - uses: ./.github/actions/run-qemu-gate
         with:
-          path: ~/.cache/rand-fast-kernels
-          key: kernel-${{ runner.os }}-${{ env.KERNEL_VERSION }}-${{ hashFiles('tools/kernel/kernels.tsv', 'tools/kernel/config.fragment', 'tools/kernel/build.sh') }}
+          kernel-id: 6.12.115
+          kernel-version: 6.12.115
+          psi: yes
 
-      - name: Build the pinned kernel
-        run: |
-          kernel=$(tools/kernel/build.sh "$KERNEL_VERSION")
-          echo "KERNEL=$kernel" >>"$GITHUB_ENV"
-
-      - name: Boot the guest and run the real-kernel matrix
+  kernel-changes:
+    name: Detect kernel-sensitive changes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    outputs:
+      kernel: ${{ steps.paths.outputs.kernel }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: paths
+        name: Compare the pull request with its base
         env:
-          CPUS: '4'
-          MEM_MB: '2048'
-          OUT_DIR: ${{ runner.temp }}/qemu
-          QEMU_TIMEOUT: '4200'
-        run: tools/qemu-run.sh
-
-      - name: Audit the guest log
-        if: always()
+          BASE: ${{ github.base_ref }}
         run: |
-          # The record must exist even when the guest failed to boot, which is
-          # exactly when it is most useful.
-          mkdir -p "$RUNNER_TEMP/qemu/kernel"
-          cp "$HOME/.cache/rand-fast-kernels/$KERNEL_VERSION/config" \
-            "$RUNNER_TEMP/qemu/kernel/config" 2>/dev/null || true
-          cp "$HOME/.cache/rand-fast-kernels/$KERNEL_VERSION/build-info.txt" \
-            "$RUNNER_TEMP/qemu/kernel/build-info.txt" 2>/dev/null || true
-          tools/check-qemu-results.sh \
-            --log "$RUNNER_TEMP/qemu/guest.log" \
-            --kernel "$KERNEL_VERSION" \
-            --scenarios "$(sed -n 's/^SCENARIO_COUNT=//p' tools/scenarios.sh)" \
-            --output "$RUNNER_TEMP/qemu/cell.json"
+          if git diff --name-only "origin/$BASE...HEAD" \
+            | grep -Eq '^(fast-ebpf/|fast-common/|fast/src/(tracepoint_layout|io_request_layout|network|json_payloads)\.rs|tools/kernel/|tools/qemu-|tools/scenarios\.json|\.github/(actions/run-qemu-gate|workflows/ci\.yml))'; then
+            echo "kernel=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "kernel=false" >>"$GITHUB_OUTPUT"
+          fi
 
-      - name: Upload the guest log and kernel record
-        if: always()
-        uses: actions/upload-artifact@v4
+  kernel-matrix:
+    name: Kernel matrix (${{ matrix.id }})
+    needs: kernel-changes
+    if: |
+      always() && (github.event_name != 'pull_request'
+        || needs.kernel-changes.outputs.kernel == 'true'
+        || contains(github.event.pull_request.labels.*.name, 'kernel-matrix'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    concurrency:
+      group: qemu-matrix-${{ github.ref }}-${{ matrix.id }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - id: 6.1.191
+            version: 6.1.191
+            psi: yes
+          - id: 6.6.161
+            version: 6.6.161
+            psi: yes
+          - id: 7.2.15
+            version: 7.2.15
+            psi: yes
+          # The same 6.12 image without PSI. This cell proves the unavailable
+          # signal path: memory pressure must be reported as unavailable, not
+          # as zero, and the required non-PSI checks must still pass.
+          - id: 6.12.115-nopsi
+            version: 6.12.115
+            psi: no
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/run-qemu-gate
         with:
-          name: qemu-real-kernel-${{ env.KERNEL_VERSION }}
-          path: |
-            ${{ runner.temp }}/qemu/guest.log
-            ${{ runner.temp }}/qemu/qemu-status.txt
-            ${{ runner.temp }}/qemu/cell.json
-            ${{ runner.temp }}/qemu/ldd.txt
-            ${{ runner.temp }}/qemu/kernel/config
-            ${{ runner.temp }}/qemu/kernel/build-info.txt
-          if-no-files-found: warn
-          retention-days: 14
+          kernel-id: ${{ matrix.id }}
+          kernel-version: ${{ matrix.version }}
+          psi: ${{ matrix.psi }}

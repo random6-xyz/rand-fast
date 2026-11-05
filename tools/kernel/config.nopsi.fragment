@@ -1,0 +1,44 @@
+# Negative capability profile: the same required facilities as
+# config.fragment, with memory pressure information deliberately absent.
+# PSI must be reported as unavailable, never as zero pressure.
+# Required facilities for the QEMU gate.
+#
+# Applied on top of the pinned kernel's defconfig. These are the capabilities
+# rand-fast refuses to guess about: eBPF and BTF for loading, tracepoints and
+# ftrace for the collectors, PSI as a real (not assumed) optional signal, and
+# the virtio/ext4/serial pieces the guest boots with.
+CONFIG_BPF=y
+CONFIG_BPF_SYSCALL=y
+CONFIG_BPF_JIT=y
+CONFIG_BPF_EVENTS=y
+CONFIG_DEBUG_INFO=y
+CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
+CONFIG_DEBUG_INFO_BTF=y
+CONFIG_DEBUG_FS=y
+CONFIG_FTRACE=y
+CONFIG_TRACEPOINTS=y
+CONFIG_KPROBES=y
+CONFIG_PERF_EVENTS=y
+# CONFIG_PSI is not set
+CONFIG_CGROUPS=y
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_PCI=y
+CONFIG_VIRTIO_BLK=y
+CONFIG_EXT4_FS=y
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_TMPFS=y
+CONFIG_PROC_FS=y
+CONFIG_SYSFS=y
+CONFIG_NET=y
+CONFIG_INET=y
+CONFIG_IPV6=y
+CONFIG_PACKET=y
+CONFIG_UNIX=y
+CONFIG_TCP_CONG_CUBIC=y
+CONFIG_IKCONFIG=y
+CONFIG_IKCONFIG_PROC=y
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_RD_GZIP=y

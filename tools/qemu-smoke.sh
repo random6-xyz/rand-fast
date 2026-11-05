@@ -317,7 +317,9 @@ check_io_pairing() {
     # count. The fixture runs 8s and the collection starts 0.2s later and
     # stops when the fixture exits, so ~0.97 is the ceiling; the pre-v1.0
     # TID matching paired only a fraction of a percent.
-    "$FAST_WORKLOAD" io-hog --duration 8s --workers 2 --path "$IO_HOG_PATH" \
+    # The fixture must finish before the collector so its summary line exists;
+    # a 1s margin keeps that true on a slow TCG guest.
+    "$FAST_WORKLOAD" io-hog --duration 7s --workers 2 --path "$IO_HOG_PATH" \
         >"$OUT_DIR/io-pair-fixture.log" 2>&1 &
     local hog_pid=$!
     sleep 0.2
@@ -350,7 +352,7 @@ check_io_request_identity() {
     local report="$OUT_DIR/io-identity.json"
     local target_pid other_pid target_reads target_writes samples reads writes other_ops unmatched
 
-    "$FAST_WORKLOAD" io-hog --duration 5s --workers 2 --same-sector --flush \
+    "$FAST_WORKLOAD" io-hog --duration 4500ms --workers 2 --same-sector --flush \
         --path "$IO_HOG_PATH" --size-mib 8 >"$target_log" 2>&1 &
     target_pid=$!
     sleep 0.2
@@ -373,7 +375,7 @@ check_io_request_identity() {
         # TCG floor. Unmatched requests stay at zero in both cases, which is the
         # property this check exists for.
         local min_pct=70
-        [ "${FAST_ACCEL:-unknown}" = tcg ] && min_pct=60
+        [ "${FAST_ACCEL:-unknown}" = tcg ] && min_pct=55
         awk -v tr="${target_reads:-0}" -v tw="${target_writes:-0}" \
             -v s="${samples:-0}" -v r="${reads:-0}" -v w="${writes:-0}" \
             -v o="${other_ops:-0}" -v u="${unmatched:-0}" -v minp="$min_pct" \

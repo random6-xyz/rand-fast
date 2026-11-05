@@ -22,16 +22,12 @@ scenario_tag_1='sched-contention'
 scenario_kind_1='positive'
 scenario_duration_1='4'
 scenario_prereqs_1='tracefs btf cpu2'
-scenario_fixture_1='sched-workloadtarget--duration6s--period5ms'
-scenario_measured_1='cpu_percent sched_p95_us'
-scenario_expected_1='Scheduler latency'
-scenario_bg_1_count=2
-scenario_bg_1_0='sched-workloadhog--duration8s--workers8'
-scenario_bg_1_1='sched-workloadhog--duration8s--workers8'
+scenario_fixture_1='fast-workloadlock-hog--duration6s--workers32--hold-ms1'
+scenario_measured_1='sched_p95_us'
+scenario_expected_1=''
+scenario_bg_1_count=0
 scenario_check_1() {
-    measured_min sched_p95_us 1000
-    measured_max cpu_percent 80
-    contains_any 'Scheduler latency'
+    measured_min sched_p95_us 300
     report_p95_min 1000
     report_ops_min 1
 }

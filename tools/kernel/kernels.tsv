@@ -1,4 +1,10 @@
 # Pinned kernel images used by the real-kernel QEMU gate.
-# Columns: version, source URL, sha256, toolchain, config profile.
-# The version must match what the guest reports from `uname -r`.
-6.12.115	https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.115.tar.xz	0ec90fe4b20422b1b664b77e6d2dde22b40bd41e7eb2cad8ac8739a4749cb1bb	gcc	default
+# Columns: id, version, profile, source URL, sha256, toolchain.
+# The version is what the guest must report from `uname -r`; the id is the
+# cache and artifact key, so one version may have more than one capability
+# profile (for example the same kernel built without PSI).
+6.1.191	6.1.191	default	https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.191.tar.xz	02f15b77d213e15607923832ef9382e2414ea90df6c007f15a910e139645c35d	gcc
+6.6.161	6.6.161	default	https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.161.tar.xz	7d34405be5cd4989b2a5e9cbefa798e3a175218901271e034af3fe4e840b71c6	gcc
+6.12.115	6.12.115	default	https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.115.tar.xz	0ec90fe4b20422b1b664b77e6d2dde22b40bd41e7eb2cad8ac8739a4749cb1bb	gcc
+6.12.115-nopsi	6.12.115	nopsi	https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.115.tar.xz	0ec90fe4b20422b1b664b77e6d2dde22b40bd41e7eb2cad8ac8739a4749cb1bb	gcc
+7.2.15	7.2.15	default	https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.15.tar.xz	d0f6b1d7324c937ccaeb5c4ca7084bfcf71db2edb3e2d3a31f0ad83a681809ab	gcc

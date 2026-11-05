@@ -65,25 +65,42 @@ independent record of its operations and latency next to the collector's
 measurement, and `--ready-file` replaces fixed sleeps during startup.
 
 Scenario kinds separate proof from ranking work: `positive` cases must produce
-the declared measurement and at least one declared cause, `mixed` cases must
-produce both declared signals and one accepted cause, and the `control` case
-must not report any bottleneck cause.
+the declared measurement, `mixed` cases must produce both declared signals and
+one accepted cause, and the `control` case must not report any bottleneck
+cause. `sched-contention` is a measurement case rather than a top-1 case: on a
+small emulated guest the fixture target's own sleep can dominate the report, so
+the smoke matrix asserts that the scheduler signal was measured, while the
+repeated ranking evaluation records where the cause ranked.
 
 ### Real-kernel CI gate
 
 The `qemu-real-kernel` job in `.github/workflows/ci.yml` runs on every pull
-request and main push. It provisions QEMU and kernel build tools, builds the
-kernel pinned in `tools/kernel/kernels.tsv` from its verified tarball with
-`tools/kernel/config.fragment`, boots the guest with
-`tools/qemu-run.sh`, and audits the guest log with
+request and main push. The weekly `kernel-matrix` job covers the pinned
+compatibility set, and also runs on main pushes, manual dispatches, and pull
+requests that touch kernel-facing paths (`fast-ebpf/`, the tracepoint and
+block-request layout code, `tools/kernel/`, the QEMU scripts, or the scenario
+manifest) or carry the `kernel-matrix` label. Each cell provisions QEMU and
+kernel build tools, builds its kernel from the verified tarball in
+`tools/kernel/kernels.tsv` with the profile's config fragment, boots the guest
+with `tools/qemu-run.sh`, and audits the log with
 `tools/check-qemu-results.sh`.
 
 The audit is what makes the job meaningful: a missing BTF/tracefs facility, a
 required verifier check that did not run, an unexpected `SKIP`, a scenario
 failure, the wrong kernel version, or a non-zero guest exit fails the job.
-The only accepted skip is the documented TCP unavailable one. The job always
-uploads the guest log, the kernel config and build record, the cell record, and
-the loader diagnostics, including on failure. The kernel cache is keyed by the
+The only accepted skip is the documented TCP unavailable one. One fresh boot is
+retried only when the first guest panicked under TCG (`guest-attempt1.log` is
+kept); a second failure, or a non-panic failure, fails the job. Each cell always
+uploads the guest logs, `qemu-status.txt`, the kernel config and build record,
+the cell record, and the loader diagnostics, including on failure.
+
+The pinned cells are Linux 6.1.191, 6.6.161, 6.12.115 and 7.2.15, plus a
+6.12.115 build with PSI deliberately disabled. The PSI-off cell is the negative
+capability case: memory pressure must be reported as unavailable, never as
+zero, while the required non-PSI checks still pass. The 6.12.115 default cell
+is the per-pull-request gate; the rest of the matrix is the compatibility gate.
+The tested-kernel support policy is recorded in
+[the reference](reference.md#compatibility-and-limitations). The kernel cache is keyed by the
 version, the config fragment, and the build script, so a source change rebuilds
 and an unchanged matrix does not.
 
@@ -117,12 +134,12 @@ The report separates two things that must not be confused:
   misclassification can be argued from data rather than guessed at.
 
 Scoring is changed only when these rates show a reproduced misclassification;
-the raw documents stay in the artifact set so the change can be checked. One
-limitation is visible in the data rather than hidden by it: a fixture whose
-target sleeps between cycles reports that self-imposed sleep as `Other waiting`,
-so scheduler contention can be the second cause (top-3) while `Other waiting`
-keeps the top-1 share. The manifest therefore requires the scheduler signal to
-be present and ranked, not to outrank the fixture's own sleep.
+the raw documents stay in the artifact set so the change can be checked. The
+`sched-contention` scenario is a measurement case: a 32-thread futex convoy is
+the observed fixture, so the smoke matrix proves that scheduler latency was
+measured and that the fixture itself reported contention, while the repeated
+evaluation records where the scheduler cause ranked. The manifest does not
+require that cause to be top-1.
 Enable the evaluation with `RANK_EVAL=1 tools/qemu-run.sh` (the guest repeats
 the matrix once more and gates on the deterministic checks).
 

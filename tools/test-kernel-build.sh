@@ -11,6 +11,12 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BUILD="$ROOT/tools/kernel/build.sh"
 TSV="$ROOT/tools/kernel/kernels.tsv"
 FAILURES=0
+TMP=$(mktemp -d) || exit 1
+
+cleanup() {
+    rm -rf "$TMP"
+}
+trap cleanup EXIT
 
 fail() {
     echo "test-kernel-build: FAIL: $*" >&2
@@ -35,9 +41,32 @@ fi
 
 rows=$(awk -F '\t' '!/^#/ && NF { n++ } END { print n + 0 }' "$TSV")
 [ "$rows" -ge 1 ] || fail "the pin table has no rows"
-awk -F '\t' '!/^#/ && NF && ($2 !~ /^https:\/\// || $3 !~ /^[0-9a-f]{64}$/) { bad = 1 }
-    END { exit bad ? 1 : 0 }' "$TSV" \
-    || fail "a pin row has no https source or a malformed sha256"
+awk -F '\t' '!/^#/ && NF {
+        if ($1 == "" || $2 == "" || $3 == "" || $4 !~ /^https:\/\// || $5 !~ /^[0-9a-f]{64}$/ || $6 != "gcc") bad = 1
+    } END { exit bad ? 1 : 0 }' "$TSV" \
+    || fail "a pin row has a missing field, a non-https source, or a malformed sha256"
+# Every declared profile needs a fragment, otherwise the failure only appears
+# inside a long CI build.
+awk -F '\t' '!/^#/ && NF { print $3 }' "$TSV" | sort -u | while read -r profile; do
+    if [ "$profile" = default ]; then
+        fragment="$ROOT/tools/kernel/config.fragment"
+    else
+        fragment="$ROOT/tools/kernel/config.$profile.fragment"
+    fi
+    if [ ! -r "$fragment" ]; then
+        echo "missing profile fragment: $profile"
+        continue
+    fi
+    for symbol in CONFIG_BPF_SYSCALL CONFIG_BPF_EVENTS CONFIG_DEBUG_INFO_BTF CONFIG_IKCONFIG_PROC; do
+        grep -q "^$symbol=y" "$fragment" || echo "profile $profile lacks $symbol"
+    done
+    if [ "$profile" = nopsi ] && ! grep -q '^# CONFIG_PSI is not set' "$fragment"; then
+        echo "profile nopsi does not disable PSI"
+    fi
+done >"$TMP/profiles.txt"
+if [ -s "$TMP/profiles.txt" ]; then
+    fail "$(cat "$TMP/profiles.txt")"
+fi
 
 if [ "$FAILURES" -ne 0 ]; then
     echo "test-kernel-build: $FAILURES case(s) failed" >&2

@@ -1,0 +1,121 @@
+name: Run the real-kernel QEMU gate
+description: Build a pinned kernel, boot the guest, audit the log, and upload the record
+inputs:
+  kernel-id:
+    description: Pinned id from tools/kernel/kernels.tsv
+    required: true
+  kernel-version:
+    description: Kernel release the guest must report
+    required: true
+  cpus:
+    description: Guest vCPU count
+    required: false
+    default: '4'
+  mem-mb:
+    description: Guest memory in MiB
+    required: false
+    default: '2048'
+  guest-timeout:
+    description: Seconds before the guest is killed
+    required: false
+    default: '4200'
+  psi:
+    description: Whether this image was built with PSI (yes|no)
+    required: false
+    default: 'yes'
+runs:
+  using: composite
+  steps:
+    - name: Set up Rust and eBPF build tools
+      uses: ./.github/actions/setup-rust-ebpf
+
+    - name: Record this cell
+      shell: bash
+      run: |
+        echo "KERNEL_ID=${{ inputs.kernel-id }}" >>"$GITHUB_ENV"
+        echo "KERNEL_VERSION=${{ inputs.kernel-version }}" >>"$GITHUB_ENV"
+        echo "OUT_DIR=${{ runner.temp }}/qemu-${{ inputs.kernel-id }}" >>"$GITHUB_ENV"
+
+    - name: Install QEMU and kernel build tools
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install --yes --no-install-recommends \
+          qemu-system-x86 busybox-static cpio gcc libc6-dev e2fsprogs \
+          bc flex bison libelf-dev libssl-dev dwarves zstd xz-utils
+
+    - name: Restore the pinned kernel
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/rand-fast-kernels/${{ inputs.kernel-id }}
+        key: kernel-${{ runner.os }}-${{ inputs.kernel-id }}-${{ hashFiles('tools/kernel/kernels.tsv', 'tools/kernel/config.fragment', 'tools/kernel/config.nopsi.fragment', 'tools/kernel/build.sh') }}
+
+    - name: Build the pinned kernel
+      shell: bash
+      run: |
+        kernel=$(tools/kernel/build.sh "${{ inputs.kernel-id }}")
+        echo "KERNEL=$kernel" >>"$GITHUB_ENV"
+
+    - name: Boot the guest and run the real-kernel matrix
+      shell: bash
+      env:
+        CPUS: ${{ inputs.cpus }}
+        MEM_MB: ${{ inputs.mem-mb }}
+        QEMU_TIMEOUT: ${{ inputs.guest-timeout }}
+      run: |
+        # TCG is known to panic occasionally under SMP with heavy futex
+        # traffic. One fresh boot is retried only for a kernel panic; a
+        # deterministic failure is not hidden by a retry.
+        if ! tools/qemu-run.sh; then
+          if grep -q 'Kernel panic' "$OUT_DIR/guest.log" 2>/dev/null; then
+            echo "guest panicked under TCG; retrying once with a fresh boot" >&2
+            cp "$OUT_DIR/guest.log" "$OUT_DIR/guest-attempt1.log" 2>/dev/null || true
+            tools/qemu-run.sh || exit 1
+          else
+            exit 1
+          fi
+        fi
+
+    - name: Audit the guest log
+      if: always()
+      shell: bash
+      env:
+        CPUS: ${{ inputs.cpus }}
+        MEM_MB: ${{ inputs.mem-mb }}
+        QEMU_TIMEOUT: ${{ inputs.guest-timeout }}
+      run: |
+        # The record must exist even when the guest never booted, which is
+        # exactly when it is most useful.
+        mkdir -p "$OUT_DIR/kernel"
+        cp "$HOME/.cache/rand-fast-kernels/$KERNEL_ID/config" \
+          "$OUT_DIR/kernel/config" 2>/dev/null || true
+        cp "$HOME/.cache/rand-fast-kernels/$KERNEL_ID/build-info.txt" \
+          "$OUT_DIR/kernel/build-info.txt" 2>/dev/null || true
+        if ! tools/check-qemu-results.sh \
+          --log "$OUT_DIR/guest.log" \
+          --kernel "$KERNEL_VERSION" \
+          --psi "${{ inputs.psi }}" \
+          --scenarios "$(sed -n 's/^SCENARIO_COUNT=//p' tools/scenarios.sh)" \
+          --output "$OUT_DIR/cell.json"; then
+          if [ ! -s "$OUT_DIR/cell.json" ]; then
+            printf '{"schema":"rand-fast/qemu-cell/v1","kernel":"%s","accelerator":"unknown","psi":"%s","scenario_count":0,"scenarios_passed":0,"result":"fail","log":"%s","problems":"no-guest-log"}\n' \
+              "$KERNEL_VERSION" "${{ inputs.psi }}" "$OUT_DIR/guest.log" >"$OUT_DIR/cell.json"
+          fi
+          exit 1
+        fi
+
+    - name: Upload the guest log and kernel record
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: qemu-${{ inputs.kernel-id }}
+        path: |
+          ${{ runner.temp }}/qemu-${{ inputs.kernel-id }}/guest.log
+          ${{ runner.temp }}/qemu-${{ inputs.kernel-id }}/guest-attempt1.log
+          ${{ runner.temp }}/qemu-${{ inputs.kernel-id }}/qemu-status.txt
+          ${{ runner.temp }}/qemu-${{ inputs.kernel-id }}/cell.json
+          ${{ runner.temp }}/qemu-${{ inputs.kernel-id }}/ldd.txt
+          ${{ runner.temp }}/qemu-${{ inputs.kernel-id }}/kernel/config
+          ${{ runner.temp }}/qemu-${{ inputs.kernel-id }}/kernel/build-info.txt
+        if-no-files-found: warn
+        retention-days: 14

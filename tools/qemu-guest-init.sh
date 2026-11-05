@@ -144,6 +144,20 @@ if [ -r /proc/cmdline ]; then
         esac
     done
 fi
+if [ -r /proc/pressure/memory ]; then
+    echo "guest: pressure/memory available"
+else
+    echo "guest: pressure/memory unavailable"
+fi
+if [ -r /proc/config.gz ]; then
+    if gzip -dc /proc/config.gz 2>/dev/null | grep -q '^CONFIG_PSI=y'; then
+        echo "guest: config PSI=y"
+    else
+        echo "guest: config PSI=disabled"
+    fi
+else
+    echo "guest: config.gz unavailable"
+fi
 echo "guest: collection duration $DURATION"
 echo "guest: accelerator ${FAST_ACCEL:-unknown}"
 
