@@ -6,7 +6,12 @@
     "reviewed": "2026-02"
   },
   "min_valid_runs": 1,
-  "required_modes": ["cpu", "io", "lock", "net"],
+  "required_modes": [
+    "cpu",
+    "io",
+    "lock",
+    "net"
+  ],
   "metrics": {
     "ops_ratio": {
       "enforced": true,
@@ -17,7 +22,7 @@
       "max_increase_pct": 50
     },
     "collector_cpu_pct": {
-      "enforced": true,
+      "enforced": false,
       "max_increase_pct": 50,
       "absolute_slack": 2.0
     },

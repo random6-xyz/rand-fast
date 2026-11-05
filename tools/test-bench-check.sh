@@ -20,6 +20,9 @@ path, ops, cpu, p95, lost, valid, runs = sys.argv[1:]
 report = {
     "schema": "rand-fast/bench/v1",
     "metadata": {"kernel": "6.12.115", "accelerator": "tcg", "cpus": 4},
+    "duration_ms": 3000,
+    "repetitions": 2,
+    "warmup": 0,
     "runs": [],
     "summary": [],
 }
@@ -40,15 +43,30 @@ PY
 }
 
 make_report "$TMP/base.json" 0.98 10 1.2 0 2 2
+python3 - "$TMP/base.json" <<'PY_FIXTURE'
+import json, sys
+path = sys.argv[1]
+report = json.load(open(path))
+report["duration_ms"] = 3000
+report["repetitions"] = 2
+report["warmup"] = 0
+json.dump(report, open(path, "w"))
+PY_FIXTURE
 make_report "$TMP/stable.json" 0.96 12 1.4 0 2 2
 "$CHECK" --baseline "$TMP/base.json" --candidate "$TMP/stable.json" \
     --policy "$POLICY" >/dev/null || fail "a stable candidate was rejected"
 
 make_report "$TMP/cpu-regression.json" 0.97 30 1.3 0 2 2
-if "$CHECK" --baseline "$TMP/base.json" --candidate "$TMP/cpu-regression.json" \
-    --policy "$POLICY" >/dev/null 2>&1; then
-    fail "a 3x collector CPU regression was accepted"
+if ! "$CHECK" --baseline "$TMP/base.json" --candidate "$TMP/cpu-regression.json" \
+    --policy "$POLICY" --output "$TMP/cpu-report.json" >/dev/null 2>&1; then
+    fail "the report-only collector CPU metric failed the gate"
 fi
+python3 - "$TMP/cpu-report.json" <<'PY2' || fail "collector CPU is not marked report-only"
+import json, sys
+doc = json.load(open(sys.argv[1]))
+cpu = [c for c in doc["checks"] if c["metric"] == "collector_cpu_pct"]
+assert cpu and all(c["status"] == "report-only" for c in cpu), cpu
+PY2
 
 make_report "$TMP/ops-regression.json" 0.50 11 1.2 0 2 2
 if "$CHECK" --baseline "$TMP/base.json" --candidate "$TMP/ops-regression.json" \
@@ -78,12 +96,22 @@ if "$CHECK" --baseline "$TMP/base.json" --candidate "$TMP/invalid.json" \
     fail "a report with an invalid run was accepted"
 fi
 
-python3 - "$TMP/base.json" "$TMP/mismatch.json" <<'PY'
+python3 - "$TMP/base.json" "$TMP/mismatch.json" <<'PY_FIXTURE'
 import json, sys
 report = json.load(open(sys.argv[1]))
 report["metadata"]["accelerator"] = "kvm"
 json.dump(report, open(sys.argv[2], "w"))
-PY
+PY_FIXTURE
+python3 - "$TMP/base.json" "$TMP/duration-mismatch.json" <<'PY_FIXTURE'
+import json, sys
+report = json.load(open(sys.argv[1]))
+report["duration_ms"] = 1500
+json.dump(report, open(sys.argv[2], "w"))
+PY_FIXTURE
+if "$CHECK" --baseline "$TMP/base.json" --candidate "$TMP/duration-mismatch.json" \
+    --policy "$POLICY" >/dev/null 2>&1; then
+    fail "a duration mismatch was accepted"
+fi
 if "$CHECK" --baseline "$TMP/base.json" --candidate "$TMP/mismatch.json" \
     --policy "$POLICY" >/dev/null 2>&1; then
     fail "an accelerator mismatch was accepted"

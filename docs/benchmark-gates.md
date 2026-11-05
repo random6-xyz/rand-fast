@@ -2,7 +2,9 @@
 
 `tools/bench-check.sh` compares a candidate `fast-bench` report with a
 calibrated baseline. It enforces only metrics that repeated measurements
-showed to be stable; unstable metrics stay visible as `report-only`.
+showed to be stable; unstable metrics stay visible as `report-only`. At
+present throughput ratio and event loss are enforced; collector CPU and p95
+are report-only.
 
 ## Calibration
 
@@ -14,11 +16,14 @@ Representative paired runs:
 | Local TCG | 6.12.115 | 4 | 2 per mode | A/B |
 
 The two KVM runs agreed within 2% on throughput ratios and collector CPU. The
-two TCG runs agreed within 4% on throughput ratios; collector CPU was again
-stable, but its absolute value is much higher (for I/O it is around 115% of one
-CPU) because TCG emulates the guest. These A/B pairs are enough to reject large
-regressions; a 10% change is inside the observed noise and is not claimed to be
-detectable. CI noise should be measured again before tightening a threshold. The accelerator and vCPU count are
+two TCG runs agreed within 4% on throughput ratios, but a later GitHub-hosted
+A/B pair moved the network mode's collector CPU from 28.5% to 49.8%. That
+metric therefore stays report-only despite looking stable on the local TCG
+host. Its absolute value is also much higher under TCG (around 115% of one CPU
+for I/O) because the guest is emulated. These pairs are enough to reject large
+throughput regressions; a 10% change is inside the observed noise and is not
+claimed to be detectable. CI noise should be measured again before tightening a
+threshold. The accelerator and vCPU count are
 therefore part of the comparability check, and a KVM baseline is never used
 against a TCG candidate.
 
@@ -30,7 +35,7 @@ baseline mode by mode:
 | Metric | Enforced | Limit | Rationale |
 | --- | --- | --- | --- |
 | `ops_ratio` | yes | candidate ≥ baseline × 0.80 | A 20% additional throughput loss is a real regression, not noise. |
-| `collector_cpu_pct` | yes | candidate ≤ baseline × 1.50 + 2 points | Allows runner noise while catching a large new cost. |
+| `collector_cpu_pct` | no | candidate ≤ baseline × 1.50 + 2 points | A CI A/B pair moved from 28.5% to 49.8% on the network mode (75%), so this metric is not yet stable on shared runners; it stays report-only with its limit visible. |
 | `lost_events` | yes | candidate ≤ baseline + 50, and ≤ 100 | Loss is a correctness signal; a small absolute allowance covers a busier run. A baseline above the 100 cap is itself invalid. |
 | `p95_ratio` | no | candidate ≤ baseline × 1.50 | Tail latency is useful evidence but too noisy on shared runners yet. |
 | `valid_runs` | yes | at least one per mode | Missing data is never a performance pass. |

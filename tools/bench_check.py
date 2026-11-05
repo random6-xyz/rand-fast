@@ -41,17 +41,16 @@ def check_metadata(baseline: dict, candidate: dict) -> list[str]:
     problems: list[str] = []
     bmeta = baseline.get("metadata", {})
     cmeta = candidate.get("metadata", {})
-    for field in (
-        "kernel",
-        "accelerator",
-        "cpus",
-        "duration_ms",
-        "repetitions",
-        "warmup",
-    ):
+    for field in ("kernel", "accelerator", "cpus"):
         if bmeta.get(field) != cmeta.get(field):
             problems.append(
                 f"metadata {field}: baseline={bmeta.get(field)!r} candidate={cmeta.get(field)!r}"
+            )
+    # Duration and repetition counts are top-level report fields, not metadata.
+    for field in ("duration_ms", "repetitions", "warmup"):
+        if baseline.get(field) != candidate.get(field):
+            problems.append(
+                f"{field}: baseline={baseline.get(field)!r} candidate={candidate.get(field)!r}"
             )
     return problems
 
