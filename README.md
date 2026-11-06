@@ -12,16 +12,22 @@ A flight recorder can also retain recent intervals when a trigger fires.
   `/sys/kernel/debug/tracing`.
 - Permission to load eBPF and open perf events: root, or `CAP_BPF` and
   `CAP_PERFMON` on kernel 5.8+, or `CAP_SYS_ADMIN` on older kernels.
+- Read access to `/proc/<pid>/fd` and `/proc/<pid>/net/tcp{,6}` for the
+  observed process, which is how TCP socket ownership is evidenced. Root, or
+  the same user as the target, has it; without it TCP is reported as
+  unavailable with a reason and the other collectors still run.
 - Recognized scheduler, block-request, and TCP tracepoint layouts. Unrecognized
   layouts are rejected at startup. The CI matrix pins Linux 6.1.191, 6.6.161,
   6.12.115 and 7.2.15, plus a PSI-off 6.12.115 cell; layout fixtures also cover
   6.12.105 and 7.2.0-rc6. See the
   [support policy](docs/reference.md#tested-kernels-and-support-policy).
 
-TCP RTT and retransmission attribution is **unavailable**: the tracepoints do
-not reliably identify a socket's owning process. Network ranking may still use
-independently measured off-CPU socket waits. See the
-[reference](docs/reference.md#tcp-attribution) for the limitations.
+TCP RTT, retransmissions and connection setup latency are reported for
+connections whose owner is proven: either the target created the connection or
+it holds the socket's descriptor. Events from unrelated processes are never
+attributed. See the [reference](docs/reference.md#tcp-attribution) for the
+limits, including why accepted sockets have no handshake latency and why no
+retransmission ratio is reported.
 
 ## Install a release
 
@@ -51,7 +57,10 @@ sudo ./fast diagnose --pid 1234 --duration 10s
 
 The report lists measurements and ranks likely causes. A confidence value is a
 cause's share of the measured slowdown, **not** the probability that it is the
-root cause. Use `--format json` for machine-readable output.
+root cause. Use `--format json` for machine-readable output. For TCP, the
+report names the connections it attributes, excludes sockets the target no
+longer holds, and states when a measurement is unavailable instead of showing
+a zero.
 
 To record a rolling window and write incidents when a threshold is crossed:
 

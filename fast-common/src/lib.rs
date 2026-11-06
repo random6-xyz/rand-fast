@@ -12,6 +12,11 @@ mod aya_pod {
     unsafe impl aya::Pod for crate::IoRequestLayout {}
     unsafe impl aya::Pod for crate::OffCpuPending {}
     unsafe impl aya::Pod for crate::MemoryCounters {}
+    unsafe impl aya::Pod for crate::TcpKey {}
+    unsafe impl aya::Pod for crate::TcpOwner {}
+    unsafe impl aya::Pod for crate::ListenKey {}
+    unsafe impl aya::Pod for crate::ListenOwner {}
+    unsafe impl aya::Pod for crate::TcpPendingConnect {}
 }
 
 pub const MAX_TARGET_TIDS: u32 = 4096;
@@ -222,6 +227,246 @@ pub struct TcpEvent {
     pub saddr: [u8; 16],
     /// Destination address, network byte order.
     pub daddr: [u8; 16],
+}
+
+/// Upper bound for owned TCP connections tracked at once. The map holds only
+/// sockets a verified owner exists for, so an ordinary process needs a few
+/// dozen entries; a process that opens thousands of connections hits the cap
+/// and the excess is reported rather than evicted.
+pub const MAX_TCP_OWNERS: u32 = 8192;
+/// Upper bound for listening sockets tracked at once.
+pub const MAX_TCP_LISTENERS: u32 = 512;
+/// Upper bound for client handshakes in flight. A process normally has a few
+/// concurrent connects; the LRU bound only matters when a target opens more
+/// than this many at once, and a lost entry costs a latency sample rather
+/// than an ownership record.
+pub const MAX_TCP_PENDING_CONNECTS: u32 = 1024;
+
+/// Minimum spacing between attributed RTT samples for one connection.
+///
+/// `tcp_probe` fires on every received segment of an established socket, so a
+/// busy connection would otherwise dominate the perf buffer. One sample per
+/// connection per 10ms keeps the buffer bounded while still describing the
+/// RTT distribution over a run.
+pub const TCP_RTT_SAMPLE_INTERVAL_NS: u64 = 10_000_000;
+
+/// Role of an owned connection: the target called `connect`.
+pub const TCP_ROLE_CLIENT: u8 = 1;
+/// Role of an owned connection: the target accepted it, or holds the listener
+/// the connection arrived on.
+pub const TCP_ROLE_SERVER: u8 = 2;
+
+/// Ownership evidence: a socket was created or accepted in the target's own
+/// thread-group context.
+pub const TCP_ORIGIN_CREATED: u8 = 1;
+/// Ownership evidence: the target holds the socket descriptor, observed
+/// through `/proc/<pid>/fd`, whether or not this run saw it created.
+pub const TCP_ORIGIN_SEEDED: u8 = 2;
+
+/// A client `connect` is waiting for its handshake to finish, so the record
+/// carries a start timestamp for the connection-latency measurement.
+pub const TCP_AWAITING_CONNECT: u8 = 1;
+
+/// A listener key has more than one owning thread group, so connections that
+/// arrive on it cannot be attributed to one process.
+pub const TCP_LISTENER_AMBIGUOUS: u8 = 1;
+
+/// Connection-latency event result: the handshake reached `TCP_ESTABLISHED`.
+pub const TCP_CONNECT_ESTABLISHED: u8 = 0;
+/// Connection-latency event result: the socket closed before establishing.
+pub const TCP_CONNECT_FAILED: u8 = 1;
+
+/// Indices into the `TCP_OWNER_STATS` per-CPU counter array.
+pub const TCP_STAT_OWNER_INSERTED: u32 = 0;
+pub const TCP_STAT_OWNER_DROPS: u32 = 1;
+pub const TCP_STAT_OWNER_REMOVED: u32 = 2;
+pub const TCP_STAT_MATCHED_RTT: u32 = 3;
+pub const TCP_STAT_UNMATCHED_RTT: u32 = 4;
+pub const TCP_STAT_MATCHED_RETRANS: u32 = 5;
+pub const TCP_STAT_UNMATCHED_RETRANS: u32 = 6;
+pub const TCP_STAT_RATE_LIMITED: u32 = 7;
+pub const TCP_STAT_AMBIGUOUS_LISTENER: u32 = 8;
+pub const TCP_STAT_PENDING_INSERTED: u32 = 9;
+pub const TCP_STAT_PENDING_ESTABLISHED: u32 = 10;
+pub const TCP_STAT_PENDING_FAILED: u32 = 11;
+pub const TCP_STAT_COUNT: u32 = 12;
+
+/// Connection identity used as the TCP ownership key.
+///
+/// Addresses are in network byte order and ports in host byte order, exactly
+/// as in [`TcpEvent`], so a key built from a tracepoint payload and a key
+/// built from `/proc/net/tcp` describe the same connection. The key is the
+/// connection's full 5-tuple: no two established sockets in a network
+/// namespace can share one, so it survives pointer reuse and needs no kernel
+/// pointer to correlate events with ownership.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Pod, Zeroable)]
+pub struct TcpKey {
+    /// [`AF_INET`] or [`AF_INET6`].
+    pub family: u16,
+    /// Source port, host byte order.
+    pub sport: u16,
+    /// Destination port, host byte order.
+    pub dport: u16,
+    /// Padding, always zero.
+    pub _pad: u16,
+    /// Source address, network byte order.
+    pub saddr: [u8; 16],
+    /// Destination address, network byte order.
+    pub daddr: [u8; 16],
+}
+
+impl TcpKey {
+    /// Builds a key from the fields a tracepoint payload or `/proc/net/tcp`
+    /// row exposes.
+    pub const fn new(
+        family: u16,
+        saddr: [u8; 16],
+        sport: u16,
+        daddr: [u8; 16],
+        dport: u16,
+    ) -> Self {
+        Self {
+            family,
+            sport,
+            dport,
+            _pad: 0,
+            saddr,
+            daddr,
+        }
+    }
+
+    /// Reverses the direction of the connection. Endpoint aggregation groups a
+    /// server-side connection by its peer, which is the key's source side.
+    pub const fn reversed(&self) -> Self {
+        Self {
+            family: self.family,
+            sport: self.dport,
+            dport: self.sport,
+            _pad: 0,
+            saddr: self.daddr,
+            daddr: self.saddr,
+        }
+    }
+}
+
+/// Ownership record for one connection.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+pub struct TcpOwner {
+    /// Thread group that owns the connection.
+    pub tgid: u32,
+    /// One of the `TCP_ROLE_*` constants.
+    pub role: u8,
+    /// One of the `TCP_ORIGIN_*` constants.
+    pub origin: u8,
+    /// [`TCP_AWAITING_CONNECT`] while a client handshake is in flight.
+    pub awaiting: u8,
+    /// Padding, always zero.
+    pub _pad: u8,
+    /// When the handshake started, from `bpf_ktime_get_ns`. Zero when the
+    /// connection existed before this run, so no latency can be measured.
+    pub start_ns: u64,
+    /// Last attributed RTT sample, for the sampling interval.
+    pub last_sample_ns: u64,
+    /// Listening port the connection arrived on, or zero for a client.
+    pub listener_port: u16,
+    /// Padding, always zero.
+    pub _pad2: [u8; 6],
+}
+
+/// A client `connect` seen leaving `TCP_CLOSE`, waiting for its handshake to
+/// finish.
+///
+/// The payload carries the remote endpoint, which is already final when the
+/// kernel sets `TCP_SYN_SENT`, while the local port may still be zero: the
+/// kernel assigns it after that state change. The entry is therefore keyed by
+/// the socket address only to pair the two events of the *same live socket*;
+/// ownership itself comes from the thread group observed at `TCP_SYN_SENT`,
+/// never from the pointer. The remote endpoint recorded here is checked again
+/// when the socket reaches `TCP_ESTABLISHED`, so a recycled address cannot
+/// produce a latency sample for an unrelated connection.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+pub struct TcpPendingConnect {
+    /// When `TCP_SYN_SENT` was set, from `bpf_ktime_get_ns`.
+    pub start_ns: u64,
+    /// [`AF_INET`] or [`AF_INET6`].
+    pub family: u16,
+    /// Source port at `TCP_SYN_SENT`, which may still be zero.
+    pub sport: u16,
+    /// Destination port, host byte order.
+    pub dport: u16,
+    /// Padding, always zero.
+    pub _pad: u16,
+    /// Destination address, network byte order.
+    pub daddr: [u8; 16],
+}
+
+impl TcpPendingConnect {
+    /// Whether the connection described by `key` is the one this pending
+    /// handshake started.
+    pub fn matches(&self, key: &TcpKey) -> bool {
+        self.family == key.family && self.dport == key.dport && self.daddr == key.daddr
+    }
+}
+
+/// Listener identity: the address a socket listens on, not a pointer.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Pod, Zeroable)]
+pub struct ListenKey {
+    /// [`AF_INET`] or [`AF_INET6`].
+    pub family: u16,
+    /// Bound port, host byte order.
+    pub port: u16,
+    /// Bound address, network byte order. All zero means the wildcard address.
+    pub addr: [u8; 16],
+}
+
+/// Ownership record for one listening socket.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+pub struct ListenOwner {
+    /// Thread group that listens on the key, or zero when ambiguous.
+    pub tgid: u32,
+    /// [`TCP_LISTENER_AMBIGUOUS`] when more than one thread group listens here.
+    pub ambiguous: u8,
+    /// Padding, always zero.
+    pub _pad: [u8; 3],
+}
+
+/// TCP connection-establishment latency event.
+///
+/// Emitted when a client connection the target started reaches
+/// `TCP_ESTABLISHED`, or closes before it does. Accepted sockets have no such
+/// event: the kernel sets a child socket's initial `TCP_SYN_RECV` state
+/// directly, so a server-side handshake has no observable start.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
+pub struct ConnEvent {
+    /// [`AF_INET`] or [`AF_INET6`].
+    pub family: u16,
+    /// Source port, host byte order.
+    pub sport: u16,
+    /// Destination port, host byte order.
+    pub dport: u16,
+    /// [`TCP_CONNECT_ESTABLISHED`] or [`TCP_CONNECT_FAILED`].
+    pub result: u8,
+    /// Padding, always zero.
+    pub _pad: u8,
+    /// Elapsed time from `TCP_SYN_SENT` to the outcome, in microseconds.
+    pub latency_us: u32,
+    /// Source address, network byte order.
+    pub saddr: [u8; 16],
+    /// Destination address, network byte order.
+    pub daddr: [u8; 16],
+}
+
+impl ConnEvent {
+    /// The connection key this event describes.
+    pub const fn key(&self) -> TcpKey {
+        TcpKey::new(self.family, self.saddr, self.sport, self.daddr, self.dport)
+    }
 }
 
 /// The wait reason could not be classified from the task state alone.
@@ -450,5 +695,75 @@ mod tests {
         let decoded: MemoryCounters = bytemuck::pod_read_unaligned(bytemuck::bytes_of(&counters));
         assert_eq!(decoded.faults, 12_345);
         assert_eq!(decoded.reclaims, 7);
+    }
+    #[test]
+    fn tcp_key_layout_is_stable() {
+        assert_eq!(size_of::<TcpKey>(), 40);
+        assert_eq!(align_of::<TcpKey>(), 2);
+    }
+
+    #[test]
+    fn tcp_owner_layout_is_stable() {
+        assert_eq!(size_of::<TcpOwner>(), 32);
+        assert_eq!(align_of::<TcpOwner>(), 8);
+    }
+
+    #[test]
+    fn listen_layouts_are_stable() {
+        assert_eq!(size_of::<ListenKey>(), 20);
+        assert_eq!(align_of::<ListenKey>(), 2);
+        assert_eq!(size_of::<ListenOwner>(), 8);
+        assert_eq!(align_of::<ListenOwner>(), 4);
+    }
+
+    #[test]
+    fn pending_connect_layout_is_stable() {
+        assert_eq!(size_of::<TcpPendingConnect>(), 32);
+        assert_eq!(align_of::<TcpPendingConnect>(), 8);
+    }
+
+    #[test]
+    fn conn_event_layout_is_stable() {
+        assert_eq!(size_of::<ConnEvent>(), 44);
+        assert_eq!(align_of::<ConnEvent>(), 4);
+        assert!(size_of::<ConnEvent>() <= 64);
+    }
+
+    #[test]
+    fn tcp_key_round_trips_through_bytes_and_reverses() {
+        let key = TcpKey::new(
+            AF_INET,
+            [10, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            40000,
+            [10, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            443,
+        );
+        let decoded: TcpKey = bytemuck::pod_read_unaligned(bytemuck::bytes_of(&key));
+        assert_eq!(decoded, key);
+        let reversed = key.reversed();
+        assert_eq!(reversed.sport, 443);
+        assert_eq!(reversed.dport, 40000);
+        assert_eq!(reversed.saddr[..4], [10, 0, 0, 2]);
+        assert_eq!(reversed.daddr[..4], [10, 0, 0, 1]);
+    }
+
+    #[test]
+    fn conn_event_reports_its_connection_key() {
+        let event = ConnEvent {
+            family: AF_INET6,
+            sport: 1234,
+            dport: 80,
+            result: TCP_CONNECT_ESTABLISHED,
+            _pad: 0,
+            latency_us: 42,
+            saddr: [1; 16],
+            daddr: [2; 16],
+        };
+        let key = event.key();
+        assert_eq!(key.family, AF_INET6);
+        assert_eq!(key.sport, 1234);
+        assert_eq!(key.dport, 80);
+        assert_eq!(key.saddr, [1; 16]);
+        assert_eq!(key.daddr, [2; 16]);
     }
 }

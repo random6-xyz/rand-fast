@@ -27,7 +27,7 @@ pub enum Command {
     Cpu(CpuArgs),
     /// Measure disk I/O latency.
     Io(IoArgs),
-    /// Report TCP measurement availability.
+    /// Measure TCP RTT, retransmissions and connection setup.
     Net(NetArgs),
     /// Measure off-CPU wait time.
     OffCpu(OffCpuArgs),
@@ -37,6 +37,38 @@ pub enum Command {
     Diagnose(DiagnoseArgs),
     /// Flight recorder daemon.
     Daemon(DaemonArgs),
+    /// Inspect the evidence rand-fast uses, without running a collector.
+    #[command(hide = true)]
+    Debug(DebugArgs),
+}
+
+/// Arguments for the hidden inspection commands.
+///
+/// These exist so the ownership rules can be exercised against a real process
+/// from the QEMU suite and by support engineers. They are not part of the
+/// documented interface and print no measurement of their own: only what
+/// procfs proves about the target's descriptors.
+#[derive(Debug, Clone, Args)]
+pub struct DebugArgs {
+    #[command(subcommand)]
+    pub command: DebugCommand,
+}
+
+/// The inspection commands themselves.
+#[derive(Debug, Clone, Subcommand)]
+pub enum DebugCommand {
+    /// List the TCP sockets the target holds, from procfs evidence only.
+    TcpSockets(DebugTcpSocketsArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DebugTcpSocketsArgs {
+    /// Process ID (TGID) whose descriptors are listed.
+    #[arg(long, value_name = "PID", value_parser = parse_pid)]
+    pub pid: u32,
+
+    #[command(flatten)]
+    pub format: FormatArg,
 }
 
 #[derive(Debug, Clone, Args)]

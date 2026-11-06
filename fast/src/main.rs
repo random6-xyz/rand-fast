@@ -17,6 +17,8 @@ mod runtime;
 mod scoring;
 mod stats;
 mod symbolize;
+mod tcp;
+mod tcp_ownership;
 mod tracepoint_layout;
 mod trigger;
 
@@ -46,5 +48,6 @@ fn run() -> anyhow::Result<()> {
         Command::Memory(args) => memory::run(args),
         Command::Diagnose(args) => diagnose::run(args),
         Command::Daemon(args) => daemon::run(args),
+        Command::Debug(args) => tcp_ownership::run_debug(args),
     }
 }

@@ -78,9 +78,9 @@ require "cpu verifier: pass" "cpu-verifier"
 require "io verifier: pass" "io-verifier"
 require "off-cpu verifier: pass" "off-cpu-verifier"
 require "memory verifier: pass" "memory-verifier"
-require "net collection: pass" "net-collection"
+require "net verifier: pass" "net-verifier"
 require "diagnose verifier: pass" "diagnose-verifier"
-require "TCP unavailable contract: pass" "tcp-contract"
+require "TCP ownership contract: pass" "tcp-contract"
 
 # PSI is a genuine optional capability. The caller states what this image was
 # built with, and the guest proves it from /proc rather than from the build
@@ -112,10 +112,9 @@ elif [ -n "$accelerator" ] && [ "$recorded_accelerator" != "$accelerator" ]; the
 fi
 [ -n "$accelerator" ] || accelerator=$recorded_accelerator
 
-# The TCP skip is deliberate and documented; every other skip means a required
-# check did not run.
+# Any skip means a required check did not run. TCP no longer has a skip: its
+# programs are attached and verified like every other collector.
 unexpected_skips=$(grep -E 'SKIP' "$log" 2>/dev/null \
-    | grep -Fv 'TCP verifier: SKIP' \
     | grep -v '^$' || true)
 if [ -n "$unexpected_skips" ]; then
     problems="$problems unexpected-skip"

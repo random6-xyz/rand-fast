@@ -1,75 +1,113 @@
-use std::collections::{BTreeMap, BTreeSet};
+//! TCP measurement and endpoint reporting.
+//!
+//! A measurement is only published when the connection's owner is proven:
+//! either the kernel saw the target create the socket, or the target's own
+//! descriptor table shows it holds the socket. The ownership record carries
+//! that proof, and every event is joined against it by connection 5-tuple.
+//! There is no fallback to "the current task looked busy", because a
+//! plausible-looking wrong attribution is worse than an unavailable one.
+
+use std::{
+    cell::RefCell,
+    cmp::Reverse,
+    collections::BTreeMap,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use aya::{Ebpf, include_bytes_aligned};
-use fast_common::{AF_INET, COLLECT_NET, TcpEvent};
+use fast_common::{COLLECT_NET, ConnEvent, TCP_CONNECT_ESTABLISHED, TcpEvent, TcpKey};
 
 use crate::{
     cli::NetArgs,
     json::{self, Envelope, Format},
     process, runtime,
+    tcp::TcpCollector,
 };
 
-/// RTT samples arrive at roughly the rate the socket sends and receives data.
-/// 64 pages (256 KiB) per CPU keeps event loss low.
+pub use crate::tcp_ownership::format_address;
+
+/// The two TCP event streams feed one aggregator.
+///
+/// The collection loop dispatches every stream on one thread, so a shared
+/// cell is enough to let the RTT and handshake streams write to the same
+/// accumulator without cloning it.
+pub struct SharedStats(Rc<RefCell<NetStats>>);
+
+impl SharedStats {
+    /// Wraps a shared accumulator for a collection stream.
+    pub fn new(stats: Rc<RefCell<NetStats>>) -> Self {
+        Self(stats)
+    }
+}
+
+impl runtime::EventHandler<TcpEvent> for SharedStats {
+    fn on_event(&mut self, event: TcpEvent) {
+        self.0.borrow_mut().record(event);
+    }
+
+    fn on_lost(&mut self, count: u64) {
+        self.0.borrow_mut().record_lost(count);
+    }
+}
+
+impl runtime::EventHandler<ConnEvent> for SharedStats {
+    fn on_event(&mut self, event: ConnEvent) {
+        self.0.borrow_mut().record_conn(event);
+    }
+
+    fn on_lost(&mut self, count: u64) {
+        self.0.borrow_mut().record_lost(count);
+    }
+}
+
+/// RTT samples arrive at most once per connection per sampling interval, and
+/// 64 pages (256 KiB) per CPU keeps event loss low for a process with many
+/// connections.
 const PERF_PAGE_COUNT: usize = 64;
+
+/// How often the ownership records are reconciled with procfs. A descriptor
+/// handed away or closed is attributed for at most this long after it happens.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How many rows the endpoint table prints before truncating. A busy process
 /// can hold hundreds of connections, and a table nobody scrolls is better
 /// than one that buries its first line.
 const MAX_REPORTED_ENDPOINTS: usize = 10;
 
-/// Identity of a connection: address family, both addresses, both ports.
-///
-/// Kept as a plain tuple so `BTreeMap` can order endpoints, which gives the
-/// report a deterministic order across runs.
-type EndpointKey = (u16, [u8; 16], [u8; 16], u16, u16);
-
 /// One remote endpoint observed during a run.
 #[derive(Debug, Default, Clone)]
 pub struct Endpoint {
-    /// Address family, [`fast_common::AF_INET`] or [`fast_common::AF_INET6`].
-    pub family: u16,
-    /// Source address in network byte order.
-    pub saddr: [u8; 16],
-    /// Destination address in network byte order.
-    pub daddr: [u8; 16],
-    /// Source port, host byte order.
-    pub sport: u16,
-    /// Destination port, host byte order.
-    pub dport: u16,
-    /// Smoothed RTT samples in microseconds, one per `tcp_probe` event.
+    /// Connection identity, also the aggregation key.
+    pub key: TcpKey,
+    /// Smoothed RTT samples in microseconds, one per attributed event.
     pub rtts: Vec<u32>,
-    /// Number of retransmissions attributed to this endpoint.
+    /// Number of retransmissions attributed to this connection.
     pub retrans: u64,
-    /// Highest congestion window in segments seen on this endpoint.
+    /// Highest congestion window in segments seen on this connection.
     pub max_cwnd: u32,
-    /// Highest receive window in bytes seen on this endpoint.
+    /// Highest receive window in bytes seen on this connection.
     pub max_rcv_wnd: u32,
+    /// Client handshakes that completed for this connection.
+    pub connects: u64,
+    /// Client handshakes that closed before establishing.
+    pub connect_failures: u64,
+    /// Handshake durations in microseconds.
+    pub connect_us: Vec<u32>,
 }
 
 impl Endpoint {
-    fn key(event: &TcpEvent) -> EndpointKey {
-        (
-            event.family,
-            event.saddr,
-            event.daddr,
-            event.sport,
-            event.dport,
-        )
-    }
-
-    fn new(event: &TcpEvent) -> Self {
+    fn new(key: TcpKey, event: &TcpEvent) -> Self {
         Self {
-            family: event.family,
-            saddr: event.saddr,
-            daddr: event.daddr,
-            sport: event.sport,
-            dport: event.dport,
+            key,
             rtts: Vec::new(),
             retrans: 0,
             max_cwnd: event.snd_cwnd,
             max_rcv_wnd: event.rcv_wnd,
+            connects: 0,
+            connect_failures: 0,
+            connect_us: Vec::new(),
         }
     }
 
@@ -78,32 +116,65 @@ impl Endpoint {
         crate::stats::percentiles_us(&self.rtts)
     }
 
+    /// p50, p95 and p99 of this endpoint's handshake durations, in
+    /// microseconds. All zero when no handshake was measured.
+    pub fn connect_percentiles(&self) -> (u32, u32, u32) {
+        if self.connect_us.is_empty() {
+            return (0, 0, 0);
+        }
+        crate::stats::percentiles_us(&self.connect_us)
+    }
+
     /// Key used to rank endpoints by how slow they are.
     ///
     /// p95 is the ranking signal because a single slow tail is what makes a
     /// connection the reason a request felt slow, and p95 is far steadier
-    /// than a maximum over a short run. The endpoint label breaks ties so
-    /// the ordering is deterministic between runs.
-    fn slowness(&self) -> (u32, EndpointKey) {
+    /// than a maximum over a short run. The connection key breaks ties so the
+    /// ordering is deterministic between runs.
+    fn slowness(&self) -> (u32, TcpKey) {
         let (_, p95, _) = self.rtt_percentiles();
-        (
-            p95,
-            (self.family, self.saddr, self.daddr, self.sport, self.dport),
-        )
+        (p95, self.key)
+    }
+
+    /// Key used to rank slow connection setup, in microseconds.
+    fn connect_slowness(&self) -> (u32, TcpKey) {
+        let (_, p95, _) = self.connect_percentiles();
+        (p95, self.key)
+    }
+
+    /// Retransmissions per second of collection time.
+    pub fn retrans_per_second(&self, elapsed: Duration) -> f64 {
+        if elapsed.is_zero() {
+            return 0.0;
+        }
+        self.retrans as f64 / elapsed.as_secs_f64()
     }
 }
 
-/// Aggregates TCP events per endpoint.
+/// Aggregates attributed TCP events per connection.
 #[derive(Debug, Default)]
 pub struct NetStats {
-    endpoints: BTreeMap<EndpointKey, Endpoint>,
+    endpoints: BTreeMap<TcpKey, Endpoint>,
     retrans: u64,
     samples: u64,
     lost: u64,
+    connects: u64,
+    connect_failures: u64,
+    connect_us: Vec<u32>,
+    /// Connections that produced a creation event, which corroborates
+    /// ownership independently of procfs.
+    created: std::collections::BTreeSet<TcpKey>,
 }
 
 impl NetStats {
     fn record(&mut self, event: TcpEvent) {
+        let key = TcpKey::new(
+            event.family,
+            event.saddr,
+            event.sport,
+            event.daddr,
+            event.dport,
+        );
         let is_retrans = event.retrans != 0;
         if is_retrans {
             self.retrans += 1;
@@ -113,8 +184,8 @@ impl NetStats {
 
         let entry = self
             .endpoints
-            .entry(Endpoint::key(&event))
-            .or_insert_with(|| Endpoint::new(&event));
+            .entry(key)
+            .or_insert_with(|| Endpoint::new(key, &event));
         if is_retrans {
             entry.retrans += 1;
         } else {
@@ -129,18 +200,49 @@ impl NetStats {
         }
     }
 
+    fn record_conn(&mut self, event: ConnEvent) {
+        let key = event.key();
+        self.created.insert(key);
+        let entry = self.endpoints.entry(key).or_insert_with(|| Endpoint {
+            key,
+            ..Endpoint::default()
+        });
+        if event.result == TCP_CONNECT_ESTABLISHED {
+            self.connects += 1;
+            entry.connects += 1;
+            if event.latency_us != 0 {
+                self.connect_us.push(event.latency_us);
+                entry.connect_us.push(event.latency_us);
+            }
+        } else {
+            self.connect_failures += 1;
+            entry.connect_failures += 1;
+        }
+    }
+
     fn record_lost(&mut self, count: u64) {
         self.lost = self.lost.saturating_add(count);
     }
 
     /// Endpoints ordered from slowest to fastest by RTT p95.
-    ///
-    /// This is the ranking the report leads with, so that the endpoint most
-    /// worth looking at comes first rather than whichever one the map
-    /// happened to yield.
     pub fn slowest_endpoints(&self) -> Vec<&Endpoint> {
         let mut ordered: Vec<&Endpoint> = self.endpoints.values().collect();
-        ordered.sort_by_key(|endpoint| std::cmp::Reverse(endpoint.slowness()));
+        ordered.sort_by_key(|endpoint| Reverse(endpoint.slowness()));
+        ordered
+    }
+
+    /// Endpoints ordered from slowest to fastest handshake by p95.
+    ///
+    /// Only connections with a measured handshake appear: an accepted socket
+    /// has no observable start, and a connection that existed before
+    /// collection has no creation event, so neither can be ranked here.
+    pub fn slowest_connects(&self) -> Vec<&Endpoint> {
+        let mut ordered: Vec<&Endpoint> = self
+            .endpoints
+            .values()
+            .filter(|endpoint| !endpoint.connect_us.is_empty())
+            .collect();
+        ordered.sort_by_key(|endpoint| Reverse(endpoint.connect_slowness()));
         ordered
     }
 
@@ -158,6 +260,55 @@ impl NetStats {
     pub fn lost(&self) -> u64 {
         self.lost
     }
+
+    /// Completed client handshakes.
+    pub fn connects(&self) -> u64 {
+        self.connects
+    }
+
+    /// Client handshakes that closed before establishing.
+    pub fn connect_failures(&self) -> u64 {
+        self.connect_failures
+    }
+
+    /// Handshake percentiles across every measured connection.
+    pub fn connect_percentiles(&self) -> (u32, u32, u32) {
+        if self.connect_us.is_empty() {
+            return (0, 0, 0);
+        }
+        crate::stats::percentiles_us(&self.connect_us)
+    }
+
+    /// Whether a connection produced its own creation event.
+    pub fn was_created(&self, key: &TcpKey) -> bool {
+        self.created.contains(key)
+    }
+
+    /// Drops endpoints the target's socket table never corroborated, and
+    /// returns how many were dropped.
+    ///
+    /// The kernel keys ownership by tuple, which is not scoped to a network
+    /// namespace. A socket in another namespace with the same 5-tuple could
+    /// therefore add samples to one of these rows; a row is only published
+    /// when the target itself either created the connection or holds its
+    /// descriptor.
+    pub fn retain_verified(&mut self, collector: &TcpCollector) -> u64 {
+        let unverified: Vec<TcpKey> = self
+            .endpoints
+            .keys()
+            .copied()
+            .filter(|key| !collector.is_verified(key) && !self.created.contains(key))
+            .collect();
+        for key in &unverified {
+            self.endpoints.remove(key);
+        }
+        unverified.len() as u64
+    }
+
+    /// Whether any endpoint remains after verification.
+    pub fn endpoints_len(&self) -> usize {
+        self.endpoints.len()
+    }
 }
 
 impl runtime::EventHandler<TcpEvent> for NetStats {
@@ -170,38 +321,33 @@ impl runtime::EventHandler<TcpEvent> for NetStats {
     }
 }
 
-/// Formats an address from an event as a printable string.
-///
-/// IPv4 renders in dotted-quad form. IPv6 renders as eight groups without
-/// zero compression, which keeps the output stable and easy to compare
-/// between runs.
-pub fn format_address(family: u16, address: [u8; 16]) -> String {
-    if family == AF_INET {
-        return format!(
-            "{}.{}.{}.{}",
-            address[0], address[1], address[2], address[3]
-        );
+impl runtime::EventHandler<ConnEvent> for NetStats {
+    fn on_event(&mut self, event: ConnEvent) {
+        self.record_conn(event);
     }
-    let mut out = String::with_capacity(39);
-    for group in 0..8 {
-        if group != 0 {
-            out.push(':');
-        }
-        let high = u16::from_be_bytes([address[group * 2], address[group * 2 + 1]]);
-        out.push_str(&format!("{high:x}"));
+
+    fn on_lost(&mut self, count: u64) {
+        self.record_lost(count);
     }
-    out
 }
 
 /// Renders an endpoint as `address:port -> address:port`.
 pub fn format_endpoint(endpoint: &Endpoint) -> String {
     format!(
         "{}:{} -> {}:{}",
-        format_address(endpoint.family, endpoint.saddr),
-        endpoint.sport,
-        format_address(endpoint.family, endpoint.daddr),
-        endpoint.dport
+        format_address(endpoint.key.family, endpoint.key.saddr),
+        endpoint.key.sport,
+        format_address(endpoint.key.family, endpoint.key.daddr),
+        endpoint.key.dport
     )
+}
+
+/// Attaches the TCP ownership and measurement programs.
+pub fn attach(bpf: &mut Ebpf) -> Result<()> {
+    runtime::attach_tracepoint(bpf, "sock", "inet_sock_set_state")?;
+    runtime::attach_tracepoint(bpf, "tcp", "tcp_probe")?;
+    runtime::attach_tracepoint(bpf, "tcp", "tcp_retransmit_skb")?;
+    Ok(())
 }
 
 pub fn run(args: NetArgs) -> Result<()> {
@@ -216,90 +362,69 @@ pub fn run(args: NetArgs) -> Result<()> {
         "/fast-ebpf"
     )))
     .context("failed to load eBPF object; run as root or grant CAP_BPF and CAP_PERFMON")?;
-    // No TCP tracepoint provides trustworthy ownership attribution.
+    attach(&mut bpf)?;
     let mut target_tids = runtime::take_target_map(&mut bpf)?;
+    let collector = Rc::new(RefCell::new(TcpCollector::new(&mut bpf, pid)?));
+    // Seed the sockets that already exist, so a process that is already
+    // serving or connected is measurable without waiting for a restart.
+    collector.borrow_mut().reconcile();
 
-    let mut known_tids = BTreeSet::new();
-    let mut stats = NetStats::default();
-    let summary = runtime::run_collection(
+    let mut known_tids = std::collections::BTreeSet::new();
+    let stats = Rc::new(RefCell::new(NetStats::default()));
+    let reconcile = Rc::clone(&collector);
+    // The tick callback reports the collection's elapsed time, so the window
+    // the report prints is the one the measurements covered.
+    let tick_started = Instant::now();
+    let summary = runtime::run_multi_collection(
         &mut bpf,
         &mut target_tids,
         &mut runtime::NoPendingCleanup,
         &mut known_tids,
         &initial_tids,
-        &mut stats,
-        runtime::CollectionOptions {
+        runtime::MultiCollectionOptions {
             pid,
             duration: args.duration,
-            events_map: "NET_EVENTS",
-            perf_page_count: PERF_PAGE_COUNT,
             mode: COLLECT_NET,
+            tick_interval: RECONCILE_INTERVAL,
+            poll_interval: runtime::DEFAULT_POLL_INTERVAL,
+        },
+        runtime::MultiStreams {
+            streams: vec![
+                runtime::EventStream::of::<TcpEvent, _>(
+                    "NET_EVENTS",
+                    PERF_PAGE_COUNT,
+                    SharedStats(Rc::clone(&stats)),
+                ),
+                runtime::EventStream::of::<ConnEvent, _>(
+                    "CONN_EVENTS",
+                    runtime::DEFAULT_PERF_PAGE_COUNT,
+                    SharedStats(Rc::clone(&stats)),
+                ),
+            ],
+            on_tick: Some(Box::new(move |_at, _summary| {
+                reconcile.borrow_mut().reconcile();
+                tick_started.elapsed()
+            })),
+            on_progress: None,
         },
     )?;
+    // The tick callback reconciled during the final drain; reading once more
+    // makes the verification use the newest descriptor table.
+    collector.borrow_mut().reconcile();
+    let mut stats = std::mem::take(&mut *stats.borrow_mut());
+    // The tick callback is dropped when the collection returns, so this is
+    // the only remaining reference.
+    let collector = match Rc::try_unwrap(collector) {
+        Ok(cell) => cell.into_inner(),
+        Err(_) => anyhow::bail!("TCP ownership is still borrowed after collection"),
+    };
+    let mut collector = collector;
+    let counters = collector.counters();
+    let unverified = stats.retain_verified(&collector);
+    let report = NetReport::new(&stats, &collector, &counters, unverified, &summary);
 
     if args.format.format == Format::Text {
-        println!("PID: {process_name} ({pid})");
-        println!("Duration: {}", humantime::format_duration(summary.elapsed));
-        if summary.interrupted {
-            println!("Status: interrupted");
-        }
-        println!("TCP attribution: unavailable (socket ownership cannot be established)");
-        println!("Samples: unavailable");
-        println!("Retransmissions: unavailable");
-        println!("Lost events: {}", stats.lost());
-        println!();
-
-        let ranked = stats.slowest_endpoints();
-        if ranked.is_empty() {
-            println!("Endpoints");
-            println!("No TCP samples collected.");
-            return Ok(());
-        }
-
-        // The table leads with the slowest endpoint so the connection worth
-        // looking at is the first thing on screen. All latencies are in
-        // microseconds. Transmitted segment counts are not collected.
-        println!(
-            "Slow endpoints by RTT p95 ({} of {} shown)",
-            ranked.len().min(MAX_REPORTED_ENDPOINTS),
-            ranked.len()
-        );
-        println!(
-            "  {:>8} {:>8} {:>8} {:>8} {:>8}  endpoint",
-            "p95", "p50", "p99", "samples", "retrans"
-        );
-        for endpoint in ranked.iter().take(MAX_REPORTED_ENDPOINTS) {
-            let (p50, p95, p99) = endpoint.rtt_percentiles();
-            println!(
-                "  {p95:>8} {p50:>8} {p99:>8} {:>8} {:>8}  {}",
-                endpoint.rtts.len(),
-                endpoint.retrans,
-                format_endpoint(endpoint),
-            );
-        }
-        if ranked.len() > MAX_REPORTED_ENDPOINTS {
-            println!(
-                "  ... {} more endpoint(s) not shown",
-                ranked.len() - MAX_REPORTED_ENDPOINTS
-            );
-        }
-
-        // The worst offender is called out on its own, because a table row is
-        // easy to skim past and this is the answer to "which remote is slow".
-        let worst = ranked[0];
-        let (_, worst_p95, _) = worst.rtt_percentiles();
-        println!();
-        println!("Slowest endpoint");
-        println!("  {} us p95", worst_p95);
-        println!("  {}", format_endpoint(worst));
-        println!("  {} retransmissions", worst.retrans);
-        println!("  retransmission rate unavailable (transmitted segment count not collected)");
-        // A closed congestion window with retransmissions on top is what a
-        // struggling path looks like, so both are always named here.
-        println!(
-            "  congestion window {} segments, receive window {} bytes",
-            worst.max_cwnd, worst.max_rcv_wnd
-        );
+        print_text(pid, &process_name, summary.elapsed, &report);
     } else {
         json::emit(
             args.format.format,
@@ -309,8 +434,8 @@ pub fn run(args: NetArgs) -> Result<()> {
                 Some(process_name),
                 summary.elapsed,
                 summary.interrupted,
-                false,
-                crate::json_payloads::network_json(&stats),
+                summary.process_exited,
+                crate::json_payloads::network_json(&report),
             )
             .with_v2(),
         );
@@ -318,177 +443,348 @@ pub fn run(args: NetArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Everything the report needs, gathered so the text and JSON renderers read
+/// the same numbers.
+pub struct NetReport<'a> {
+    /// Per-connection aggregation.
+    pub stats: &'a NetStats,
+    /// Ownership state and evidence counts, absent for a report built
+    /// without a collector (unit tests of the document shape).
+    collector: Option<&'a TcpCollector>,
+    /// Kernel-side attribution counters.
+    pub counters: &'a crate::tcp::TcpCounters,
+    /// Endpoints dropped because no evidence corroborated them.
+    pub unverified: u64,
+    /// Whether attribution is possible at all.
+    pub available: bool,
+    /// Why it is not, when it is not.
+    pub reason: Option<String>,
+    /// Wall time the measurements were collected over.
+    pub elapsed: Duration,
+    /// Whether a client handshake was measured.
+    pub connect_available: bool,
+    /// Why not, when not.
+    pub connect_reason: Option<String>,
+}
 
-    #[test]
-    fn tcp_programs_have_no_attribution_or_output_path() {
-        let ebpf = include_str!("../../fast-ebpf/src/main.rs");
-        assert_eq!(
-            ebpf.matches("NET_EVENTS").count(),
-            1,
-            "the event map may only be declared"
-        );
-        assert!(!ebpf.contains("TCP_SOCKETS"));
-        for name in ["tcp_probe", "tcp_retransmit_skb"] {
-            let body = format!("pub fn {name}(_ctx: TracePointContext) -> u32 {{\n    0\n}}");
-            assert!(
-                ebpf.contains(&body),
-                "{name} must unconditionally return without attributing"
-            );
-            for source in [
-                include_str!("network.rs"),
-                include_str!("diagnose.rs"),
-                include_str!("daemon.rs"),
-            ] {
-                let attachment = format!("attach_tracepoint(&mut bpf, \"tcp\", \"{name}\")");
-                assert!(!source.contains(&attachment), "{name} must not be attached");
-            }
+impl<'a> NetReport<'a> {
+    /// Gathers the numbers both renderers read.
+    pub fn new(
+        stats: &'a NetStats,
+        collector: &'a TcpCollector,
+        counters: &'a crate::tcp::TcpCounters,
+        unverified: u64,
+        summary: &runtime::CollectionSummary,
+    ) -> NetReport<'a> {
+        let reason = collector.unavailable_reason().map(str::to_owned);
+        // Availability is about evidence, not traffic: a target that holds no TCP
+        // socket is measured, with a sample count of zero.
+        let available = reason.is_none();
+        let connect_available = stats.connects() > 0;
+        let connect_reason = if connect_available {
+            None
+        } else if stats.connect_failures() > 0 {
+            Some("no handshake completed: every connect failed".to_string())
+        } else if reason.is_some() {
+            reason.clone()
+        } else if stats.endpoints_len() == 0 {
+            Some("no owned TCP connection was observed".to_string())
+        } else {
+            Some("no client handshake was observed; accepted sockets and pre-existing connections have no measurable start".to_string())
+        };
+        NetReport {
+            stats,
+            collector: Some(collector),
+            counters,
+            unverified,
+            elapsed: summary.elapsed,
+            available,
+            reason,
+            connect_available,
+            connect_reason,
+        }
+    }
+}
+
+/// Whether the report can publish RTT and retransmission measurements.
+impl<'a> NetReport<'a> {
+    /// Builds a report with no ownership evidence, for document tests.
+    #[cfg(test)]
+    pub fn for_test(
+        stats: &'a NetStats,
+        counters: &'a crate::tcp::TcpCounters,
+        elapsed: Duration,
+    ) -> NetReport<'a> {
+        Self {
+            stats,
+            collector: None,
+            counters,
+            unverified: 0,
+            elapsed,
+            available: false,
+            reason: Some("no ownership evidence".to_string()),
+            connect_available: false,
+            connect_reason: Some("no handshake measured".to_string()),
         }
     }
 
-    fn probe(family: u16, saddr: [u8; 16], daddr: [u8; 16], rtt: u32) -> TcpEvent {
+    /// Connections removed because the target stopped holding the socket.
+    pub fn excluded(&self) -> u64 {
+        self.collector.map_or(0, TcpCollector::excluded)
+    }
+
+    /// Listener addresses that could not be attributed.
+    pub fn ambiguous_listeners(&self) -> usize {
+        self.collector.map_or(0, TcpCollector::ambiguous_listeners)
+    }
+
+    /// Whether the target's socket table corroborated this connection.
+    pub fn is_verified(&self, key: &TcpKey) -> bool {
+        self.collector
+            .is_some_and(|collector| collector.is_verified(key))
+    }
+
+    /// Human-readable attribution summary line.
+    pub fn attribution_line(&self) -> String {
+        if let Some(reason) = &self.reason {
+            return format!("TCP attribution: unavailable ({reason})");
+        }
+        format!(
+            "TCP attribution: verified ({} endpoint(s), {} excluded, {} ambiguous listener(s), {} event(s) from connections this run could not attribute)",
+            self.stats.endpoints_len(),
+            self.excluded() + self.unverified,
+            self.ambiguous_listeners(),
+            self.counters.unmatched_rtt + self.counters.unmatched_retrans
+        )
+    }
+
+    /// Whether the target listens on `port`.
+    pub fn is_listener_port(&self, port: u16) -> bool {
+        self.collector
+            .is_some_and(|collector| collector.is_listener_port(port))
+    }
+}
+
+fn print_text(pid: u32, process_name: &str, elapsed: Duration, report: &NetReport<'_>) {
+    println!("PID: {process_name} ({pid})");
+    println!("Duration: {}", humantime::format_duration(elapsed));
+    println!("{}", report.attribution_line());
+    if report.available {
+        println!("Samples: {}", report.stats.samples());
+        println!("Retransmissions: {}", report.stats.retrans());
+    } else {
+        println!("Samples: unavailable");
+        println!("Retransmissions: unavailable");
+    }
+    println!("Lost events: {}", report.stats.lost());
+    println!(
+        "Attribution counters: {} owner record(s), {} dropped, {} closed; RTT {} matched, {} rate-limited, {} unattributed; retransmissions {} matched, {} unattributed; handshakes {} tracked, {} established, {} failed",
+        report.counters.inserted,
+        report.counters.drops,
+        report.counters.removed,
+        report.counters.matched_rtt,
+        report.counters.rate_limited,
+        report.counters.unmatched_rtt,
+        report.counters.matched_retrans,
+        report.counters.unmatched_retrans,
+        report.counters.pending_inserted,
+        report.counters.pending_established,
+        report.counters.pending_failed,
+    );
+    println!();
+
+    let ranked = report.stats.slowest_endpoints();
+    if ranked.is_empty() {
+        println!("Endpoints");
+        println!("No attributed TCP connections.");
+        return;
+    }
+
+    println!(
+        "Slowest connections by RTT p95 ({} of {} shown)",
+        ranked.len().min(MAX_REPORTED_ENDPOINTS),
+        ranked.len()
+    );
+    println!(
+        "  {:>8} {:>8} {:>8} {:>8} {:>8}  endpoint",
+        "p95", "p50", "p99", "samples", "retrans"
+    );
+    for endpoint in ranked.iter().take(MAX_REPORTED_ENDPOINTS) {
+        let (p50, p95, p99) = endpoint.rtt_percentiles();
+        println!(
+            "  {p95:>8} {p50:>8} {p99:>8} {:>8} {:>8}  {}",
+            endpoint.rtts.len(),
+            endpoint.retrans,
+            format_endpoint(endpoint),
+        );
+    }
+    if ranked.len() > MAX_REPORTED_ENDPOINTS {
+        println!(
+            "  ... {} more connection(s) not shown",
+            ranked.len() - MAX_REPORTED_ENDPOINTS
+        );
+    }
+
+    let worst = ranked[0];
+    let (_, worst_p95, _) = worst.rtt_percentiles();
+    println!();
+    println!("Slowest connection");
+    println!("  {} us p95 RTT", worst_p95);
+    println!("  {}", format_endpoint(worst));
+    println!("  {} retransmissions", worst.retrans);
+    println!(
+        "  congestion window {} segments, receive window {} bytes",
+        worst.max_cwnd, worst.max_rcv_wnd
+    );
+
+    println!();
+    match report.connect_available {
+        true => {
+            let (p50, p95, p99) = report.stats.connect_percentiles();
+            println!(
+                "Connection setup: {} attempt(s), {} failed",
+                report.stats.connects() + report.stats.connect_failures(),
+                report.stats.connect_failures()
+            );
+            println!("  p95 {p95} us, p50 {p50} us, p99 {p99} us (connect to established)");
+            for endpoint in report
+                .stats
+                .slowest_connects()
+                .iter()
+                .take(MAX_REPORTED_ENDPOINTS)
+            {
+                let (_, endpoint_p95, _) = endpoint.connect_percentiles();
+                println!(
+                    "  {endpoint_p95:>8} us p95  {}  ({} connect(s))",
+                    format_endpoint(endpoint),
+                    endpoint.connects
+                );
+            }
+        }
+        false => println!(
+            "Connection setup: unavailable ({})",
+            report.connect_reason.as_deref().unwrap_or("no measurement")
+        ),
+    }
+    println!();
+    println!("Retransmission ratio: unavailable (no transmitted-segment denominator)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fast_common::AF_INET;
+
+    fn v4(last: u8) -> [u8; 16] {
+        let mut address = [0u8; 16];
+        address[..4].copy_from_slice(&[10, 0, 0, last]);
+        address
+    }
+
+    fn probe(daddr: u8, rtt_us: u32) -> TcpEvent {
         TcpEvent {
-            tid: 1,
-            family,
+            tid: 0,
+            family: AF_INET,
             retrans: 0,
             _pad: 0,
             sport: 1234,
             dport: 80,
-            rtt_us: rtt,
+            rtt_us,
             snd_cwnd: 10,
-            rcv_wnd: 0,
-            saddr,
-            daddr,
+            rcv_wnd: 4096,
+            saddr: v4(1),
+            daddr: v4(daddr),
         }
     }
 
-    fn retrans(family: u16, saddr: [u8; 16], daddr: [u8; 16]) -> TcpEvent {
+    fn retrans(daddr: u8) -> TcpEvent {
         TcpEvent {
             retrans: 1,
-            ..probe(family, saddr, daddr, 0)
+            ..probe(daddr, 0)
         }
     }
 
-    fn v4(a: u8, b: u8, c: u8, d: u8) -> [u8; 16] {
-        let mut out = [0u8; 16];
-        out[..4].copy_from_slice(&[a, b, c, d]);
-        out
-    }
-
     #[test]
-    fn groups_samples_per_endpoint() {
-        let mut s = NetStats::default();
-        s.record(probe(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 1), 100));
-        s.record(probe(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 1), 300));
-        s.record(probe(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 2), 200));
-
-        assert_eq!(s.samples(), 3);
-        assert_eq!(s.slowest_endpoints().len(), 2);
-        // Endpoints are ordered by their key, so the 10.0.0.1 connection
-        // comes first and holds both of its samples.
-        let first = &s.slowest_endpoints()[0];
-        assert_eq!(first.rtts.len(), 2);
-        assert_eq!(format_endpoint(first), "127.0.0.1:1234 -> 10.0.0.1:80");
-        assert_eq!(s.slowest_endpoints()[1].rtts.len(), 1);
-    }
-
-    #[test]
-    fn ignores_zero_rtt_samples_but_keeps_the_endpoint() {
-        let mut s = NetStats::default();
-        // A fresh connection has no smoothed RTT yet.
-        s.record(probe(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 1), 0));
-        assert_eq!(s.samples(), 1);
-        assert_eq!(s.slowest_endpoints().len(), 1);
-        assert!(s.slowest_endpoints()[0].rtts.is_empty());
-    }
-
-    #[test]
-    fn ranks_endpoints_slowest_first() {
-        let mut s = NetStats::default();
-        // A fast endpoint and a slow one, each with a steady distribution.
-        for rtt in [40, 40, 40] {
-            s.record(probe(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 1), rtt));
-        }
-        for rtt in [900, 900, 900] {
-            s.record(probe(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 2), rtt));
-        }
-        // A middle endpoint, added last, to prove the order is by latency
-        // and not by insertion or by address.
-        for rtt in [200, 200, 200] {
-            s.record(probe(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 3), rtt));
-        }
-
-        let ranked = s.slowest_endpoints();
-        assert_eq!(ranked.len(), 3);
-        assert_eq!(format_endpoint(ranked[0]), "127.0.0.1:1234 -> 10.0.0.2:80");
-        assert_eq!(format_endpoint(ranked[1]), "127.0.0.1:1234 -> 10.0.0.3:80");
-        assert_eq!(format_endpoint(ranked[2]), "127.0.0.1:1234 -> 10.0.0.1:80");
-    }
-
-    #[test]
-    fn network_json_never_reports_unattributable_events() {
-        // The reporters keep no TCP ownership, so events recorded through the
-        // low-level collector must not leak into the document as measurements.
+    fn groups_samples_per_connection() {
         let mut stats = NetStats::default();
-        let src = v4(127, 0, 0, 1);
-        stats.record(probe(AF_INET, src, v4(10, 0, 0, 3), 100));
-        stats.record(retrans(AF_INET, src, v4(10, 0, 0, 3)));
-        let json = serde_json::to_value(crate::json_payloads::network_json(&stats)).unwrap();
-        assert_eq!(json["tcp_available"], false);
-        assert!(json["samples"].is_null());
-        assert!(json["retransmissions"].is_null());
-        assert_eq!(json["endpoints"].as_array().unwrap().len(), 0);
+        stats.record(probe(2, 100));
+        stats.record(probe(2, 300));
+        stats.record(probe(3, 200));
+        let ranked = stats.slowest_endpoints();
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(format_endpoint(ranked[0]), "10.0.0.1:1234 -> 10.0.0.2:80");
+        assert_eq!(format_endpoint(ranked[1]), "10.0.0.1:1234 -> 10.0.0.3:80");
+        assert_eq!(ranked[0].rtts.len(), 2);
+    }
+
+    #[test]
+    fn a_five_tuple_is_the_connection_identity() {
+        // Two connections to the same remote are two rows, because the local
+        // port differs; one connection keeps its samples together.
+        let mut stats = NetStats::default();
+        stats.record(probe(2, 100));
+        stats.record(TcpEvent {
+            sport: 4321,
+            ..probe(2, 100)
+        });
+        stats.record(TcpEvent {
+            sport: 4321,
+            ..probe(2, 200)
+        });
+        let ranked = stats.slowest_endpoints();
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].rtts.len(), 2);
+        assert_eq!(ranked[1].rtts.len(), 1);
     }
 
     #[test]
     fn ranking_is_stable_for_equal_latency() {
-        let mut s = NetStats::default();
+        let mut stats = NetStats::default();
         for daddr in [10, 9, 8] {
-            s.record(probe(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, daddr), 100));
+            stats.record(probe(daddr, 100));
         }
-        // Equal latency falls back to the endpoint key, in descending order,
-        // so two reports generated from the same events read identically.
-        let first = format_endpoint(s.slowest_endpoints()[0]);
-        assert_eq!(first, "127.0.0.1:1234 -> 10.0.0.10:80");
-        assert_eq!(first, format_endpoint(s.slowest_endpoints()[0]));
+        let first = format_endpoint(stats.slowest_endpoints()[0]);
+        assert_eq!(first, "10.0.0.1:1234 -> 10.0.0.10:80");
+        assert_eq!(first, format_endpoint(stats.slowest_endpoints()[0]));
     }
 
     #[test]
-    fn counts_retransmissions_per_endpoint() {
-        let mut s = NetStats::default();
-        s.record(probe(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 1), 100));
-        s.record(retrans(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 1)));
-
-        assert_eq!(s.retrans(), 1);
-        let endpoint = &s.slowest_endpoints()[0];
+    fn counts_retransmissions_per_connection() {
+        let mut stats = NetStats::default();
+        stats.record(probe(1, 100));
+        stats.record(retrans(1));
+        assert_eq!(stats.retrans(), 1);
+        let endpoint = &stats.slowest_endpoints()[0];
         assert_eq!(endpoint.retrans, 1);
-        // The sample and the retransmission belong to the same connection.
         assert_eq!(endpoint.rtts.len(), 1);
     }
 
     #[test]
     fn separates_ipv4_from_ipv6_endpoints() {
-        let mut s = NetStats::default();
+        let mut stats = NetStats::default();
+        stats.record(probe(1, 100));
         let mut v6 = [0u8; 16];
         v6[0] = 0x20;
         v6[1] = 0x01;
-        s.record(probe(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 1), 100));
-        s.record(probe(fast_common::AF_INET6, v6, v6, 100));
-        assert_eq!(s.slowest_endpoints().len(), 2);
+        stats.record(TcpEvent {
+            family: fast_common::AF_INET6,
+            saddr: v6,
+            daddr: v6,
+            ..probe(1, 100)
+        });
+        assert_eq!(stats.slowest_endpoints().len(), 2);
     }
 
     #[test]
     fn tracks_highest_windows_seen() {
-        let mut s = NetStats::default();
-        s.record(probe(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 1), 100));
-        s.record(TcpEvent {
+        let mut stats = NetStats::default();
+        stats.record(probe(1, 100));
+        stats.record(TcpEvent {
             snd_cwnd: 24,
             rcv_wnd: 65535,
-            ..probe(AF_INET, v4(127, 0, 0, 1), v4(10, 0, 0, 1), 120)
+            ..probe(1, 120)
         });
-        let endpoint = &s.slowest_endpoints()[0];
+        let endpoint = &stats.slowest_endpoints()[0];
         assert_eq!(endpoint.max_cwnd, 24);
         assert_eq!(endpoint.max_rcv_wnd, 65535);
     }
@@ -502,19 +798,64 @@ mod tests {
         v6[3] = 0xb8;
         v6[15] = 0x01;
         let endpoint = Endpoint {
-            family: fast_common::AF_INET6,
-            saddr: v6,
-            daddr: v6,
-            sport: 443,
-            dport: 51000,
-            rtts: Vec::new(),
-            retrans: 0,
-            max_cwnd: 0,
-            max_rcv_wnd: 0,
+            key: TcpKey::new(fast_common::AF_INET6, v6, 443, v6, 51000),
+            ..Endpoint::default()
         };
         assert_eq!(
             format_endpoint(&endpoint),
-            "2001:db8:0:0:0:0:0:1:443 -> 2001:db8:0:0:0:0:0:1:51000"
+            "2001:db8::1:443 -> 2001:db8::1:51000"
         );
+    }
+
+    #[test]
+    fn handshakes_rank_separately_from_rtt() {
+        let mut stats = NetStats::default();
+        stats.record(probe(1, 50));
+        stats.record(probe(2, 900));
+        stats.record_conn(ConnEvent {
+            family: AF_INET,
+            sport: 1234,
+            dport: 80,
+            result: TCP_CONNECT_ESTABLISHED,
+            _pad: 0,
+            latency_us: 1_500,
+            saddr: v4(1),
+            daddr: v4(1),
+        });
+        let by_rtt = stats.slowest_endpoints();
+        assert_eq!(format_endpoint(by_rtt[0]), "10.0.0.1:1234 -> 10.0.0.2:80");
+        let by_connect = stats.slowest_connects();
+        assert_eq!(by_connect.len(), 1);
+        assert_eq!(by_connect[0].connect_us, vec![1_500]);
+        assert_eq!(stats.connects(), 1);
+    }
+
+    #[test]
+    fn failed_handshakes_are_counted_and_never_ranked() {
+        let mut stats = NetStats::default();
+        stats.record_conn(ConnEvent {
+            family: AF_INET,
+            sport: 1234,
+            dport: 9,
+            result: fast_common::TCP_CONNECT_FAILED,
+            _pad: 0,
+            latency_us: 12,
+            saddr: v4(1),
+            daddr: v4(3),
+        });
+        assert_eq!(stats.connect_failures(), 1);
+        assert_eq!(stats.connects(), 0);
+        assert!(stats.slowest_connects().is_empty());
+        assert_eq!(stats.endpoints_len(), 1);
+    }
+
+    #[test]
+    fn retransmissions_per_second_uses_the_collection_window() {
+        let mut stats = NetStats::default();
+        stats.record(retrans(2));
+        stats.record(retrans(2));
+        let endpoint = &stats.slowest_endpoints()[0];
+        assert_eq!(endpoint.retrans_per_second(Duration::from_secs(2)), 1.0);
+        assert_eq!(endpoint.retrans_per_second(Duration::ZERO), 0.0);
     }
 }

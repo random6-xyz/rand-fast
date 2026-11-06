@@ -67,6 +67,23 @@ pub mod threshold {
     /// the link rather than working around it.
     pub const NETWORK_WAIT_SHARE: f64 = 0.5;
 
+    /// Attributed RTT p95, in microseconds, that counts as a slow link. The
+    /// threshold is the same 10ms the scheduler and block-I/O signals use, so
+    /// a number here means what it means there: long enough to feel, short
+    /// enough that ordinary traffic does not trip it.
+    pub const NETWORK_RTT_P95_US: u64 = 10_000;
+
+    /// Attributed retransmissions per second that count as a lossy path. Two
+    /// per second is not a packet-loss statistic; it is a rate a healthy
+    /// connection does not sustain, so its presence says the path is losing
+    /// data rather than merely being far away.
+    pub const NETWORK_RETRANS_PER_S: f64 = 2.0;
+
+    /// Connection-establishment p95, in microseconds, that counts as slow.
+    /// Handshakes are three round trips' worth of work, so this is a fifth of
+    /// the RTT threshold: a 10ms RTT path still connects inside it.
+    pub const NETWORK_CONNECT_P95_US: u64 = 2_000;
+
     /// Waits that must be observed before a wait share may outrank anything.
     ///
     /// A share is a ratio, and a ratio over one sample is not a measurement: a
@@ -241,24 +258,107 @@ fn score_lock(evidence: &Evidence) -> Option<Severity> {
     })
 }
 
-/// Scores socket waiting; retransmission counts have no valid rate denominator.
+/// Scores the network signal.
+///
+/// Four measurements can describe a slow network, and any one of them is
+/// enough: the process waiting on a socket, a slow round trip on a connection
+/// it owns, a lossy path that keeps retransmitting, or a handshake that takes
+/// too long. The severity is the worst of them rather than their sum, because
+/// they describe one condition from different angles: a lossy path raises both
+/// RTT and the retransmission rate, and adding those together would report two
+/// causes where there is one.
+///
+/// Every measurement is gated on its own evidence. An unavailable TCP signal
+/// contributes nothing instead of contributing zero, so "not measured" cannot
+/// look like "measured healthy".
 fn score_network(evidence: &Evidence) -> Option<Severity> {
-    if evidence.offcpu_samples == 0 {
+    let wait = if evidence.offcpu_samples > 0 {
+        wait_severity(
+            evidence.offcpu_network_ratio,
+            threshold::NETWORK_WAIT_SHARE,
+            evidence,
+        )
+    } else {
+        0.0
+    };
+    let rtt = evidence
+        .net_rtt_p95_us
+        .filter(|_| evidence.net_samples > 0)
+        .map_or(0.0, |value| {
+            ramp(
+                value as f64,
+                threshold::NETWORK_RTT_P95_US as f64,
+                threshold::NETWORK_RTT_P95_US as f64 * 5.0,
+            )
+        });
+    let retrans = evidence.retrans_per_second.map_or(0.0, |value| {
+        ramp(
+            value,
+            threshold::NETWORK_RETRANS_PER_S * 0.5,
+            threshold::NETWORK_RETRANS_PER_S,
+        )
+    });
+    let connect = evidence.net_connect_p95_us.map_or(0.0, |value| {
+        ramp(
+            value as f64,
+            threshold::NETWORK_CONNECT_P95_US as f64,
+            threshold::NETWORK_CONNECT_P95_US as f64 * 5.0,
+        )
+    });
+    let severity = wait.max(rtt).max(retrans).max(connect);
+    if severity <= 0.0 {
         return None;
     }
     Some(Severity {
         cause: "Network",
-        severity: wait_severity(
-            evidence.offcpu_network_ratio,
-            threshold::NETWORK_WAIT_SHARE,
-            evidence,
-        ),
-        evidence: format!(
-            "{:.0}% of {} us off-CPU waiting on a socket; TCP attribution and retransmission rate unavailable",
-            evidence.offcpu_network_ratio.clamp(0.0, 1.0) * 100.0,
-            evidence.offcpu_total_us
-        ),
+        severity,
+        evidence: describe_network(evidence),
     })
+}
+
+/// States which network measurements were available, and their numbers.
+fn describe_network(evidence: &Evidence) -> String {
+    let mut parts = vec![format!(
+        "{:.0}% of {} us off-CPU waiting on a socket",
+        evidence.offcpu_network_ratio.clamp(0.0, 1.0) * 100.0,
+        evidence.offcpu_total_us
+    )];
+    if !evidence.tcp_available {
+        parts.push(format!(
+            "TCP measurements unavailable ({})",
+            evidence
+                .tcp_reason
+                .as_deref()
+                .unwrap_or("socket ownership was not established")
+        ));
+        return parts.join("; ");
+    }
+    if let Some(rtt) = evidence.net_rtt_p95_us {
+        parts.push(format!("RTT p95 {rtt} us"));
+    } else {
+        parts.push("RTT p95 unavailable".to_string());
+    }
+    if let Some(rate) = evidence.retrans_per_second {
+        parts.push(format!(
+            "{} retransmission(s), {rate:.1}/s",
+            evidence.retransmissions
+        ));
+    }
+    if let Some(connect) = evidence.net_connect_p95_us {
+        parts.push(format!(
+            "connect p95 {connect} us over {} attempt(s)",
+            evidence.net_connects + evidence.net_connect_failures
+        ));
+    } else {
+        parts.push("connection setup unavailable".to_string());
+    }
+    if evidence.net_connect_failures > 0 {
+        parts.push(format!(
+            "{} connect attempt(s) failed",
+            evidence.net_connect_failures
+        ));
+    }
+    parts.join("; ")
 }
 
 /// Scores memory by reusing the memory report's own verdict.
@@ -538,7 +638,51 @@ mod tests {
             ranked[0]
                 .evidence
                 .iter()
-                .any(|item| item.contains("rate unavailable"))
+                .any(|item| item.contains("TCP measurements unavailable")),
+            "{ranked:?}"
+        );
+    }
+
+    #[test]
+    fn attributed_rtt_and_handshakes_rank_network_without_socket_waits() {
+        // With ownership proven, a slow path is visible even when the process
+        // spends no measurable time waiting on a socket: the handshake and
+        // the RTT describe the connection itself.
+        let evidence = Evidence {
+            net_samples: 400,
+            net_rtt_p95_us: Some(80_000),
+            retrans_per_second: Some(0.0),
+            retransmissions: 0,
+            tcp_available: true,
+            tcp_reason: None,
+            ..idle()
+        };
+        let ranked = score(&evidence);
+        assert_eq!(ranked[0].cause, "Network");
+        assert!(
+            ranked[0]
+                .evidence
+                .iter()
+                .any(|item| item.contains("RTT p95")),
+            "{ranked:?}"
+        );
+
+        let evidence = Evidence {
+            net_samples: 120,
+            net_rtt_p95_us: Some(200),
+            net_connects: 20,
+            net_connect_p95_us: Some(15_000),
+            tcp_available: true,
+            ..idle()
+        };
+        let ranked = score(&evidence);
+        assert_eq!(ranked[0].cause, "Network");
+        assert!(
+            ranked[0]
+                .evidence
+                .iter()
+                .any(|item| item.contains("connect p95")),
+            "{ranked:?}"
         );
     }
 

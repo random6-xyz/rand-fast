@@ -168,9 +168,23 @@ storage as on a real root filesystem.
 
 The matrix covers collector verifier/load paths, scheduler contention, CPU
 sampling and stacks, block I/O attribution, off-CPU waits, memory and PSI,
-diagnosis ranking, daemon triggers and storage, and the TCP-unavailable
-contract. TCP programs are deliberately not attached; the guest reports
-`TCP verifier: SKIP` rather than claiming a verifier pass.
+diagnosis ranking, daemon triggers and storage, and the TCP ownership contract.
+The TCP case attaches every TCP program, so the guest runs the real verifier
+for them.
+
+For support work, the hidden `fast debug tcp-sockets --pid <PID> [--format json]`
+prints only what procfs proves about the target: the sockets it holds, their
+inodes and kernel retransmission counters, and any listener address that more
+than one socket binds. It runs no collector and prints no RTT or rate.
+
+`QEMU_SMOKE_CASE=tcp-ownership` runs only that case, which is the one to use
+while working on attribution. It starts two `net-hog` fixtures (the target and
+an unrelated process), attaches after their connections already exist, and
+then drives a `tcp-lifecycle` fixture through IPv6, a reused 4-tuple, a
+starved handshake, two failed connects and a socket handed to a forked child
+with `SCM_RIGHTS`. The assertions are in `check_tcp_ownership` in
+`tools/qemu-smoke.sh`: an attributed endpoint the target does not hold, or an
+endpoint from the unrelated process, fails the case.
 
 The CI gate uses the pinned Linux 6.12.115 build with `CONFIG_PSI=y`, four
 vCPUs, and TCG on GitHub-hosted runners; local validation uses the
