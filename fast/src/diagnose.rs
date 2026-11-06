@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use aya::{Ebpf, include_bytes_aligned};
 use fast_common::{
     COLLECT_CPU_SAMPLE, COLLECT_MEMORY, COLLECT_NET, COLLECT_OFFCPU, COLLECT_SCHEDULER_LATENCY,
-    CpuSampleEvent, IoEvent, OffCpuEvent, SchedulerLatencyEvent, TcpEvent,
+    ConnEvent, CpuSampleEvent, IoEvent, OffCpuEvent, SchedulerLatencyEvent, TcpEvent,
 };
 
 use crate::{
@@ -62,6 +62,18 @@ pub struct Evidence {
     pub retransmissions: u64,
     /// False when TCP ownership cannot be established.
     pub tcp_available: bool,
+    /// Why TCP measurements are unavailable, when they are.
+    pub tcp_reason: Option<String>,
+    /// Retransmissions per second of collection time.
+    pub retrans_per_second: Option<f64>,
+    /// p95 RTT of the slowest attributed connection, in microseconds.
+    pub net_rtt_p95_us: Option<u64>,
+    /// p95 connection-establishment latency, in microseconds.
+    pub net_connect_p95_us: Option<u64>,
+    /// Connection attempts observed.
+    pub net_connects: u64,
+    /// Connection attempts that failed before establishing.
+    pub net_connect_failures: u64,
     /// Always null: transmitted segment counts are not collected. Retained
     /// in v2; previous v1 numeric values were invalid.
     pub retrans_ratio: Option<f64>,
@@ -145,7 +157,6 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
     .context("failed to load eBPF object; run as root or grant CAP_BPF and CAP_PERFMON")?;
     crate::io_request_layout::configure(&mut bpf)?;
 
-    // TCP attribution is unavailable; do not attach the TCP tracepoints.
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_wakeup")?;
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_switch")?;
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_process_exit")?;
@@ -153,6 +164,9 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
     runtime::attach_raw_tracepoint(&mut bpf, "block_rq_complete")?;
     runtime::attach_tracepoint(&mut bpf, "exceptions", "page_fault_user")?;
     runtime::attach_tracepoint(&mut bpf, "vmscan", "mm_vmscan_direct_reclaim_begin")?;
+    // TCP ownership and measurement. The collector seeds the sockets the
+    // target already holds before the first event can arrive.
+    network::attach(&mut bpf)?;
 
     // The on-CPU sampler is a perf event program rather than a tracepoint, so
     // it is attached separately. Without it the CPU signal collects nothing
@@ -160,11 +174,15 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
     let (cpu_links, mut cpu_stats) = cpu::attach_cpu_sampler(&mut bpf, pid, CPU_SAMPLE_HZ)?;
 
     let mut target_tids = runtime::take_target_map(&mut bpf)?;
+    let tcp_collector = std::rc::Rc::new(std::cell::RefCell::new(crate::tcp::TcpCollector::new(
+        &mut bpf, pid,
+    )?));
+    tcp_collector.borrow_mut().reconcile();
     let mut sched_stats = stats::Statistics::default();
     // The same default threshold `fast io` uses, so a p99 here means what it
     // means there.
     let mut io_stats = io::IoStats::new(io::DEFAULT_SLOW_THRESHOLD_NS);
-    let mut net_stats = network::NetStats::default();
+    let net_stats = std::rc::Rc::new(std::cell::RefCell::new(network::NetStats::default()));
     let mut offcpu_stats = offcpu::OffCpuStats::default();
 
     let mode = COLLECT_SCHEDULER_LATENCY
@@ -176,11 +194,9 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
     // The collection loop owns the clock, so progress rides its tick timer
     // instead of starting a second timer that could disagree with it. With
     // progress off the tick stays disabled, exactly as before.
-    let tick_interval = if args.progress {
-        crate::progress::UPDATE_INTERVAL
-    } else {
-        std::time::Duration::ZERO
-    };
+    // The tick also reconciles socket ownership, so it runs even without a
+    // progress display: a descriptor handed away must stop being attributed.
+    let tick_interval = crate::progress::UPDATE_INTERVAL;
 
     // Announce only once every program is attached, so the start line and the
     // update clock describe the same window. A setup failure produces the
@@ -193,6 +209,8 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
         let on_progress: Option<runtime::ProgressCallback<'_>> = progress
             .as_mut()
             .map(|reporter| Box::new(move |elapsed| reporter.update(elapsed)) as _);
+        let collector = std::rc::Rc::clone(&tcp_collector);
+        let clock = std::time::Instant::now();
         runtime::run_multi_collection(
             &mut bpf,
             &mut target_tids,
@@ -227,7 +245,12 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
                     runtime::EventStream::of::<TcpEvent, _>(
                         "NET_EVENTS",
                         PERF_PAGE_COUNT,
-                        &mut net_stats,
+                        network::SharedStats::new(std::rc::Rc::clone(&net_stats)),
+                    ),
+                    runtime::EventStream::of::<ConnEvent, _>(
+                        "CONN_EVENTS",
+                        PERF_PAGE_COUNT,
+                        network::SharedStats::new(std::rc::Rc::clone(&net_stats)),
                     ),
                     runtime::EventStream::of::<OffCpuEvent, _>(
                         "OFFCPU_EVENTS",
@@ -235,7 +258,10 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
                         &mut offcpu_stats,
                     ),
                 ],
-                on_tick: None,
+                on_tick: Some(Box::new(move |_at, _summary| {
+                    collector.borrow_mut().reconcile();
+                    clock.elapsed()
+                })),
                 on_progress,
             },
         )
@@ -262,6 +288,13 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
         }
     };
 
+    tcp_collector.borrow_mut().reconcile();
+    let tcp_counters = tcp_collector.borrow_mut().counters();
+    let mut net_stats = std::mem::take(&mut *net_stats.borrow_mut());
+    let tcp_unverified = {
+        let collector = tcp_collector.borrow();
+        net_stats.retain_verified(&collector)
+    };
     cpu::detach_sampler(&mut bpf, cpu_links);
     // Usage is a difference between two readings, so the end-of-window
     // counters have to be read or every run reports zero.
@@ -301,12 +334,20 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
         offcpu::refine_reasons(&mut offcpu_stats, &stack_maps, &mut symbolizer);
     }
 
+    let collector = tcp_collector.borrow();
+    let tcp_report = network::NetReport::new(
+        &net_stats,
+        &collector,
+        &tcp_counters,
+        tcp_unverified,
+        &summary,
+    );
     let evidence = collect_evidence(
         &summary,
         &sched_stats,
         &cpu_stats,
         &io_stats,
-        &net_stats,
+        &tcp_report,
         &offcpu_stats,
         kernel_memory,
         faults,
@@ -345,7 +386,7 @@ fn collect_evidence(
     sched: &stats::Statistics,
     cpu_stats: &cpu::CpuStats,
     io_stats: &io::IoStats,
-    net: &network::NetStats,
+    net: &network::NetReport<'_>,
     offcpu: &offcpu::OffCpuStats,
     kernel_memory: memory::Totals,
     faults: memory::ProcFaults,
@@ -369,9 +410,21 @@ fn collect_evidence(
         io_unmatched: io_stats.unmatched(),
         io_p99_us: io_stats.summary().map_or(0, |s| s.p99_ns / 1_000),
         io_slow: io_stats.slow_count(),
-        net_samples: net.samples() + net.retrans(),
-        retransmissions: net.retrans(),
-        tcp_available: false,
+        net_samples: net.stats.samples() + net.stats.retrans(),
+        retransmissions: net.stats.retrans(),
+        tcp_available: net.available,
+        tcp_reason: net.reason.clone(),
+        retrans_per_second: net.available.then(|| net.stats.retrans() as f64 / seconds),
+        net_rtt_p95_us: net
+            .stats
+            .slowest_endpoints()
+            .first()
+            .map(|endpoint| endpoint.rtt_percentiles().1 as u64),
+        net_connect_p95_us: net
+            .connect_available
+            .then(|| net.stats.connect_percentiles().1 as u64),
+        net_connects: net.stats.connects(),
+        net_connect_failures: net.stats.connect_failures(),
         retrans_ratio: None,
         offcpu_samples: offcpu.sample_count(),
         offcpu_p95_us: offcpu_p95 / 1_000,
@@ -406,6 +459,31 @@ fn reason_share(offcpu: &offcpu::OffCpuStats, want: offcpu::WaitReason) -> f64 {
     matched as f64 / total as f64
 }
 
+/// Renders the TCP line, keeping "not measured" distinct from a zero.
+fn describe_tcp(evidence: &Evidence) -> String {
+    if !evidence.tcp_available {
+        return format!(
+            "unavailable ({})",
+            evidence
+                .tcp_reason
+                .as_deref()
+                .unwrap_or("socket ownership cannot be established")
+        );
+    }
+    let rtt = evidence.net_rtt_p95_us.map_or_else(
+        || "RTT p95 n/a".to_string(),
+        |value| format!("RTT p95 {value} us"),
+    );
+    let connect = evidence.net_connect_p95_us.map_or_else(
+        || "connect p95 n/a".to_string(),
+        |value| format!("connect p95 {value} us"),
+    );
+    format!(
+        "{} event(s), {} connection(s), {} retransmission(s), {rtt}, {connect}",
+        evidence.net_samples, evidence.net_connects, evidence.retransmissions
+    )
+}
+
 fn print_report(name: &str, pid: u32, summary: &runtime::CollectionSummary, evidence: &Evidence) {
     println!("PID: {name} ({pid})");
     println!("Duration: {}", humantime::format_duration(summary.elapsed));
@@ -430,7 +508,7 @@ fn print_report(name: &str, pid: u32, summary: &runtime::CollectionSummary, evid
         "  block io: {} completions, {} unmatched, p99 {} us, {} over the slow threshold",
         evidence.io_samples, evidence.io_unmatched, evidence.io_p99_us, evidence.io_slow
     );
-    println!("  tcp: unavailable (socket ownership cannot be established)");
+    println!("  tcp: {}", describe_tcp(evidence));
     println!(
         "  off-cpu: {} waits, p95 {} us, {} us total, {:.0}% of it on a futex",
         evidence.offcpu_samples,

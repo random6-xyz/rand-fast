@@ -71,6 +71,15 @@ Rollback is the same procedure with the previous baseline file. A baseline is
 never edited in place to make a failing candidate pass; a real change in
 overhead needs a reviewed baseline refresh.
 
+Adding the TCP collector changes what the `net` mode measures: the ownership
+program runs once per TCP state change in the target's namespace, and the
+measurement programs run per event. The committed baseline predates that
+collector, so the first release carrying it needs a refresh from a green run of
+the benchmark job on that commit. Until the refresh lands, `bench-check.sh`
+compares a candidate that now includes TCP work against a baseline that does
+not, which is why the refresh belongs in the same change rather than in a later
+one.
+
 ## CI wiring
 
 The `Overhead regression gate` job runs when a PR carries the

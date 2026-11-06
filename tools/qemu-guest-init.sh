@@ -85,11 +85,14 @@ for event in sched_wakeup sched_switch sched_process_exit; do
     fi
 done
 
-# Record TCP layouts for investigation; TCP programs are not attached.
-for event in tcp_probe tcp_retransmit_skb; do
-    if [ -e /sys/kernel/tracing/events/tcp/$event/format ]; then
+# Record the TCP measurement and ownership layouts, which the collector
+# validates before attaching.
+for spec in tcp/tcp_probe tcp/tcp_retransmit_skb sock/inet_sock_set_state; do
+    event=$(basename "$spec")
+    category=$(dirname "$spec")
+    if [ -e "/sys/kernel/tracing/events/$category/$event/format" ]; then
         echo "=== $event format ==="
-        cat /sys/kernel/tracing/events/tcp/$event/format
+        cat "/sys/kernel/tracing/events/$category/$event/format"
     else
         echo "=== $event format MISSING ==="
     fi
@@ -142,7 +145,7 @@ if [ -r /proc/cmdline ]; then
     for arg in $(cat /proc/cmdline); do
         case "$arg" in
         fast.duration=*) DURATION=${arg#fast.duration=} ;;
-        fast.smoke_case=tcp-unavailable) export QEMU_SMOKE_TEST_CASE=tcp-unavailable ;;
+        fast.smoke_case=tcp-ownership) export QEMU_SMOKE_TEST_CASE=tcp-ownership ;;
         fast.smoke_case=bench) export QEMU_SMOKE_TEST_CASE=bench ;;
         fast.accel=*) export FAST_ACCEL=${arg#fast.accel=} ;;
         fast.rank_eval=*) export RANK_EVAL=${arg#fast.rank_eval=} ;;
@@ -181,7 +184,7 @@ for f in "$OUT_DIR"/*-fixture.log; do
     cat "$f"
 done
 echo "=== reports ==="
-for f in "$OUT_DIR"/*.txt; do
+for f in "$OUT_DIR"/*.txt "$OUT_DIR"/*/*.txt; do
     [ -f "$f" ] || continue
     echo "----- $f -----"
     cat "$f"

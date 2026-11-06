@@ -191,8 +191,9 @@ pub struct Interval {
     pub io_p99_us: u64,
     /// Block I/O completions over the interval.
     pub io_samples: u64,
-    /// Retransmissions during the interval.
-    pub retrans: u64,
+    /// Retransmissions attributed during the interval, or `None` when no
+    /// verified socket owner existed, which is not the same as zero.
+    pub retrans: Option<u64>,
     /// Memory "some" pressure, absent when the kernel reports none.
     pub psi_some_pct: Option<f64>,
     /// Memory "full" pressure, absent when the kernel reports none.
@@ -212,9 +213,10 @@ impl Interval {
         match signal {
             Signal::SchedulerP95 => (self.sched_samples > 0).then_some(self.sched_p95_us as f64),
             Signal::IoP99 => (self.io_samples > 0).then_some(self.io_p99_us as f64),
-            // A retransmission count is a count, so zero is a real reading: a
-            // count of nothing in this interval is an answer, not a silence.
-            Signal::Retransmissions => Some(self.retrans as f64),
+            // A retransmission count is a count, so zero is a real reading
+            // when attribution is available. Without a verified owner the
+            // number is unknown, not zero, and must never fire a trigger.
+            Signal::Retransmissions => self.retrans.map(|value| value as f64),
             Signal::PsiSome => self.psi_some_pct,
             Signal::PsiFull => self.psi_full_pct,
             Signal::CpuUsage => self.cpu_percent,
@@ -244,7 +246,7 @@ mod tests {
             sched_samples: 900,
             io_p99_us: 100,
             io_samples: 40,
-            retrans: 0,
+            retrans: Some(0),
             psi_some_pct: Some(0.0),
             psi_full_pct: Some(0.0),
             cpu_percent: Some(3.0),
@@ -279,7 +281,7 @@ mod tests {
             (
                 Signal::Retransmissions,
                 Interval {
-                    retrans: 40,
+                    retrans: Some(40),
                     ..quiet_io()
                 },
                 Signal::Retransmissions,
@@ -326,7 +328,7 @@ mod tests {
             sched_samples: 900,
             io_p99_us: 100,
             io_samples: 40,
-            retrans: 0,
+            retrans: Some(0),
             psi_some_pct: Some(0.0),
             psi_full_pct: Some(0.0),
             cpu_percent: Some(3.0),
@@ -342,7 +344,7 @@ mod tests {
             sched_p95_us: 90_000,
             sched_samples: 900,
             psi_some_pct: Some(14.0),
-            retrans: 40,
+            retrans: Some(40),
             ..quiet_io()
         };
         // How far past each threshold: 90000/10000 = 9x, 40/8 = 5x, 14/10 = 1.4x.
@@ -379,6 +381,25 @@ mod tests {
     }
 
     #[test]
+    fn an_unavailable_retransmission_count_never_fires() {
+        // Without a verified socket owner the count is unknown, not zero, so
+        // a configured trigger must stay silent instead of firing on a guess.
+        let entry = Interval {
+            retrans: None,
+            ..quiet_io()
+        };
+        assert_eq!(all_on().evaluate(&entry), Vec::new());
+        assert_eq!(
+            Interval {
+                retrans: None,
+                ..entry
+            }
+            .read(Signal::Retransmissions),
+            None
+        );
+    }
+
+    #[test]
     fn a_disabled_trigger_never_fires() {
         // A zero threshold is not "off", it is "fire on every interval", which
         // is how a threshold of zero would be misread. Every trigger is
@@ -386,7 +407,7 @@ mod tests {
         let mut triggers = all_on();
         triggers.retrans = None;
         let busy = Interval {
-            retrans: 1_000_000,
+            retrans: Some(1_000_000),
             ..quiet_io()
         };
         assert_eq!(triggers.evaluate(&busy), Vec::new());

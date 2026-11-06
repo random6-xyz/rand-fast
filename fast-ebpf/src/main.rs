@@ -12,15 +12,23 @@ use aya_ebpf::{
         bpf_probe_read_kernel,
     },
     macros::{map, perf_event, raw_tracepoint, tracepoint},
-    maps::{HashMap, LruHashMap, PerfEventArray, StackTrace},
+    maps::{Array, HashMap, LruHashMap, PerCpuArray, PerfEventArray, StackTrace},
     programs::{PerfEventContext, RawTracePointContext, TracePointContext},
 };
 use fast_common::{
-    COLLECT_CPU_SAMPLE, COLLECT_MEMORY, COLLECT_OFFCPU, COLLECT_SCHEDULER_LATENCY, CpuSampleEvent,
-    IO_OP_UNMATCHED, IoEvent, IoRequestId, IoRequestLayout, MAX_MEMORY_THREADS, MAX_PENDING_IO,
-    MAX_STACKS, MAX_TARGET_TIDS, MemoryCounters, OFFCPU_REASON_IO, OFFCPU_REASON_UNKNOWN,
-    OFFCPU_REASON_WAIT, OffCpuEvent, OffCpuPending, PendingIo, PendingWakeup,
-    SchedulerLatencyEvent, TcpEvent, io_op_from_request_flags, scheduler_state_is_exiting,
+    AF_INET, AF_INET6, COLLECT_CPU_SAMPLE, COLLECT_MEMORY, COLLECT_NET, COLLECT_OFFCPU,
+    COLLECT_SCHEDULER_LATENCY, ConnEvent, CpuSampleEvent, IO_OP_UNMATCHED, IoEvent, IoRequestId,
+    IoRequestLayout, ListenKey, ListenOwner, MAX_MEMORY_THREADS, MAX_PENDING_IO, MAX_STACKS,
+    MAX_TARGET_TIDS, MAX_TCP_LISTENERS, MAX_TCP_OWNERS, MAX_TCP_PENDING_CONNECTS, MemoryCounters,
+    OFFCPU_REASON_IO, OFFCPU_REASON_UNKNOWN, OFFCPU_REASON_WAIT, OffCpuEvent, OffCpuPending,
+    PendingIo, PendingWakeup, SchedulerLatencyEvent, TCP_AWAITING_CONNECT, TCP_CONNECT_ESTABLISHED,
+    TCP_CONNECT_FAILED, TCP_LISTENER_AMBIGUOUS, TCP_ORIGIN_CREATED, TCP_ORIGIN_SEEDED,
+    TCP_ROLE_CLIENT, TCP_ROLE_SERVER, TCP_RTT_SAMPLE_INTERVAL_NS, TCP_STAT_AMBIGUOUS_LISTENER,
+    TCP_STAT_COUNT, TCP_STAT_MATCHED_RETRANS, TCP_STAT_MATCHED_RTT, TCP_STAT_OWNER_DROPS,
+    TCP_STAT_OWNER_INSERTED, TCP_STAT_OWNER_REMOVED, TCP_STAT_PENDING_ESTABLISHED,
+    TCP_STAT_PENDING_FAILED, TCP_STAT_PENDING_INSERTED, TCP_STAT_RATE_LIMITED,
+    TCP_STAT_UNMATCHED_RETRANS, TCP_STAT_UNMATCHED_RTT, TcpEvent, TcpKey, TcpOwner,
+    TcpPendingConnect, io_op_from_request_flags, scheduler_state_is_exiting,
 };
 
 // Payload offsets for the supported scheduler tracepoint layouts. The user-space
@@ -84,6 +92,46 @@ static PENDING_IO: HashMap<IoRequestId, PendingIo> = HashMap::with_max_entries(M
 
 #[map]
 static NET_EVENTS: PerfEventArray<TcpEvent> = PerfEventArray::new(0);
+
+/// Connection-establishment latency events, one per client handshake the
+/// target started. Kept in its own perf array so the RTT stream keeps its
+/// fixed event size and the per-connection rate limit applies only to RTT.
+#[map]
+static CONN_EVENTS: PerfEventArray<ConnEvent> = PerfEventArray::new(0);
+
+/// Thread group observed by the current run. TCP ownership is recorded only
+/// when the current thread group matches, so a socket created by another
+/// process is never written into the ownership map.
+#[map]
+static TARGET_TGID: Array<u32> = Array::with_max_entries(1, 0);
+
+/// Verified socket owners, keyed by connection 5-tuple.
+///
+/// The key is never a kernel pointer: pointers are reused across socket
+/// lifetimes, and a remembered pointer is not evidence of ownership. A tuple
+/// identifies one live connection and is invalidated when the socket closes.
+#[map]
+static TCP_OWNERS: HashMap<TcpKey, TcpOwner> = HashMap::with_max_entries(MAX_TCP_OWNERS, 0);
+
+/// Listening sockets the target owns, keyed by the address they listen on.
+#[map]
+static TCP_LISTENERS: HashMap<ListenKey, ListenOwner> =
+    HashMap::with_max_entries(MAX_TCP_LISTENERS, 0);
+
+/// Client handshakes in flight, keyed by socket address.
+///
+/// The entry pairs the target's `TCP_SYN_SENT` with the same socket's
+/// `TCP_ESTABLISHED` so the handshake duration can be measured; it is bound to
+/// the socket lifetime by the `TCP_CLOSE` removal and bounded by LRU.
+#[map]
+static TCP_PENDING_CONNECTS: LruHashMap<u64, TcpPendingConnect> =
+    LruHashMap::with_max_entries(MAX_TCP_PENDING_CONNECTS, 0);
+
+/// Per-CPU counters describing how attribution went. Userspace sums them, so
+/// a run reports unattributed events and dropped records instead of silently
+/// showing fewer measurements.
+#[map]
+static TCP_OWNER_STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(TCP_STAT_COUNT, 0);
 
 #[map]
 static OFFCPU_EVENTS: PerfEventArray<OffCpuEvent> = PerfEventArray::new(0);
@@ -502,17 +550,501 @@ fn emit_unmatched(ctx: &impl EbpfContext, tid: u32, dev: u32) {
     );
 }
 
-// These tracepoints cannot establish socket ownership. In particular, receive
-// processing can run in softirq context and a raw socket address can be reused.
-// Never emit an attributed event until a verified ownership path exists.
+// --- Network: socket ownership, TCP RTT and retransmissions ---
+//
+// Attribution rules, in one place:
+//
+//   * A connection belongs to the target when the target's own thread group
+//     created it (TCP_SYN_SENT for a client, or a listener the target owns for
+//     an accepted socket) or when the target holds its descriptor
+//     (`/proc/<pid>/fd`, filled in by userspace).
+//   * The ownership key is the connection 5-tuple, never a kernel pointer.
+//     Two live sockets cannot share a tuple, and `TCP_CLOSE` invalidates the
+//     record, so a reused address cannot inherit an old owner.
+//   * Tracepoint payloads already carry the tuple, so no `struct sock` field
+//     is read and no BTF offset is guessed.
+//
+// Payload offsets of `sock:inet_sock_set_state`, verified against the format
+// files captured from the pinned kernels:
+//   skaddr=8 oldstate=16 newstate=20 sport=24 dport=26 family=28 protocol=30
+//   saddr=32(4) daddr=36(4) saddr_v6=40(16) daddr_v6=56(16)
+const STATE_SKADDR_OFFSET: usize = 8;
+const STATE_OLD_OFFSET: usize = 16;
+const STATE_NEW_OFFSET: usize = 20;
+const STATE_SPORT_OFFSET: usize = 24;
+const STATE_DPORT_OFFSET: usize = 26;
+const STATE_FAMILY_OFFSET: usize = 28;
+const STATE_SADDR_OFFSET: usize = 32;
+const STATE_DADDR_OFFSET: usize = 36;
+const STATE_SADDR_V6_OFFSET: usize = 40;
+const STATE_DADDR_V6_OFFSET: usize = 56;
+
+/// `include/net/tcp_states.h` values, which the kernel freezes in the
+/// tracepoint ABI (`BPF_TCP_*`).
+const TCP_STATE_ESTABLISHED: i32 = 1;
+const TCP_STATE_SYN_SENT: i32 = 2;
+const TCP_STATE_CLOSE: i32 = 7;
+const TCP_STATE_LISTEN: i32 = 10;
+
+// Payload offsets of the TCP measurement tracepoints.
+//   tcp_probe:          saddr=8(28) daddr=36(28) sport=64 dport=66 family=68
+//                       snd_cwnd=88 srtt=100 rcv_wnd=104 skaddr=128
+//   tcp_retransmit_skb: skbaddr=8 skaddr=16 state=24 sport=28 dport=30
+//                       family=32 saddr=34(4) daddr=38(4) saddr_v6=42(16)
+//                       daddr_v6=58(16)
+const PROBE_SADDR_OFFSET: usize = 8;
+const PROBE_DADDR_OFFSET: usize = 36;
+const PROBE_SPORT_OFFSET: usize = 64;
+const PROBE_DPORT_OFFSET: usize = 66;
+const PROBE_FAMILY_OFFSET: usize = 68;
+const PROBE_SND_CWND_OFFSET: usize = 88;
+const PROBE_SRTT_OFFSET: usize = 100;
+const PROBE_RCV_WND_OFFSET: usize = 104;
+
+const RETRANS_SPORT_OFFSET: usize = 28;
+const RETRANS_DPORT_OFFSET: usize = 30;
+const RETRANS_FAMILY_OFFSET: usize = 32;
+const RETRANS_SADDR_OFFSET: usize = 34;
+const RETRANS_DADDR_OFFSET: usize = 38;
+const RETRANS_SADDR_V6_OFFSET: usize = 42;
+const RETRANS_DADDR_V6_OFFSET: usize = 58;
+
+fn net_collection_enabled() -> bool {
+    unsafe { MODE.get(0) }.copied().unwrap_or(0) & COLLECT_NET != 0
+}
+
+fn target_tgid() -> u32 {
+    TARGET_TGID.get(0).copied().unwrap_or(0)
+}
+
+fn current_tgid() -> u32 {
+    (bpf_get_current_pid_tgid() >> 32) as u32
+}
+
+fn bump_stat(index: u32) {
+    if let Some(counter) = TCP_OWNER_STATS.get_ptr_mut(index) {
+        // Each CPU owns its slot, so no atomic is needed.
+        unsafe { *counter += 1 };
+    }
+}
+
+/// Reads an IPv4 or IPv6 address pair from a payload that carries both.
+fn read_address_pair(
+    ctx: &TracePointContext,
+    family: u16,
+    saddr4: usize,
+    daddr4: usize,
+    saddr6: usize,
+    daddr6: usize,
+) -> Option<([u8; 16], [u8; 16])> {
+    if family == AF_INET6 {
+        let s: [u8; 16] = unsafe { ctx.read_at(saddr6) }.ok()?;
+        let d: [u8; 16] = unsafe { ctx.read_at(daddr6) }.ok()?;
+        return Some((s, d));
+    }
+    if family != AF_INET {
+        return None;
+    }
+    let s: [u8; 4] = unsafe { ctx.read_at(saddr4) }.ok()?;
+    let d: [u8; 4] = unsafe { ctx.read_at(daddr4) }.ok()?;
+    let mut wide_s = [0u8; 16];
+    let mut wide_d = [0u8; 16];
+    wide_s[..4].copy_from_slice(&s);
+    wide_d[..4].copy_from_slice(&d);
+    Some((wide_s, wide_d))
+}
+
+/// Parses the source address blob `tcp_probe` stores.
+///
+/// The kernel writes a `struct sockaddr` family and port ahead of the address
+/// through `TP_STORE_ADDR_PORTS`; the separate `sport`/`dport` fields are the
+/// same ports in host byte order and are preferred, so only the address and
+/// the family are taken from here.
+fn read_probe_address(ctx: &TracePointContext, offset: usize) -> Option<(u16, [u8; 16])> {
+    let raw: [u8; 28] = unsafe { ctx.read_at(offset) }.ok()?;
+    let family = u16::from_ne_bytes([raw[0], raw[1]]);
+    let mut address = [0u8; 16];
+    if family == AF_INET {
+        address[..4].copy_from_slice(&raw[4..8]);
+    } else if family == AF_INET6 {
+        address.copy_from_slice(&raw[8..24]);
+    } else {
+        return None;
+    }
+    Some((family, address))
+}
+
+fn insert_owner(key: &TcpKey, owner: &TcpOwner) {
+    match TCP_OWNERS.insert(key, owner, BPF_ANY as u64) {
+        Ok(()) => bump_stat(TCP_STAT_OWNER_INSERTED),
+        // A full map drops the new record rather than evicting a verified
+        // owner: an unattributed connection is honest, a stolen one is not.
+        Err(_) => bump_stat(TCP_STAT_OWNER_DROPS),
+    }
+}
+
+fn emit_conn(ctx: &TracePointContext, key: &TcpKey, start_ns: u64, now_ns: u64, result: u8) {
+    let elapsed = now_ns.saturating_sub(start_ns);
+    let latency_us = (elapsed / 1_000) as u32;
+    let event = ConnEvent {
+        family: key.family,
+        sport: key.sport,
+        dport: key.dport,
+        result,
+        _pad: 0,
+        latency_us,
+        saddr: key.saddr,
+        daddr: key.daddr,
+    };
+    CONN_EVENTS.output(ctx, event, BPF_ANY);
+}
+
+/// Finds the owner of an accepted connection by the listener it arrived on.
+fn listener_owner(key: &TcpKey) -> Option<TcpOwner> {
+    let exact = ListenKey {
+        family: key.family,
+        port: key.dport,
+        addr: key.saddr,
+    };
+    let wildcard = ListenKey {
+        family: key.family,
+        port: key.dport,
+        addr: [0u8; 16],
+    };
+    for candidate in [&exact, &wildcard] {
+        if let Some(listener) = unsafe { TCP_LISTENERS.get(candidate) }.copied() {
+            if listener.ambiguous != 0 || listener.tgid == 0 {
+                return None;
+            }
+            return Some(TcpOwner {
+                tgid: listener.tgid,
+                role: TCP_ROLE_SERVER,
+                origin: TCP_ORIGIN_CREATED,
+                awaiting: 0,
+                _pad: 0,
+                // An accepted socket has no observable handshake start: the
+                // kernel sets a child's initial TCP_SYN_RECV state directly.
+                start_ns: 0,
+                last_sample_ns: 0,
+                listener_port: key.dport,
+                _pad2: [0u8; 6],
+            });
+        }
+    }
+    None
+}
+
+#[tracepoint(name = "inet_sock_set_state", category = "sock")]
+pub fn inet_sock_set_state(ctx: TracePointContext) -> u32 {
+    match try_inet_sock_set_state(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_inet_sock_set_state(ctx: TracePointContext) -> Result<u32, u32> {
+    if !net_collection_enabled() {
+        return Ok(0);
+    }
+    let target = target_tgid();
+    if target == 0 {
+        return Ok(0);
+    }
+
+    let old_state = unsafe { ctx.read_at::<i32>(STATE_OLD_OFFSET) }.map_err(|_| 1u32)?;
+    let new_state = unsafe { ctx.read_at::<i32>(STATE_NEW_OFFSET) }.map_err(|_| 1u32)?;
+    let family = unsafe { ctx.read_at::<u16>(STATE_FAMILY_OFFSET) }.map_err(|_| 1u32)?;
+    let sport = unsafe { ctx.read_at::<u16>(STATE_SPORT_OFFSET) }.unwrap_or(0);
+    let dport = unsafe { ctx.read_at::<u16>(STATE_DPORT_OFFSET) }.unwrap_or(0);
+    let (saddr, daddr) = match read_address_pair(
+        &ctx,
+        family,
+        STATE_SADDR_OFFSET,
+        STATE_DADDR_OFFSET,
+        STATE_SADDR_V6_OFFSET,
+        STATE_DADDR_V6_OFFSET,
+    ) {
+        Some(value) => value,
+        None => return Ok(0),
+    };
+    let key = TcpKey::new(family, saddr, sport, daddr, dport);
+    let skaddr = unsafe { ctx.read_at::<u64>(STATE_SKADDR_OFFSET) }.unwrap_or(0);
+    let now = unsafe { bpf_ktime_get_ns() };
+
+    match new_state {
+        TCP_STATE_CLOSE => {
+            if let Some(owner) = unsafe { TCP_OWNERS.get(key) }.copied() {
+                if owner.awaiting == TCP_AWAITING_CONNECT {
+                    emit_conn(&ctx, &key, owner.start_ns, now, TCP_CONNECT_FAILED);
+                }
+                let _ = TCP_OWNERS.remove(key);
+                bump_stat(TCP_STAT_OWNER_REMOVED);
+            }
+            if skaddr != 0 {
+                // A connect that never established has no owner record; its
+                // pending handshake is the only evidence, and closing before
+                // `TCP_ESTABLISHED` is what a refused or timed-out connect
+                // looks like. The result is reported, not guessed at.
+                if let Some(started) = unsafe { TCP_PENDING_CONNECTS.get(skaddr) }.copied()
+                    && started.matches(&key)
+                {
+                    bump_stat(TCP_STAT_PENDING_FAILED);
+                    emit_conn(&ctx, &key, started.start_ns, now, TCP_CONNECT_FAILED);
+                }
+                let _ = TCP_PENDING_CONNECTS.remove(skaddr);
+            }
+            if old_state == TCP_STATE_LISTEN {
+                let listener = ListenKey {
+                    family,
+                    port: sport,
+                    addr: saddr,
+                };
+                let _ = TCP_LISTENERS.remove(listener);
+            }
+        }
+        TCP_STATE_ESTABLISHED => {
+            let pending = if skaddr == 0 {
+                None
+            } else {
+                unsafe { TCP_PENDING_CONNECTS.get(skaddr) }.copied()
+            };
+            match unsafe { TCP_OWNERS.get(key) }.copied() {
+                Some(owner) => {
+                    // A record seeded from `/proc` while the handshake was in
+                    // flight carries no creation evidence; promote it when the
+                    // matching handshake completes so the latency is measured
+                    // instead of lost.
+                    if owner.origin == TCP_ORIGIN_SEEDED {
+                        if let Some(started) = pending.filter(|entry| entry.matches(&key)) {
+                            let promoted = TcpOwner {
+                                tgid: target,
+                                role: TCP_ROLE_CLIENT,
+                                origin: TCP_ORIGIN_CREATED,
+                                awaiting: 0,
+                                _pad: 0,
+                                start_ns: started.start_ns,
+                                last_sample_ns: owner.last_sample_ns,
+                                listener_port: 0,
+                                _pad2: [0u8; 6],
+                            };
+                            insert_owner(&key, &promoted);
+                            let _ = TCP_PENDING_CONNECTS.remove(skaddr);
+                            bump_stat(TCP_STAT_PENDING_ESTABLISHED);
+                            emit_conn(&ctx, &key, started.start_ns, now, TCP_CONNECT_ESTABLISHED);
+                        }
+                    } else if owner.awaiting == TCP_AWAITING_CONNECT {
+                        let mut settled = owner;
+                        settled.awaiting = 0;
+                        insert_owner(&key, &settled);
+                        if skaddr != 0 {
+                            let _ = TCP_PENDING_CONNECTS.remove(skaddr);
+                        }
+                        emit_conn(&ctx, &key, owner.start_ns, now, TCP_CONNECT_ESTABLISHED);
+                    }
+                }
+                None => {
+                    if let Some(started) = pending.filter(|entry| entry.matches(&key)) {
+                        let owner = TcpOwner {
+                            tgid: target,
+                            role: TCP_ROLE_CLIENT,
+                            origin: TCP_ORIGIN_CREATED,
+                            awaiting: 0,
+                            _pad: 0,
+                            start_ns: started.start_ns,
+                            last_sample_ns: 0,
+                            listener_port: 0,
+                            _pad2: [0u8; 6],
+                        };
+                        insert_owner(&key, &owner);
+                        let _ = TCP_PENDING_CONNECTS.remove(skaddr);
+                        bump_stat(TCP_STAT_PENDING_ESTABLISHED);
+                        emit_conn(&ctx, &key, started.start_ns, now, TCP_CONNECT_ESTABLISHED);
+                    } else if let Some(owner) = listener_owner(&key) {
+                        insert_owner(&key, &owner);
+                    }
+                }
+            }
+        }
+        TCP_STATE_SYN_SENT => {
+            // The local port is assigned after this state is set, so the
+            // pending entry records the remote endpoint and pairs the two
+            // events by socket address. Ownership is the current thread
+            // group, which is the target's only when the target called
+            // connect.
+            if skaddr != 0 && current_tgid() == target {
+                let pending = TcpPendingConnect {
+                    start_ns: now,
+                    family,
+                    sport,
+                    dport,
+                    _pad: 0,
+                    daddr,
+                };
+                let _ = TCP_PENDING_CONNECTS.insert(skaddr, pending, BPF_ANY as u64);
+                bump_stat(TCP_STAT_PENDING_INSERTED);
+            }
+        }
+        TCP_STATE_LISTEN => {
+            let listener = ListenKey {
+                family,
+                port: sport,
+                addr: saddr,
+            };
+            if current_tgid() == target {
+                match unsafe { TCP_LISTENERS.get(listener) }.copied() {
+                    Some(existing) if existing.tgid != target || existing.ambiguous != 0 => {
+                        let ambiguous = ListenOwner {
+                            tgid: 0,
+                            ambiguous: TCP_LISTENER_AMBIGUOUS,
+                            _pad: [0u8; 3],
+                        };
+                        let _ = TCP_LISTENERS.insert(listener, ambiguous, 0);
+                        bump_stat(TCP_STAT_AMBIGUOUS_LISTENER);
+                    }
+                    _ => {
+                        let owned = ListenOwner {
+                            tgid: target,
+                            ambiguous: 0,
+                            _pad: [0u8; 3],
+                        };
+                        let _ = TCP_LISTENERS.insert(listener, owned, 0);
+                    }
+                }
+            } else if let Some(existing) = unsafe { TCP_LISTENERS.get(listener) }.copied() {
+                // Two processes listening on one address make every accepted
+                // connection on it unattributable, so the key is poisoned
+                // instead of keeping whichever owner was seen first.
+                if existing.tgid == target {
+                    let ambiguous = ListenOwner {
+                        tgid: 0,
+                        ambiguous: TCP_LISTENER_AMBIGUOUS,
+                        _pad: [0u8; 3],
+                    };
+                    let _ = TCP_LISTENERS.insert(listener, ambiguous, 0);
+                    bump_stat(TCP_STAT_AMBIGUOUS_LISTENER);
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(0)
+}
+
 #[tracepoint(name = "tcp_probe", category = "tcp")]
-pub fn tcp_probe(_ctx: TracePointContext) -> u32 {
-    0
+pub fn tcp_probe(ctx: TracePointContext) -> u32 {
+    match try_tcp_probe(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_tcp_probe(ctx: TracePointContext) -> Result<u32, u32> {
+    if !net_collection_enabled() {
+        return Ok(0);
+    }
+
+    let sfamily = unsafe { ctx.read_at::<u16>(PROBE_FAMILY_OFFSET) }.map_err(|_| 1u32)?;
+    let (sockaddr_family, saddr) = read_probe_address(&ctx, PROBE_SADDR_OFFSET).ok_or(1u32)?;
+    let (dsockaddr_family, daddr) = read_probe_address(&ctx, PROBE_DADDR_OFFSET).ok_or(1u32)?;
+    // The dedicated family field and the family embedded in each sockaddr are
+    // written from the same socket; disagreement means the assumed layout is
+    // wrong for this kernel, so the sample is dropped rather than misfiled.
+    if sockaddr_family != sfamily || dsockaddr_family != sfamily {
+        return Ok(0);
+    }
+    let sport = unsafe { ctx.read_at::<u16>(PROBE_SPORT_OFFSET) }.unwrap_or(0);
+    let dport = unsafe { ctx.read_at::<u16>(PROBE_DPORT_OFFSET) }.unwrap_or(0);
+    let key = TcpKey::new(sfamily, saddr, sport, daddr, dport);
+
+    let now = unsafe { bpf_ktime_get_ns() };
+    match TCP_OWNERS.get_ptr_mut(key) {
+        Some(ptr) => {
+            let owner = unsafe { &mut *ptr };
+            // One sample per connection per interval keeps a busy socket from
+            // flooding the perf buffer; the RTT distribution over a run is
+            // still described by the samples that remain.
+            if now.saturating_sub(owner.last_sample_ns) < TCP_RTT_SAMPLE_INTERVAL_NS {
+                bump_stat(TCP_STAT_RATE_LIMITED);
+                return Ok(0);
+            }
+            owner.last_sample_ns = now;
+            bump_stat(TCP_STAT_MATCHED_RTT);
+            let srtt = unsafe { ctx.read_at::<u32>(PROBE_SRTT_OFFSET) }.unwrap_or(0);
+            let event = TcpEvent {
+                // TCP events are attributed to a connection, not a thread.
+                tid: 0,
+                family: sfamily,
+                retrans: 0,
+                _pad: 0,
+                sport,
+                dport,
+                rtt_us: srtt,
+                snd_cwnd: unsafe { ctx.read_at::<u32>(PROBE_SND_CWND_OFFSET) }.unwrap_or(0),
+                rcv_wnd: unsafe { ctx.read_at::<u32>(PROBE_RCV_WND_OFFSET) }.unwrap_or(0),
+                saddr,
+                daddr,
+            };
+            NET_EVENTS.output(&ctx, event, BPF_ANY);
+            Ok(0)
+        }
+        None => {
+            bump_stat(TCP_STAT_UNMATCHED_RTT);
+            Ok(0)
+        }
+    }
 }
 
 #[tracepoint(name = "tcp_retransmit_skb", category = "tcp")]
-pub fn tcp_retransmit_skb(_ctx: TracePointContext) -> u32 {
-    0
+pub fn tcp_retransmit_skb(ctx: TracePointContext) -> u32 {
+    match try_tcp_retransmit_skb(ctx) {
+        Ok(ret) => ret,
+        Err(ret) => ret,
+    }
+}
+
+fn try_tcp_retransmit_skb(ctx: TracePointContext) -> Result<u32, u32> {
+    if !net_collection_enabled() {
+        return Ok(0);
+    }
+
+    let family = unsafe { ctx.read_at::<u16>(RETRANS_FAMILY_OFFSET) }.map_err(|_| 1u32)?;
+    let (saddr, daddr) = match read_address_pair(
+        &ctx,
+        family,
+        RETRANS_SADDR_OFFSET,
+        RETRANS_DADDR_OFFSET,
+        RETRANS_SADDR_V6_OFFSET,
+        RETRANS_DADDR_V6_OFFSET,
+    ) {
+        Some(value) => value,
+        None => return Ok(0),
+    };
+    let sport = unsafe { ctx.read_at::<u16>(RETRANS_SPORT_OFFSET) }.unwrap_or(0);
+    let dport = unsafe { ctx.read_at::<u16>(RETRANS_DPORT_OFFSET) }.unwrap_or(0);
+    let key = TcpKey::new(family, saddr, sport, daddr, dport);
+
+    // Retransmissions are raised from softirq context, so the current task is
+    // never the owner; only the tuple lookup can attribute them.
+    if unsafe { TCP_OWNERS.get(key) }.is_none() {
+        bump_stat(TCP_STAT_UNMATCHED_RETRANS);
+        return Ok(0);
+    }
+    bump_stat(TCP_STAT_MATCHED_RETRANS);
+    let event = TcpEvent {
+        tid: 0,
+        family,
+        retrans: 1,
+        _pad: 0,
+        sport,
+        dport,
+        rtt_us: 0,
+        snd_cwnd: 0,
+        rcv_wnd: 0,
+        saddr,
+        daddr,
+    };
+    NET_EVENTS.output(&ctx, event, BPF_ANY);
+    Ok(0)
 }
 
 // --- Memory: page faults and direct reclaim, counted rather than streamed ---

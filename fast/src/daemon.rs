@@ -24,7 +24,8 @@ mod storage;
 use anyhow::{Context, Result};
 use aya::{Ebpf, include_bytes_aligned};
 use fast_common::{
-    COLLECT_NET, COLLECT_SCHEDULER_LATENCY, IoEvent, SchedulerLatencyEvent, TcpEvent,
+    COLLECT_NET, COLLECT_SCHEDULER_LATENCY, ConnEvent, IoEvent, SchedulerLatencyEvent,
+    TCP_CONNECT_ESTABLISHED, TcpEvent,
 };
 use serde_json::Value;
 
@@ -117,8 +118,23 @@ pub struct RingEntry {
     pub io_samples: u64,
     /// Target requests that could not be tracked over the interval.
     pub io_unmatched: u64,
-    /// Retransmissions over the interval.
+    /// Retransmissions over the interval, attributed to a verified socket
+    /// owner. Always zero when `tcp_available` is false.
     pub retrans: u64,
+    /// Whether TCP ownership was established for this interval, which decides
+    /// whether `retrans` is published as a measurement or as null.
+    pub tcp_available: bool,
+    /// Why TCP attribution was unavailable, when it was.
+    pub tcp_reason: Option<String>,
+    /// p95 RTT over the interval, in microseconds, when a connection was
+    /// measured.
+    pub net_rtt_p95_us: Option<u64>,
+    /// p95 client handshake over the interval, in microseconds.
+    pub net_connect_p95_us: Option<u64>,
+    /// Client handshakes measured over the interval.
+    pub net_connects: u64,
+    /// Client handshakes that failed over the interval.
+    pub net_connect_failures: u64,
     /// Memory PSI some at the end of the interval, in percent. Absent when the
     /// kernel has no PSI, which is not the same as zero.
     pub psi_some_pct: Option<f32>,
@@ -150,8 +166,13 @@ impl RingEntry {
             "io_p99_us": self.io_p99_us,
             "io_samples": self.io_samples,
             "io_unmatched": self.io_unmatched,
-            "retrans": null,
-            "tcp_available": false,
+            "retrans": self.tcp_available.then_some(self.retrans),
+            "tcp_available": self.tcp_available,
+            "tcp_reason": self.tcp_reason,
+            "net_rtt_p95_us": self.net_rtt_p95_us,
+            "net_connect_p95_us": self.net_connect_p95_us,
+            "net_connects": self.net_connects,
+            "net_connect_failures": self.net_connect_failures,
             // Absent rather than zero, so a kernel without PSI is not read as
             // a machine with no memory pressure.
             "psi_some_pct": self.psi_some_pct,
@@ -217,7 +238,7 @@ fn write_incident(
                 "signal": signal.name(),
                 "unit": signal.unit(),
                 "at_or_above": signal.threshold(triggers),
-                "available": *signal != Signal::Retransmissions,
+                "available": *signal != Signal::Retransmissions || entry.tcp_available,
             }))
             .collect::<Vec<_>>(),
         // Stated in the bundle, because a reader who assumed it holds the whole
@@ -234,8 +255,13 @@ fn write_incident(
             "io_p99_us": entry.io_p99_us,
             "io_samples": entry.io_samples,
             "io_unmatched": entry.io_unmatched,
-            "retrans": null,
-            "tcp_available": false,
+            "retrans": entry.tcp_available.then_some(entry.retrans),
+            "tcp_available": entry.tcp_available,
+            "tcp_reason": entry.tcp_reason,
+            "net_rtt_p95_us": entry.net_rtt_p95_us,
+            "net_connect_p95_us": entry.net_connect_p95_us,
+            "net_connects": entry.net_connects,
+            "net_connect_failures": entry.net_connect_failures,
             "psi_some_pct": entry.psi_some_pct,
             "psi_full_pct": entry.psi_full_pct,
             "lost_events": entry.lost,
@@ -424,6 +450,21 @@ fn ring_entry_from_json(value: &Value) -> Option<RingEntry> {
         io_samples: number("io_samples").unwrap_or(0),
         io_unmatched: number("io_unmatched").unwrap_or(0),
         retrans: number("retrans").unwrap_or(0),
+        // A restored interval keeps its recorded availability: a v1/v2
+        // interval without attribution must never be re-emitted as a fresh
+        // retransmission measurement.
+        tcp_available: value
+            .get("tcp_available")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        tcp_reason: value
+            .get("tcp_reason")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        net_rtt_p95_us: number("net_rtt_p95_us"),
+        net_connect_p95_us: number("net_connect_p95_us"),
+        net_connects: number("net_connects").unwrap_or(0),
+        net_connect_failures: number("net_connect_failures").unwrap_or(0),
         psi_some_pct: value
             .get("psi_some_pct")
             .and_then(Value::as_f64)
@@ -467,9 +508,15 @@ fn diagnose_from(entry: &RingEntry, pid: u32, slow: &SlowSamples) -> Value {
         // The recorder knows the p99 but not how many requests crossed the
         // slow threshold, so this signal is left out rather than guessed at.
         io_slow: 0,
-        net_samples: 0,
+        net_samples: entry.retrans,
         retransmissions: entry.retrans,
-        tcp_available: false,
+        tcp_available: entry.tcp_available,
+        tcp_reason: entry.tcp_reason.clone(),
+        retrans_per_second: entry.tcp_available.then_some(entry.retrans as f64),
+        net_rtt_p95_us: entry.net_rtt_p95_us,
+        net_connect_p95_us: entry.net_connect_p95_us,
+        net_connects: entry.net_connects,
+        net_connect_failures: entry.net_connect_failures,
         retrans_ratio: None,
         offcpu_samples: 0,
         offcpu_p95_us: 0,
@@ -511,7 +558,6 @@ fn diagnose_from(entry: &RingEntry, pid: u32, slow: &SlowSamples) -> Value {
         "not_collected": [
             "off-CPU wait reasons and stacks",
             "page fault and direct reclaim rates",
-            "TCP attribution and retransmissions: socket ownership cannot be established",
             "on-CPU samples; usage is read from the target's accounting counters",
         ],
         "slowest_samples": slow.to_json(),
@@ -539,7 +585,7 @@ impl RingEntry {
         match signal {
             Signal::SchedulerP95 => Some(self.sched_p95_us as f64),
             Signal::IoP99 => Some(self.io_p99_us as f64),
-            Signal::Retransmissions => None,
+            Signal::Retransmissions => self.tcp_available.then_some(self.retrans as f64),
             Signal::PsiSome => self.psi_some_pct.map(f64::from),
             Signal::PsiFull => self.psi_full_pct.map(f64::from),
             Signal::CpuUsage => self.cpu_percent,
@@ -576,7 +622,41 @@ fn incident_text(entry: &RingEntry, triggers: &Triggers, diagnosis: &Value) -> S
         "  block I/O p99  {} us over {} completions, {} unmatched\n",
         entry.io_p99_us, entry.io_samples, entry.io_unmatched
     ));
-    text.push_str("  retransmissions unavailable (socket ownership cannot be established)\n");
+    match (
+        entry.tcp_available,
+        entry.net_rtt_p95_us,
+        entry.net_connect_p95_us,
+    ) {
+        (false, _, _) => text.push_str(&format!(
+            "  retransmissions unavailable ({})\n",
+            entry
+                .tcp_reason
+                .as_deref()
+                .unwrap_or("no verified socket ownership")
+        )),
+        (true, rtt, connect) => {
+            text.push_str(&format!(
+                "  retransmissions {} over the interval\n",
+                entry.retrans
+            ));
+            text.push_str(&format!(
+                "  TCP RTT p95    {}\n",
+                rtt.map_or(
+                    "unavailable, no sample in the interval".to_string(),
+                    |value| { format!("{value} us") }
+                )
+            ));
+            text.push_str(&format!(
+                "  connect p95    {} ({} handshake(s), {} failed)\n",
+                connect.map_or(
+                    "unavailable, no handshake in the interval".to_string(),
+                    |value| { format!("{value} us") }
+                ),
+                entry.net_connects,
+                entry.net_connect_failures
+            ));
+        }
+    }
     match (entry.psi_some_pct, entry.psi_full_pct) {
         (Some(some), Some(full)) => {
             text.push_str(&format!("  memory PSI     {some}% some, {full}% full\n"));
@@ -845,11 +925,16 @@ impl runtime::EventHandler<IoEvent> for RecorderIo {
     }
 }
 
-/// The recorder needs only retransmission and loss counts, not endpoint RTTs.
-/// Keeping endpoints or individual RTT samples would grow without bound.
+/// The recorder keeps retransmission counts and interval latency summaries,
+/// not endpoints or individual samples: a background recorder must not grow
+/// with the number of connections it observes.
 #[derive(Default)]
 struct RecorderNetwork {
     retrans: u64,
+    rtt: IntervalLatency,
+    connect: IntervalLatency,
+    connects: u64,
+    connect_failures: u64,
     lost: u64,
     queue_lost: u64,
 }
@@ -858,6 +943,26 @@ impl runtime::EventHandler<TcpEvent> for RecorderNetwork {
     fn on_event(&mut self, event: TcpEvent) {
         if event.retrans != 0 {
             self.retrans = self.retrans.saturating_add(1);
+        } else if event.rtt_us != 0 {
+            self.rtt.record(u64::from(event.rtt_us) * 1_000);
+        }
+    }
+
+    fn on_lost(&mut self, count: u64) {
+        self.lost = self.lost.saturating_add(count);
+    }
+    fn on_queue_lost(&mut self, count: u64) {
+        self.queue_lost = self.queue_lost.saturating_add(count);
+    }
+}
+
+impl runtime::EventHandler<ConnEvent> for RecorderNetwork {
+    fn on_event(&mut self, event: ConnEvent) {
+        if event.result == TCP_CONNECT_ESTABLISHED {
+            self.connects = self.connects.saturating_add(1);
+            self.connect.record(u64::from(event.latency_us) * 1_000);
+        } else {
+            self.connect_failures = self.connect_failures.saturating_add(1);
         }
     }
 
@@ -883,7 +988,31 @@ fn io_snapshot(stats: &mut RecorderIo) -> Value {
 }
 
 fn network_snapshot(stats: &mut RecorderNetwork) -> Value {
-    serde_json::json!({ "retrans": stats.retrans, "lost": stats.lost, "queue_lost": stats.queue_lost })
+    let (rtt_p95_us, rtt_samples, _) = stats.rtt.take_snapshot(95);
+    serde_json::json!({
+        "retrans": stats.retrans,
+        "rtt_p95_us": rtt_p95_us,
+        "rtt_samples": rtt_samples,
+        "lost": stats.lost,
+        "queue_lost": stats.queue_lost,
+    })
+}
+
+/// The handshake stream's own snapshot.
+///
+/// Handshakes and RTT travel on separate perf arrays but share one interval
+/// record, so each snapshot keys only what its own stream carries; a shared
+/// snapshot would let the second stream overwrite the first stream's counts.
+fn connect_snapshot(stats: &mut RecorderNetwork) -> Value {
+    let (connect_p95_us, connect_samples, _) = stats.connect.take_snapshot(95);
+    serde_json::json!({
+        "connects": stats.connects,
+        "connect_failures": stats.connect_failures,
+        "connect_p95_us": connect_p95_us,
+        "connect_samples": connect_samples,
+        "lost": stats.lost,
+        "queue_lost": stats.queue_lost,
+    })
 }
 
 /// Interval latency measurements and cumulative event counters.
@@ -905,6 +1034,14 @@ struct Cumulative {
     io_unmatched: u64,
     /// Retransmissions so far.
     retrans: u64,
+    /// RTT p95 for this interval, in microseconds.
+    net_rtt_p95_us: Option<u64>,
+    /// Client handshake p95 for this interval, in microseconds.
+    net_connect_p95_us: Option<u64>,
+    /// Client handshakes completed in this interval.
+    net_connects: u64,
+    /// Client handshakes that failed in this interval.
+    net_connect_failures: u64,
     /// Network records dropped so far.
     net_lost: u64,
     /// Queue records dropped in the latest interval.
@@ -926,26 +1063,22 @@ struct PreviousTick {
     primed: bool,
 }
 
-/// Explains a configured trigger that cannot fire in this build.
+/// Explains a configured trigger that cannot fire.
 ///
-/// The warning belongs at startup, not only in the final report: the default
-/// recording is unbounded, so an operator who selected the retransmission
-/// trigger would otherwise learn that it was never armed only when they stop
-/// the recorder. Returning the message keeps it testable; the caller writes it
-/// to stderr so JSON on stdout stays one document.
-fn unavailable_trigger_warning(args: &DaemonArgs) -> Option<String> {
-    Triggers::from_args(args).retrans.map(|_| {
-        "warning: --trigger-retrans is configured but cannot fire: TCP ownership \
-         attribution is unavailable, so no retransmissions are measured; pass \
-         --trigger-retrans off to disable this trigger"
+/// TCP attribution is available on every supported kernel, but it needs the
+/// target's descriptor table: when that cannot be read, the retransmission
+/// trigger is armed and can never fire. Saying so at startup is the difference
+/// between a quiet recorder and a broken one.
+fn unavailable_trigger_warning(args: &DaemonArgs, attribution: bool) -> Option<String> {
+    (Triggers::from_args(args).retrans.is_some() && !attribution).then(|| {
+        "warning: --trigger-retrans is configured but cannot fire: socket \
+         ownership cannot be established for this target, so no retransmissions \
+         are measured; pass --trigger-retrans off to disable this trigger"
             .to_owned()
     })
 }
 
 pub fn run(args: DaemonArgs) -> Result<()> {
-    if let Some(warning) = unavailable_trigger_warning(&args) {
-        eprintln!("{warning}");
-    }
     storage::Output::open(&args.output).with_context(|| {
         format!(
             "unsafe incident output {}; use a trusted directory (see docs/reference.md)",
@@ -975,8 +1108,18 @@ pub fn run(args: DaemonArgs) -> Result<()> {
     runtime::attach_tracepoint(&mut bpf, "sched", "sched_process_exit")?;
     runtime::attach_raw_tracepoint(&mut bpf, "block_rq_issue")?;
     runtime::attach_raw_tracepoint(&mut bpf, "block_rq_complete")?;
+    crate::network::attach(&mut bpf)?;
 
     let after_attach_rss = read_self_rss_bytes().unwrap_or(0);
+    let mut tcp_collector = crate::tcp::TcpCollector::new(&mut bpf, pid)?;
+    // Seed the sockets the target already holds; a recorder attached to a
+    // running server would otherwise attribute nothing until it restarted.
+    tcp_collector.reconcile();
+    if let Some(warning) =
+        unavailable_trigger_warning(&args, tcp_collector.unavailable_reason().is_none())
+    {
+        eprintln!("{warning}");
+    }
     let mut target_tids = runtime::take_target_map(&mut bpf)?;
     let mut known = std::collections::BTreeSet::new();
 
@@ -1015,6 +1158,8 @@ pub fn run(args: DaemonArgs) -> Result<()> {
         slow_io: Vec::new(),
         restored: restored.clone(),
         time_offset: restored.previous_at,
+        tcp_available: false,
+        tcp_reason: Some("collection has not started".to_string()),
     }));
     let tick_state = std::rc::Rc::clone(&state);
     // The tick callback needs the thresholds and the output directory, both of
@@ -1064,10 +1209,22 @@ pub fn run(args: DaemonArgs) -> Result<()> {
                     RecorderNetwork::default(),
                     network_snapshot,
                 ),
+                runtime::EventStream::sampled::<ConnEvent, _>(
+                    "conn",
+                    "CONN_EVENTS",
+                    PERF_PAGE_COUNT,
+                    RecorderNetwork::default(),
+                    connect_snapshot,
+                ),
             ],
             on_tick: Some(Box::new(move |at, summary| {
                 let tick_started = Instant::now();
                 let mut state = tick_state.borrow_mut();
+                // Reconcile before the interval is summarised, so a socket the
+                // target no longer holds cannot contribute to this interval.
+                tcp_collector.reconcile();
+                state.tcp_available = tcp_collector.unavailable_reason().is_none();
+                state.tcp_reason = tcp_collector.unavailable_reason().map(str::to_owned);
                 if let Err(error) = tick(pid, tick_started, at, summary, &mut state, &tick_args) {
                     // Reported through the summary rather than stored, because the
                     // collection loop owns the error channel and a tick that cannot
@@ -1183,6 +1340,10 @@ struct RecorderState {
     /// restored entry at eighteen seconds, and the window would read as though
     /// time ran backwards.
     time_offset: Duration,
+    /// Whether TCP ownership was established at the latest reconcile.
+    tcp_available: bool,
+    /// Why it was not, when it was not.
+    tcp_reason: Option<String>,
 }
 
 /// How many of the slowest samples an incident bundle keeps.
@@ -1279,6 +1440,8 @@ fn tick_with_target_cpu(
         slow_io,
         restored: _,
         time_offset,
+        tcp_available,
+        tcp_reason,
     } = state;
     let triggers = Triggers::from_args(args);
     let mut current = Cumulative::default();
@@ -1311,7 +1474,15 @@ fn tick_with_target_cpu(
             }
             "net" => {
                 current.retrans = number("retrans");
-                current.net_lost = number("lost");
+                current.net_lost = current.net_lost.saturating_add(number("lost"));
+                current.net_rtt_p95_us = (number("rtt_samples") > 0).then(|| number("rtt_p95_us"));
+            }
+            "conn" => {
+                current.net_lost = current.net_lost.saturating_add(number("lost"));
+                current.net_connects = number("connects");
+                current.net_connect_failures = number("connect_failures");
+                current.net_connect_p95_us =
+                    (number("connect_samples") > 0).then(|| number("connect_p95_us"));
             }
             _ => {}
         }
@@ -1378,6 +1549,14 @@ fn tick_with_target_cpu(
         io_samples: current.io_samples,
         io_unmatched: current.io_unmatched.saturating_sub(before.io_unmatched),
         retrans: current.retrans.saturating_sub(before.retrans),
+        tcp_available: *tcp_available,
+        tcp_reason: tcp_reason.clone(),
+        net_rtt_p95_us: current.net_rtt_p95_us,
+        net_connect_p95_us: current.net_connect_p95_us,
+        net_connects: current.net_connects.saturating_sub(before.net_connects),
+        net_connect_failures: current
+            .net_connect_failures
+            .saturating_sub(before.net_connect_failures),
         psi_some_pct: psi.available.then_some(psi.some_pct),
         psi_full_pct: psi.available.then_some(psi.full_pct),
         lost,
@@ -1397,7 +1576,7 @@ fn tick_with_target_cpu(
             sched_samples: entry.sched_samples,
             io_p99_us: entry.io_p99_us,
             io_samples: entry.io_samples,
-            retrans: entry.retrans,
+            retrans: entry.tcp_available.then_some(entry.retrans),
             psi_some_pct: entry.psi_some_pct.map(f64::from),
             psi_full_pct: entry.psi_full_pct.map(f64::from),
             cpu_percent: entry.cpu_percent,
@@ -1549,11 +1728,7 @@ fn print_summary(
     } else {
         for signal in enabled {
             let threshold = signal.threshold(triggers).unwrap_or_default();
-            if signal == Signal::Retransmissions {
-                println!("  {signal}: unavailable (socket ownership cannot be established)");
-            } else {
-                println!("  {signal} at {threshold} {}", signal.unit());
-            }
+            println!("  {signal} at {threshold} {}", signal.unit());
         }
     }
     // The count stands on its own with no unit glued to it, so a script reading
@@ -1603,19 +1778,24 @@ fn print_summary(
             entry.at.as_secs(),
             entry.sched_p95_us,
             entry.io_p99_us,
-            "unavailable",
+            if entry.tcp_available {
+                entry.retrans.to_string()
+            } else {
+                "unavailable".to_string()
+            },
             entry.cpu_cost_pct,
             entry.memory_bytes / 1024
         );
     }
 }
 
-// TCP tracepoints cannot establish ownership, even when the configured
-// threshold is zero. Do not let an unavailable count trigger an incident.
+/// Evaluates every configured trigger against one interval.
+///
+/// An unavailable measurement is already read as `None` by [`Interval::read`],
+/// including a retransmission count without a verified socket owner, so a
+/// trigger can never fire on a number that was not measured.
 fn evaluate_available_triggers(triggers: &Triggers, interval: &Interval) -> Vec<Signal> {
-    let mut fired = triggers.evaluate(interval);
-    fired.retain(|signal| *signal != Signal::Retransmissions);
-    fired
+    triggers.evaluate(interval)
 }
 
 /// Whether a measurement is inside its budget.
@@ -1634,15 +1814,16 @@ mod tests {
         use crate::runtime::EventHandler;
         let mut collector = super::RecorderNetwork::default();
         let mut event: fast_common::TcpEvent = bytemuck::Zeroable::zeroed();
+        event.rtt_us = 250;
         for _ in 0..100_000 {
             collector.on_event(event);
         }
         event.retrans = 1;
         collector.on_event(event);
-        collector.on_lost(3);
+        crate::runtime::EventHandler::<TcpEvent>::on_lost(&mut collector, 3);
         assert_eq!(collector.retrans, 1);
         assert_eq!(collector.lost, 3);
-        assert_eq!(std::mem::size_of_val(&collector), 24);
+        assert_eq!(collector.rtt.count, 100_000);
     }
 
     #[test]
@@ -1713,6 +1894,8 @@ mod tests {
             slow_io: Vec::new(),
             restored: Restored::default(),
             time_offset: Duration::ZERO,
+            tcp_available: false,
+            tcp_reason: None,
         }
     }
 
@@ -1907,6 +2090,8 @@ mod tests {
             slow_io: Vec::new(),
             restored: Restored::default(),
             time_offset: Duration::ZERO,
+            tcp_available: false,
+            tcp_reason: None,
         };
         let mut sched = RecorderScheduler::default();
         let mut io = RecorderIo::default();
@@ -1928,7 +2113,7 @@ mod tests {
             if i == 1 {
                 sched.on_lost(2);
                 io.on_queue_lost(3);
-                net.on_lost(4);
+                crate::runtime::EventHandler::<TcpEvent>::on_lost(&mut net, 4);
                 io_event.op = fast_common::IO_OP_UNMATCHED;
                 io.on_event(io_event);
                 io_event.op = 0;
@@ -2013,6 +2198,8 @@ mod tests {
             slow_io: Vec::new(),
             restored: Restored::default(),
             time_offset: Duration::ZERO,
+            tcp_available: false,
+            tcp_reason: None,
         };
         let snapshot = |lost| {
             vec![(
@@ -2076,6 +2263,8 @@ mod tests {
             slow_io: Vec::new(),
             restored: Restored::default(),
             time_offset: Duration::ZERO,
+            tcp_available: false,
+            tcp_reason: None,
         };
         tick(
             args.pid,
@@ -2150,6 +2339,8 @@ mod tests {
             slow_io: Vec::new(),
             restored: Restored::default(),
             time_offset: Duration::ZERO,
+            tcp_available: false,
+            tcp_reason: None,
         };
         let mut net = RecorderNetwork::default();
         let started = Instant::now();
@@ -2287,6 +2478,8 @@ mod tests {
             slow_io: Vec::new(),
             restored: Restored::default(),
             time_offset: Duration::ZERO,
+            tcp_available: false,
+            tcp_reason: None,
         };
         assert_eq!(state.peak_cpu_pct, 0.0);
         assert_eq!(state.peak_memory_bytes, 0);
@@ -2295,20 +2488,21 @@ mod tests {
     }
 
     #[test]
-    fn a_configured_retrans_trigger_warns_at_startup() {
+    fn a_configured_retrans_trigger_warns_only_without_attribution() {
         let args = default_args(std::path::Path::new("."));
-        let warning = unavailable_trigger_warning(&args)
-            .expect("the default retransmission trigger must warn");
+        let warning = unavailable_trigger_warning(&args, false)
+            .expect("a trigger that cannot fire must warn");
         assert!(warning.contains("--trigger-retrans"));
         assert!(warning.contains("cannot fire"));
         assert!(warning.contains("--trigger-retrans off"));
+        assert_eq!(unavailable_trigger_warning(&args, true), None);
     }
 
     #[test]
     fn an_explicitly_disabled_retrans_trigger_stays_quiet() {
         let mut args = default_args(std::path::Path::new("."));
         args.trigger_retrans = "off".parse().expect("threshold");
-        assert_eq!(unavailable_trigger_warning(&args), None);
+        assert_eq!(unavailable_trigger_warning(&args, false), None);
     }
 
     fn default_args(output: &std::path::Path) -> DaemonArgs {
@@ -2782,7 +2976,7 @@ mod tests {
         let mut triggers = Triggers::from_args(&default_args(std::path::Path::new(".")));
         triggers.retrans = Some(0);
         let interval = Interval {
-            retrans: 999,
+            retrans: None,
             ..Interval::default()
         };
         assert!(
@@ -2804,6 +2998,12 @@ mod tests {
             io_samples: 7,
             io_unmatched: 2,
             retrans: 0,
+            tcp_available: false,
+            tcp_reason: None,
+            net_rtt_p95_us: None,
+            net_connect_p95_us: None,
+            net_connects: 0,
+            net_connect_failures: 0,
             psi_some_pct: Some(2.5),
             psi_full_pct: None,
             lost: 1,
@@ -2896,6 +3096,8 @@ mod tests {
             slow_io: Vec::new(),
             restored: Restored::default(),
             time_offset: Duration::ZERO,
+            tcp_available: false,
+            tcp_reason: None,
         };
         for (cost, rss) in [(1.5, 8_000_000u64), (0.2, 9_500_000), (0.1, 1_000_000)] {
             state.peak_cpu_pct = state.peak_cpu_pct.max(cost);

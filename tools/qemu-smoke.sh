@@ -91,17 +91,9 @@ run_case() {
 
     if "$FAST" "$command_name" --pid "$target_pid" --duration "$DURATION" \
         >"$report" 2>&1; then
-        if [ "$command_name" = net ]; then
-            echo "net collection: pass (TCP programs not attached; no TCP verifier check)"
-        else
-            echo "$command_name verifier: pass (program loaded and attached)"
-        fi
+        echo "$command_name verifier: pass (program loaded and attached)"
     else
-        if [ "$command_name" = net ]; then
-            echo "net collection: FAIL (TCP programs not attached)"
-        else
-            echo "$command_name verifier: FAIL"
-        fi
+        echo "$command_name verifier: FAIL"
         cat "$report"
         FAILURES=$((FAILURES + 1))
         kill "$target_pid" 2>/dev/null
@@ -164,73 +156,126 @@ run_sched_case() {
 
 # The TCP programs are intentionally not attached. Exercise the public
 # unavailable contract against live traffic, not an invented zero count.
-check_tcp_unavailable() {
-    local dir="$OUT_DIR/tcp-unavailable" pid status=0 manifest
+check_tcp_ownership() {
+    # Two phases. The first proves what may be attributed: the target's own
+    # endpoints are published, an unrelated process and a socket handed to
+    # another process are not. The second proves what is measured: IPv6,
+    # connection latency against the fixture's own timing, failed connects and
+    # an incident written from attributed retransmissions.
+    local dir="$OUT_DIR/tcp-ownership" status=0
     rm -rf "$dir"
-    mkdir -p "$dir/incidents" "$dir/triggered"
-    "$FAST_WORKLOAD" net-hog --duration 60s --workers 2 --delay-ms 600 \
-        >"$dir/fixture.log" 2>&1 &
-    pid=$!
-    sleep 0.5
-    "$FAST" net --pid "$pid" --duration 2s >"$dir/net.txt" 2>&1 || status=1
-    "$FAST" net --pid "$pid" --duration 2s --format json >"$dir/net.json" 2>"$dir/net.err" || status=1
-    "$FAST" diagnose --pid "$pid" --duration 2s >"$dir/diagnose.txt" 2>&1 || status=1
-    "$FAST" diagnose --pid "$pid" --duration 2s --format json >"$dir/diagnose.json" 2>"$dir/diagnose.err" || status=1
-    local flags="--trigger-sched-p95 off --trigger-io-p99 off --trigger-retrans 1 --trigger-psi-some off --trigger-psi-full off --trigger-cpu off"
-    # Only the disabled retransmission trigger is enabled.
-    "$FAST" daemon --pid "$pid" --duration 4s --interval 1s --window 10s \
-        --output "$dir/incidents" $flags >"$dir/daemon.txt" 2>&1 || status=1
-    "$FAST" daemon --pid "$pid" --duration 4s --interval 1s --window 10s \
-        --output "$dir/incidents" $flags --format json >"$dir/daemon.json" 2>"$dir/daemon.err" || status=1
-    # A different signal produces a real incident whose TCP fields must still
-    # be unavailable. This also checks the incident envelope and manifest.
-    "$FAST" daemon --pid "$pid" --duration 5s --interval 1s --window 10s \
-        --output "$dir/triggered" --trigger-sched-p95 1us --trigger-io-p99 off \
-        --trigger-retrans 1 --trigger-psi-some off --trigger-psi-full off \
-        --trigger-cpu off >"$dir/incident.txt" 2>&1 || status=1
+    mkdir -p "$dir"
+
+    "$FAST_WORKLOAD" net-hog --duration 30s --workers 2 --peer-delay-ms 40 \
+        >"$dir/target.log" 2>&1 &
+    local pid=$!
+    "$FAST_WORKLOAD" net-hog --duration 30s --workers 2 >"$dir/other.log" 2>&1 &
+    local other=$!
+    # Both fixtures are already connected when the collector attaches, which is
+    # the pre-existing-socket case the ownership evidence has to cover.
+    sleep 1.2
+    local port other_port
+    port=$(sed -n 's/.*endpoint: 127\.0\.0\.1:\([0-9]*\).*/\1/p' "$dir/target.log" | head -1)
+    other_port=$(sed -n 's/.*endpoint: 127\.0\.0\.1:\([0-9]*\).*/\1/p' "$dir/other.log" | head -1)
+
+    "$FAST" net --pid "$pid" --duration 3s >"$dir/net.txt" 2>&1 || status=1
+    "$FAST" net --pid "$pid" --duration 3s --format json >"$dir/net.json" 2>"$dir/net.err" || status=1
+    "$FAST" diagnose --pid "$pid" --duration 3s --format json >"$dir/diagnose.json" 2>&1 || status=1
+    "$FAST" debug tcp-sockets --pid "$pid" --format json >"$dir/debug.json" 2>&1 || status=1
+    kill "$other" 2>/dev/null
+    wait "$other" 2>/dev/null
     kill "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
 
-    grep -q '^TCP attribution: unavailable' "$dir/net.txt" || status=1
-    grep -q '^Samples: unavailable' "$dir/net.txt" || status=1
-    grep -q '^Retransmissions: unavailable' "$dir/net.txt" || status=1
+    [ -n "$port" ] || status=1
+    grep -q '^TCP attribution: verified' "$dir/net.txt" || status=1
     grep -q '"schema":"rand-fast/v2"' "$dir/net.json" || status=1
-    grep -q '"tcp_available":false' "$dir/net.json" || status=1
-    grep -q '"samples":null' "$dir/net.json" || status=1
-    grep -q '"retransmissions":null' "$dir/net.json" || status=1
-    grep -q '"endpoints":\[\]' "$dir/net.json" || status=1
-    grep -q '^  tcp: unavailable' "$dir/diagnose.txt" || status=1
-    grep -q '"schema":"rand-fast/v2"' "$dir/diagnose.json" || status=1
-    grep -q '"tcp_available":false' "$dir/diagnose.json" || status=1
-    grep -q '"net_samples":null' "$dir/diagnose.json" || status=1
-    grep -q '"retrans_ratio":null' "$dir/diagnose.json" || status=1
-    grep -q 'retrans: unavailable' "$dir/daemon.txt" || status=1
-    grep -q 'incidents written: 0' "$dir/daemon.txt" || status=1
-    grep -q '"schema":"rand-fast/v2"' "$dir/daemon.json" || status=1
-    grep -q '"tcp_available":false' "$dir/daemon.json" || status=1
-    grep -q '"retrans":null' "$dir/daemon.json" || status=1
-    for candidate in "$dir"/incidents/*/; do
-        [ ! -d "$candidate" ] || status=1
-    done
-    manifest=""
-    for candidate in "$dir"/triggered/*/manifest.json; do
-        [ -f "$candidate" ] && { manifest=$candidate; break; }
-    done
+    grep -q '"tcp_available":true' "$dir/net.json" || status=1
+    grep -q '"ownership_verified":true' "$dir/net.json" || status=1
+    grep -q "\"destination_port\":$port" "$dir/net.json" || status=1
+    grep -q '"connection_latency"' "$dir/net.json" || status=1
+    grep -q '"owner_drops":' "$dir/net.json" || status=1
+    grep -q '"tcp_available":true' "$dir/diagnose.json" || status=1
+    grep -q '"net_rtt_p95_us":' "$dir/diagnose.json" || status=1
+    grep -q '"available":true' "$dir/debug.json" || status=1
+    grep -q "\"local_port\":$port" "$dir/debug.json" || status=1
+    # The unrelated process runs the same workload on the same host. None of
+    # its connections may appear in the target's report.
+    if [ -n "$other_port" ]; then
+        if grep -q "\"destination_port\":$other_port" "$dir/net.json"; then
+            echo "tcp ownership: FAIL (attributed the unrelated process's port $other_port)"
+            status=1
+        fi
+    fi
+
+    # IPv6, a reused 4-tuple, a slow handshake, failed connects, and a socket
+    # handed to another process after the target held it.
+    "$FAST_WORKLOAD" tcp-lifecycle --duration 20s --connects 6 --family ipv6 \
+        --connect-interval-ms 400 --reuse-tuple --pass-fd --pass-delay-ms 800 \
+        --starve-ms 200 --failed-connects 2 >"$dir/lifecycle.log" 2>&1 &
+    local lifecycle=$!
+    sleep 1.2
+    "$FAST" net --pid "$lifecycle" --duration 8s --format json \
+        >"$dir/lifecycle.json" 2>"$dir/lifecycle.err" || status=1
+    kill "$lifecycle" 2>/dev/null
+    wait "$lifecycle" 2>/dev/null
+
+    grep -q '"family":10' "$dir/lifecycle.json" || status=1
+    grep -q '"available":true' "$dir/lifecycle.json" || status=1
+    grep -q '"failures":2' "$dir/lifecycle.json" || status=1
+    if ! grep -q '"p95_us":[5-9][0-9][0-9][0-9][0-9][0-9]' "$dir/lifecycle.json" \
+        && ! grep -q '"p95_us":[0-9][0-9][0-9][0-9][0-9][0-9][0-9]' "$dir/lifecycle.json"; then
+        echo "tcp ownership: FAIL (the starved handshake was not measured as slow)"
+        status=1
+    fi
+    grep -q '"excluded_endpoints":0' "$dir/lifecycle.json" && {
+        echo "tcp ownership: FAIL (the handed-over socket was still attributed)"
+        status=1
+    }
+
+    # A recorder must be able to fire the retransmission trigger now that the
+    # count is attributed, and the incident must carry the number it fired on.
+    "$FAST_WORKLOAD" net-hog --duration 30s --workers 2 --delay-ms 600 --rcvbuf-kb 8 \
+        >"$dir/retrans.log" 2>&1 &
+    local recorder_target=$!
+    sleep 0.8
+    "$FAST" daemon --pid "$recorder_target" --duration 6s --interval 1s --window 10s \
+        --output "$dir/incidents" --trigger-sched-p95 off --trigger-io-p99 off \
+        --trigger-retrans 1 --trigger-psi-some off --trigger-psi-full off \
+        --trigger-cpu off >"$dir/daemon.txt" 2>&1 || status=1
+    "$FAST" daemon --pid "$recorder_target" --duration 4s --interval 1s --window 10s \
+        --output "$dir/incidents" --trigger-sched-p95 off --trigger-io-p99 off \
+        --trigger-retrans 1 --trigger-psi-some off --trigger-psi-full off \
+        --trigger-cpu off --format json >"$dir/daemon.json" 2>"$dir/daemon.err" || status=1
+    kill "$recorder_target" 2>/dev/null
+    wait "$recorder_target" 2>/dev/null
+
+    grep -q '"tcp_available":true' "$dir/daemon.json" 2>/dev/null || status=1
+    grep -q '"retrans":null' "$dir/daemon.json" && status=1
+    if grep -q 'incidents written: 0' "$dir/daemon.txt"; then
+        echo "tcp ownership: FAIL (no incident fired on attributed retransmissions)"
+        status=1
+    fi
+    local manifest
+    manifest=$(find "$dir/incidents" -name manifest.json 2>/dev/null | head -1)
     if [ -z "$manifest" ]; then
+        echo "tcp ownership: FAIL (no incident bundle was written)"
         status=1
     else
-        grep -q '"schema": "rand-fast/v2"' "$manifest" || status=1
-        grep -q '"retrans": null' "$manifest" || status=1
-        grep -q '"tcp_available": false' "$manifest" || status=1
-        grep -q '"signal": "sched_p95"' "$manifest" || status=1
-        grep -q '"available": false' "$manifest" || status=1
+        grep -q '"tcp_available": true' "$manifest" || status=1
+        grep -q '"retrans": null' "$manifest" && status=1
     fi
+
     if [ "$status" -ne 0 ]; then
-        echo "TCP unavailable contract: FAIL (see $dir)"
+        echo "TCP ownership contract: FAIL (see $dir)"
+        for report in "$dir"/net.txt "$dir"/net.json "$dir"/lifecycle.json "$dir"/daemon.txt; do
+            [ -s "$report" ] || continue
+            echo "----- $report -----"
+            head -40 "$report"
+        done
         FAILURES=$((FAILURES + 1))
     else
-        echo "TCP unavailable contract: pass (net, diagnose, daemon and incident; retransmission trigger disabled)"
-        echo "TCP verifier: SKIP (programs intentionally not attached)"
+        echo "TCP ownership contract: pass (attribution, exclusion, IPv6, latency, failed connects, retransmission trigger)"
     fi
 }
 
@@ -240,10 +285,23 @@ if [ "${QEMU_SMOKE_TEST_CASE:-}" = "single-io" ]; then
     finish
 fi
 
-if [ "${QEMU_SMOKE_TEST_CASE:-}" = "tcp-unavailable" ]; then
-    check_tcp_unavailable
+if [ "${QEMU_SMOKE_TEST_CASE:-}" = "tcp-ownership" ]; then
+    check_tcp_ownership
     finish
 fi
+
+
+# Host-side stub tests exercise the same case/failure accounting without QEMU.
+if [ "${QEMU_SMOKE_TEST_CASE:-}" = "single-io" ]; then
+    run_case io "$FAST_WORKLOAD" io-hog --duration 1s --workers 1
+    finish
+fi
+
+if [ "${QEMU_SMOKE_TEST_CASE:-}" = "tcp-ownership" ]; then
+    check_tcp_ownership
+    finish
+fi
+
 
 if [ "${QEMU_SMOKE_TEST_CASE:-}" = "bench" ]; then
     mkdir -p "$OUT_DIR/bench"
@@ -1524,7 +1582,7 @@ check_daemon_triggers() {
         "$FAST_WORKLOAD" lock-hog --duration "$TRIGGER_RUN" --workers 32
 }
 
-check_tcp_unavailable
+check_tcp_ownership
 check_cpu_rate_scaling
 check_cpu_symbolization
 check_io_pairing

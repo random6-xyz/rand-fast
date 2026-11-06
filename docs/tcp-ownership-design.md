@@ -1,142 +1,159 @@
 # TCP ownership and lifecycle attribution
 
-Status: design and proof-of-concept report. TCP reporting and triggers remain
-disabled. This document is the deliverable for issue #71 and the prerequisite
-for #72/#73; it does not claim that attribution is ready to enable.
+Status: implemented. This document is the design behind `fast net`,
+`fast diagnose` and the daemon's TCP signals. It states what is measured, what
+evidence an attribution rests on, and where the measurement stops being
+possible.
 
-## Why the current code reports nothing
+## The problem
 
-`fast net`, `fast diagnose` and the daemon currently report
-`tcp_available: false` and keep RTT/retransmission fields null. That is a
-deliberate contract, not a missing feature.
+The kernel tracepoints that carry TCP measurements (`tcp_probe`,
+`tcp_retransmit_skb`, `sock:inet_sock_set_state`) fire for every socket on the
+host, and they do not run in a predictable task context:
 
-The kernel tracepoints that carry TCP measurements do not carry a reliable
-owner:
+- `tcp_probe` runs on the receive path and can run in softirq context, where
+  the current task is whatever was interrupted, not the socket's user.
+- A socket address (`skaddr`) is a kernel pointer. It is reused after
+  `sk_free`, so a remembered pointer says nothing about who owns the socket
+  now.
+- A socket cookie identifies a socket, not a process, and does not survive a
+  descriptor being passed to another process.
+- The 6.1 and 6.6 `tcp_probe` payload has no `skaddr` at all.
 
-- `tcp_probe` and `tcp_retransmit_skb` can run in softirq context. The current
-  task at that point is whatever was interrupted, not the task that owns the
-  socket.
-- A socket address (`skaddr`) is a kernel pointer. It can be freed and reused
-  by a different process, so a remembered pointer alone proves nothing.
-- A socket cookie identifies a socket, but not a process. It also does not
-  survive descriptor passing as an ownership statement: the receiving process
-  is not the creating or connecting task.
-- The 6.1/6.6 `tcp_probe` payload has no `skaddr` at all, so those kernels have
-  no per-socket key for RTT samples.
+An earlier implementation attributed events to whichever target thread was
+current, or to a pointer remembered from an earlier event. Both are guesses,
+and a wrong attribution is worse than an unavailable measurement, so the
+feature was disabled rather than shipped.
 
-The previous implementation attributed a tracepoint event to whichever target
-thread was current, or remembered a pointer after a target thread was seen on
-it. That is exactly the unproven attribution this issue is about; it was
-removed.
+## What attribution rests on now
 
-## Ownership evidence considered
+Two kinds of evidence, joined by one key:
 
-The only points where the kernel has both a socket and the task that created
-the relationship are:
-
-| Event | Kernel hook | What it proves |
+| Evidence | Where it comes from | What it proves |
 | --- | --- | --- |
-| Client connect | `tcp_connect(struct sock *sk)` entry | This task called connect on this socket. |
-| Server accept | `inet_csk_accept()` return | This task accepted this new socket. |
-| Socket destruction | `sk_free(struct sock *sk)` | The address is about to become reusable; drop the record. |
+| Creation | `sock:inet_sock_set_state` with the target's own thread group as the current task, at `TCP_SYN_SENT` (client) or `TCP_LISTEN` (server) | The target started this connection, or listens on this address |
+| Possession | `/proc/<pid>/fd` joined with `/proc/<pid>/net/tcp{,6}` by inode | The target holds a descriptor for this socket right now, whether or not this run saw it created |
 
-A record is written only when the current thread group is the observed process.
-The record is keyed by the socket address and removed at `sk_free`. The
-tracepoint then requires a record for the exact address before emitting an
-event; there is no fallback to the current task.
+The key is the connection's **5-tuple** (`family`, source address, source
+port, destination address, destination port), never a pointer. Two live
+sockets cannot share a tuple in a network namespace, and the record is removed
+when the socket reaches `TCP_CLOSE`, so a reused address cannot inherit an old
+owner.
 
-This gives the following safe and unsafe cases:
+The descriptor evidence is what makes a report usable on a process that is
+already running: a server that started before collection has no creation
+events, but it does hold its listening socket and its accepted connections.
+Those are seeded at startup and reconciled once a second while the run
+continues.
 
-- Safe: a socket created by `connect`/`accept` in the target after attachment,
-  with the target still alive, and the record not yet removed.
-- Excluded: sockets that existed before attachment. They have no record and are
-  never attributed.
-- Excluded: sockets created by another process. Their record is never written.
-- Excluded: a reused address after `sk_free`; the record is gone.
-- Not proven: a socket created by the target and then passed to another
-  process. The record still names the creator. This is creator attribution,
-  not proof of the current user, and must be either detected (for example via
-  file reference counts) or documented as a limitation before enabling.
-- Not proven: sockets created by a forked child. The child's TGID differs, so
-  its connects are not recorded; the target's pre-existing descriptors are
-  excluded by the attachment rule.
+### Ownership rules in full
 
-## Prototype and observed result
+- **Client connection**: a `TCP_SYN_SENT` transition whose current thread
+  group is the target. The kernel assigns the local port *after* that
+  transition, so the handshake is tracked by socket address until
+  `TCP_ESTABLISHED`, where the full tuple is recorded. The pointer is a
+  correlation handle between two events of one live socket, never ownership
+  evidence; the recorded remote endpoint is checked again at establishment, so
+  a recycled address cannot produce a latency sample for an unrelated
+  connection.
+- **Accepted connection**: the connection's local port matches a listener the
+  target owns, either because the kernel saw the target call `listen` or
+  because the target holds the listening descriptor.
+- **Pre-existing connection**: presence in the target's descriptor table.
+  Reported with `origin: "seeded"` so a reader can tell it apart from a
+  connection this run saw created.
+- **Ambiguous listener**: when two sockets in the namespace bind the same
+  address, an accepted connection on it belongs to neither process provably.
+  The address is recorded as ambiguous and its connections are never
+  attributed.
+- **Shared or transferred descriptor**: a socket the target no longer holds is
+  removed at the next reconcile. If the connection is still in the namespace's
+  socket table, it left the process and is counted in `excluded_endpoints`.
+  A socket both processes still hold is attributed to the process that created
+  it; the report says "creator plus current holder", which is the strongest
+  claim the evidence supports.
+- **Threads only**: fork and exec create new thread groups. A child process's
+  sockets are outside the observed process, which matches the tool's scope.
 
-A prototype added three kprobes (`tcp_connect`, `inet_csk_accept`,
-`sk_free`) and a map from socket address to `{tgid, start_ns}`. The two TCP
-tracepoints looked up that map only after validating the checked-in payload
-layout, and `net` gained a hidden `--experimental-tcp` switch so the default
-contract stayed unavailable.
+### Verification at report time
 
-The QEMU workload (7.2.0-rc6, KVM) exercised:
+The kernel keys ownership by tuple, which is not scoped to a network
+namespace. Every endpoint is therefore checked once more before it is
+published: it must either have produced a creation event in this run or appear
+in the target's own socket table. Endpoints that fail the check are dropped
+and counted in `unverified_endpoints`.
 
-- a client that connects after attachment;
-- a second, unrelated process connecting at the same time;
-- a connection created before attachment;
-- a stalled reader intended to induce retransmissions.
+## Measurement
 
-The prototype recorded the target's connect and accept sockets and correctly
-excluded the unrelated process and the pre-existing connection. However, the
-TCP tracepoint lookups for the recorded addresses did not match, so no
-attributed sample was emitted. The experiment was stopped rather than shipping
-an `available` report with zero samples or, worse, a guessed fallback. The
-prototype code and its hidden flag were removed; the default path is unchanged.
+| Signal | Source | Unit | Sampling |
+| --- | --- | --- | --- |
+| RTT | `tcp_probe`, `srtt >> 3` | µs | at most one sample per connection per 10 ms |
+| Retransmission | `tcp_retransmit_skb` | count, /s | every event |
+| Connection setup | `TCP_SYN_SENT` → `TCP_ESTABLISHED` | µs | every client handshake |
+| Failed connect | `TCP_SYN_SENT` → `TCP_CLOSE` before establishing | count | every attempt |
 
-This is the remaining blocker for #72/#73. Before enabling anything, the
-prototype must be reduced to a minimal reproducer and the lookup failure
-understood. Candidate explanations to test are map lifetime/instance sharing
-between kprobe and tracepoint programs, the exact socket pointer carried by
-`tcp_probe` on the tested kernel, and whether an accepted socket is the same
-object the tracepoint reports. None of these may be guessed around with a
-fallback.
+The RTT interval is what keeps a busy connection from flooding the perf
+buffer. The report says "samples", not "packets", and `Samples` is the number
+of attributed samples after that limit.
 
-## Required evidence before enabling (#72/#73)
+The server side of a handshake is not measurable: the kernel sets a child
+socket's initial `TCP_SYN_RECV` state directly instead of going through
+`inet_sock_set_state`, so there is no observable start. Accepted sockets have
+RTT and retransmissions, and their connection latency is reported as
+unavailable with that reason rather than guessed at.
 
-1. A minimal kprobe-to-tracepoint map handoff that returns the recorded owner
-   for a known socket, with the map instance and key verified independently.
-2. RTT cross-checked against an independent source (`ss -ti` or the workload's
-   own round-trip p50) on the supported kernels, with the scale documented.
-3. An induced retransmission attributed to the same owned connection, and none
-   attributed to an unrelated process.
-4. Lifetime tests: pre-existing socket, close/reopen, address reuse, target
-   exit, shared/transferred descriptor, IPv4 and IPv6.
-5. Event-loss accounting and a bounded map policy when a target opens more
-   sockets than the owner map can hold.
-6. Explicit unavailable behavior for 6.1/6.6 (no `skaddr`), missing
-   capabilities, and any ambiguous ownership case.
+`retrans_ratio` stays null. The tracepoints carry no transmitted-segment
+denominator, and dividing a retransmission count by a receive-side event count
+would be a number that means nothing. The report gives the count and the
+per-second rate instead; a rate over the collection window is a real
+measurement, a ratio without a denominator is not.
 
-Connection latency (#73) additionally needs connect/accept timestamps from the
-same proven records; RTT alone is not a connection-establishment metric.
+## Kernel objects
 
-## Feature detection and unavailable behavior
+| Object | Type | Bound | Purpose |
+| --- | --- | --- | --- |
+| `TCP_OWNERS` | hash map, tuple → owner | 8192 | verified owners; a full map drops new records instead of evicting an owner |
+| `TCP_LISTENERS` | hash map, address → owner | 512 | listeners, including the ambiguous ones |
+| `TCP_PENDING_CONNECTS` | LRU hash map, address → handshake | 1024 | pairs `TCP_SYN_SENT` with `TCP_ESTABLISHED` |
+| `TCP_OWNER_STATS` | per-CPU counters | 12 | attribution outcomes, summed by userspace |
+| `NET_EVENTS`, `CONN_EVENTS` | perf arrays | 64 pages/CPU, 8 pages/CPU | RTT/retransmission samples, handshake outcomes |
 
-- RTT attribution requires a `tcp_probe` layout with `skaddr` (verified 6.12
-  and 7.2 fixtures). On 6.1/6.6 the report must say why it is unavailable.
-- Retransmission attribution requires `tcp_retransmit_skb` `skaddr` (present on
-  all verified kernels) plus a proven owner record.
-- Missing kprobe symbols, tracefs, BTF or capabilities produce an explicit
-  unavailable line, never a zero measurement.
-- Triggers (`--trigger-retrans`) stay disabled while attribution is
-  unavailable; a configured trigger that cannot fire must remain visible and
-  must not fabricate an incident.
+Cost: one map lookup per TCP state change in the namespace (to invalidate a
+record on close and to attribute accepted connections), one lookup plus a
+counter per measurement event, and one map insert per connect/accept. A busy
+host costs a few percent of one CPU in the softirq path even when the target
+is idle; that is the price of not guessing, and it is measured by the
+benchmark gate.
 
-## Cost and bounds
+## Unavailable behavior
 
-The kprobes do one map insert per connect/accept and one remove per socket
-free; both are O(1) and run only in the target's context, except `sk_free`,
-which runs for every socket but does only a map remove. The tracepoints do one
-map lookup per event. The owner map is bounded; when full, new records are
-dropped and those sockets are unattributed rather than evicting an unrelated
-owner. The map holds only the socket address, TGID and start timestamp.
+TCP attribution is unavailable, with an explicit reason, when:
 
-## Current product behavior
+- the running kernel's tracepoint layout does not match the verified fixtures
+  (the collector refuses to start rather than misread a payload);
+- the target's descriptor table or socket table cannot be read (permissions,
+  or a target that exited mid-run);
+- the target holds no TCP socket at all — that is *available with zero
+  samples*, not unavailable, because it is a real reading.
 
-Until the evidence above exists:
+In every other case a null measurement means "not measured", never zero. The
+daemon refuses to fire `--trigger-retrans` when attribution is unavailable and
+says so at startup.
 
-- `fast net` prints `TCP attribution: unavailable (...)` and null samples.
-- `fast diagnose` keeps `tcp_available: false` and null TCP evidence.
-- The daemon keeps `tcp_available: false` and never fires the retransmission
-  trigger.
-- `tools/qemu-smoke.sh` keeps the TCP unavailable contract and the negative
-  tests for unrelated and pre-existing connections.
+## Verification
+
+`tools/qemu-smoke.sh` runs `check_tcp_ownership` inside the real-kernel guest:
+
+- attribution and exclusion: the target's own endpoints are published, an
+  unrelated process running the same fixture is never attributed, and a socket
+  handed to a forked child over `SCM_RIGHTS` is counted as excluded;
+- IPv6 endpoints, a reused 4-tuple, two failed connects, and a handshake
+  delayed past a retransmission timeout (the listener's accept queue is
+  starved for 200 ms, so the client's SYN is dropped and retried);
+- the JSON, human, diagnose and daemon documents agree, and an incident is
+  written from attributed retransmissions.
+
+The layout fixtures in `fast/tests/fixtures/tracepoints` cover 6.1.191,
+6.6.161, 6.12.105, 6.12.115, 7.2.0-rc6 and 7.2.15. All six carry the tuple and
+state fields the collector consumes; `skaddr` is not required, which is why the
+LTS kernels are supported.

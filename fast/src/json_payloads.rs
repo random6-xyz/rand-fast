@@ -14,32 +14,97 @@ use serde::Serialize;
 use crate::{
     diagnose::Evidence,
     memory::{Rates, Verdict},
-    network::NetStats,
+    network::{NetReport, format_address},
     offcpu::OffCpuStats,
 };
 
 // --- net -------------------------------------------------------------------
 
 /// The `net` command's `data` object.
+///
+/// `tcp_available` reports whether ownership was established, not whether
+/// traffic happened: a target with no TCP sockets is available with zero
+/// samples. `tcp_reason` explains every unavailable measurement, and the
+/// per-signal blocks say which signal is missing when only one is.
 #[derive(Debug, Clone, Serialize)]
 pub struct NetJson {
-    /// Whether TCP ownership attribution is available.
+    /// Whether TCP ownership attribution was established for this run.
     pub tcp_available: bool,
+    /// Why attribution or a measurement is unavailable, when it is.
+    pub tcp_reason: Option<String>,
     /// Ordinary RTT samples observed.
     pub samples: Option<u64>,
     /// Retransmissions observed.
     pub retransmissions: Option<u64>,
-    /// Records the kernel dropped from the perf buffer.
+    /// Records the kernel dropped from a perf buffer.
     pub lost_events: u64,
-    /// One row per remote endpoint, slowest first.
+    /// How attribution went, including what was excluded.
+    pub attribution: AttributionJson,
+    /// Connection-establishment measurements.
+    pub connection_latency: ConnectionLatencyJson,
+    /// One row per owned connection, slowest first.
     pub endpoints: Vec<EndpointJson>,
 }
 
-/// One remote endpoint.
+/// Counts describing the ownership evidence behind a report.
+#[derive(Debug, Clone, Serialize)]
+pub struct AttributionJson {
+    /// Connections published in `endpoints`.
+    pub owned_endpoints: u64,
+    /// Connections removed because the target stopped holding the socket.
+    pub excluded_endpoints: u64,
+    /// Listener addresses bound by more than one socket, so unattributable.
+    pub ambiguous_listeners: u64,
+    /// Owner records the kernel could not write because the map was full.
+    pub owner_drops: u64,
+    /// RTT samples dropped because no owner record matched.
+    pub unattributed_rtt: u64,
+    /// Retransmissions dropped because no owner record matched.
+    pub unattributed_retrans: u64,
+    /// Endpoints dropped because the target's socket table never corroborated
+    /// them.
+    pub unverified_endpoints: u64,
+    /// RTT samples suppressed by the per-connection sampling interval.
+    pub rate_limited_samples: u64,
+    /// Client handshakes the kernel started tracking.
+    pub handshakes_tracked: u64,
+    /// Tracked handshakes that reached `TCP_ESTABLISHED`.
+    pub handshakes_established: u64,
+    /// Tracked handshakes that closed before establishing.
+    pub handshakes_failed: u64,
+}
+
+/// Connection-establishment measurements.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectionLatencyJson {
+    /// Whether at least one handshake was measured.
+    pub available: bool,
+    /// Why not, when not.
+    pub reason: Option<String>,
+    /// Completed handshakes.
+    pub connects: u64,
+    /// Connects that closed before establishing.
+    pub failures: u64,
+    /// Median handshake duration.
+    pub p50_us: Option<u64>,
+    /// 95th percentile handshake duration.
+    pub p95_us: Option<u64>,
+    /// 99th percentile handshake duration.
+    pub p99_us: Option<u64>,
+}
+
+/// One connection row.
 #[derive(Debug, Clone, Serialize)]
 pub struct EndpointJson {
     /// Address family, 2 for IPv4 and 10 for IPv6.
     pub family: u16,
+    /// Whether the connection was opened by the target or accepted by it.
+    pub role: &'static str,
+    /// `created` when the kernel saw the target create the connection,
+    /// `seeded` when the target's descriptor table is the evidence.
+    pub origin: &'static str,
+    /// Whether the target's own socket table corroborated the connection.
+    pub ownership_verified: bool,
     /// Source address, printable form.
     pub source: String,
     /// Destination address, printable form.
@@ -48,7 +113,7 @@ pub struct EndpointJson {
     pub source_port: u16,
     /// Destination port.
     pub destination_port: u16,
-    /// RTT samples on this endpoint.
+    /// RTT samples on this connection.
     pub samples: u64,
     /// Median RTT.
     pub p50_us: u64,
@@ -56,8 +121,10 @@ pub struct EndpointJson {
     pub p95_us: u64,
     /// 99th percentile RTT.
     pub p99_us: u64,
-    /// Retransmissions on this endpoint.
+    /// Retransmissions on this connection.
     pub retransmissions: u64,
+    /// Retransmissions per second of collection time.
+    pub retransmissions_per_second: f64,
     /// Always null: transmitted segment counts are not collected. The field is
     /// retained in v2, but its former v1 numeric value was invalid.
     pub retrans_ratio: Option<f64>,
@@ -65,16 +132,86 @@ pub struct EndpointJson {
     pub max_cwnd: u64,
     /// Highest receive window seen, in bytes.
     pub max_rcv_wnd_bytes: u64,
+    /// Handshakes measured on this connection.
+    pub connect_samples: u64,
+    /// Median handshake duration on this connection.
+    pub connect_p50_us: Option<u64>,
+    /// 95th percentile handshake duration on this connection.
+    pub connect_p95_us: Option<u64>,
+    /// Handshakes on this connection that closed before establishing.
+    pub connect_failures: u64,
 }
 
 /// Builds the `net` document's `data` object.
-pub fn network_json(stats: &NetStats) -> NetJson {
+pub fn network_json(report: &NetReport<'_>) -> NetJson {
+    let stats = report.stats;
+    let counters = report.counters;
+    let available = report.available;
+    let mut endpoints = Vec::new();
+    for endpoint in stats.slowest_endpoints() {
+        let (p50, p95, p99) = endpoint.rtt_percentiles();
+        let (connect_p50, connect_p95, _) = endpoint.connect_percentiles();
+        let role = if report.is_listener_port(endpoint.key.dport) {
+            "server"
+        } else {
+            "client"
+        };
+        let created = stats.was_created(&endpoint.key);
+        endpoints.push(EndpointJson {
+            family: endpoint.key.family,
+            role,
+            origin: if created { "created" } else { "seeded" },
+            ownership_verified: created || report.is_verified(&endpoint.key),
+            source: format_address(endpoint.key.family, endpoint.key.saddr),
+            destination: format_address(endpoint.key.family, endpoint.key.daddr),
+            source_port: endpoint.key.sport,
+            destination_port: endpoint.key.dport,
+            samples: endpoint.rtts.len() as u64,
+            p50_us: u64::from(p50),
+            p95_us: u64::from(p95),
+            p99_us: u64::from(p99),
+            retransmissions: endpoint.retrans,
+            retransmissions_per_second: endpoint.retrans_per_second(report.elapsed),
+            retrans_ratio: None,
+            max_cwnd: u64::from(endpoint.max_cwnd),
+            max_rcv_wnd_bytes: u64::from(endpoint.max_rcv_wnd),
+            connect_samples: endpoint.connects,
+            connect_p50_us: (!endpoint.connect_us.is_empty()).then_some(u64::from(connect_p50)),
+            connect_p95_us: (!endpoint.connect_us.is_empty()).then_some(u64::from(connect_p95)),
+            connect_failures: endpoint.connect_failures,
+        });
+    }
+    let (p50, p95, p99) = stats.connect_percentiles();
+    let measured = report.connect_available;
     NetJson {
-        tcp_available: false,
-        samples: None,
-        retransmissions: None,
+        tcp_available: available,
+        tcp_reason: report.reason.clone(),
+        samples: available.then(|| stats.samples()),
+        retransmissions: available.then(|| stats.retrans()),
         lost_events: stats.lost(),
-        endpoints: Vec::new(),
+        attribution: AttributionJson {
+            owned_endpoints: stats.endpoints_len() as u64,
+            excluded_endpoints: report.excluded(),
+            ambiguous_listeners: report.ambiguous_listeners() as u64,
+            owner_drops: counters.drops,
+            unattributed_rtt: counters.unmatched_rtt,
+            unattributed_retrans: counters.unmatched_retrans,
+            unverified_endpoints: report.unverified,
+            rate_limited_samples: counters.rate_limited,
+            handshakes_tracked: counters.pending_inserted,
+            handshakes_established: counters.pending_established,
+            handshakes_failed: counters.pending_failed,
+        },
+        connection_latency: ConnectionLatencyJson {
+            available: measured,
+            reason: report.connect_reason.clone(),
+            connects: stats.connects(),
+            failures: stats.connect_failures(),
+            p50_us: measured.then(|| u64::from(p50)),
+            p95_us: measured.then(|| u64::from(p95)),
+            p99_us: measured.then(|| u64::from(p99)),
+        },
+        endpoints,
     }
 }
 
@@ -83,8 +220,11 @@ pub fn network_json(stats: &NetStats) -> NetJson {
 /// The `daemon` command's `data` object.
 #[derive(Debug, Clone, Serialize)]
 pub struct DaemonJson {
-    /// Whether TCP ownership attribution is available.
+    /// Whether TCP ownership attribution was established for the latest
+    /// recorded interval.
     pub tcp_available: bool,
+    /// Why it was not, when it was not.
+    pub tcp_reason: Option<String>,
     /// How long the recorder ran, in seconds.
     pub ran_s: f64,
     /// The rolling window the ring covers, in seconds.
@@ -150,7 +290,8 @@ pub fn daemon_json(
             })
     });
     DaemonJson {
-        tcp_available: false,
+        tcp_available: entry.is_some_and(|entry| entry.tcp_available),
+        tcp_reason: entry.and_then(|entry| entry.tcp_reason.clone()),
         ran_s: ring.entries().last().map_or(0.0, |e| e.at.as_secs_f64()),
         window_s: window.as_secs_f64(),
         interval_s: interval.as_secs_f64(),
@@ -559,8 +700,18 @@ pub struct CauseJson {
 pub fn diagnose_json(evidence: &Evidence) -> DiagnoseJson {
     let mut measured = serde_json::to_value(evidence).expect("evidence is serializable");
     if !evidence.tcp_available {
-        measured["net_samples"] = serde_json::Value::Null;
-        measured["retrans_ratio"] = serde_json::Value::Null;
+        // Unavailable measurements are explicitly null rather than zero, so a
+        // consumer can tell "nothing happened" from "nothing was measured".
+        for field in [
+            "net_samples",
+            "retransmissions",
+            "retrans_ratio",
+            "retrans_per_second",
+            "net_rtt_p95_us",
+            "net_connect_p95_us",
+        ] {
+            measured[field] = serde_json::Value::Null;
+        }
     }
     DiagnoseJson {
         measured,
@@ -586,7 +737,10 @@ pub fn diagnose_json(evidence: &Evidence) -> DiagnoseJson {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::offcpu::WaitReason;
+    use crate::{
+        network::{NetReport, NetStats},
+        offcpu::WaitReason,
+    };
     use serde_json::Value;
 
     fn value_of<T: Serialize>(payload: &T) -> Value {
@@ -595,11 +749,19 @@ mod tests {
 
     #[test]
     fn net_json_of_an_empty_run_is_still_well_formed() {
-        let value = value_of(&network_json(&NetStats::default()));
+        let stats = NetStats::default();
+        let counters = crate::tcp::TcpCounters::default();
+        let value = value_of(&network_json(&NetReport::for_test(
+            &stats,
+            &counters,
+            std::time::Duration::from_secs(1),
+        )));
         assert_eq!(value["tcp_available"], false);
         assert!(value["samples"].is_null());
         assert!(value["retransmissions"].is_null());
         assert_eq!(value["endpoints"].as_array().unwrap().len(), 0);
+        assert_eq!(value["attribution"]["owned_endpoints"], 0);
+        assert_eq!(value["connection_latency"]["available"], false);
     }
 
     #[test]
@@ -683,6 +845,7 @@ mod tests {
             offcpu_futex_ratio: 0.9,
             net_samples: 12,
             retransmissions: 2,
+            tcp_available: true,
             ..Evidence::default()
         };
         let value = value_of(&diagnose_json(&evidence));
@@ -782,7 +945,13 @@ mod tests {
     fn every_payload_serializes() {
         // A payload that cannot serialize would make --format json fail at
         // runtime, which is the worst place to find out.
-        value_of(&network_json(&NetStats::default()));
+        let stats = NetStats::default();
+        let counters = crate::tcp::TcpCounters::default();
+        value_of(&network_json(&NetReport::for_test(
+            &stats,
+            &counters,
+            std::time::Duration::from_secs(1),
+        )));
         value_of(&offcpu_json(&OffCpuStats::default()));
         value_of(&memory_json(None, false, &crate::memory::Sample::default()));
         value_of(&diagnose_json(&Evidence::default()));

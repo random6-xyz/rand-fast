@@ -108,21 +108,9 @@ const TCP_PROBE_FIELDS: &[ExpectedField] = &[
         offset: 104,
         size: 4,
     },
-    ExpectedField {
-        name: "skaddr",
-        field_type: "const void *",
-        offset: 128,
-        size: 8,
-    },
 ];
 
 const TCP_RETRANSMIT_FIELDS: &[ExpectedField] = &[
-    ExpectedField {
-        name: "skaddr",
-        field_type: "const void *",
-        offset: 16,
-        size: 8,
-    },
     ExpectedField {
         name: "sport",
         field_type: "__u16",
@@ -167,6 +155,73 @@ const TCP_RETRANSMIT_FIELDS: &[ExpectedField] = &[
     },
 ];
 
+// `sock:inet_sock_set_state` carries the socket's 5-tuple on every TCP state
+// change. Ownership is decided from the thread group seen at `TCP_SYN_SENT`
+// (client) and `TCP_LISTEN` (server), and the tuple is what the measurement
+// tracepoints are joined against; no payload field is guessed.
+const INET_SOCK_SET_STATE_FIELDS: &[ExpectedField] = &[
+    ExpectedField {
+        name: "skaddr",
+        field_type: "const void *",
+        offset: 8,
+        size: 8,
+    },
+    ExpectedField {
+        name: "oldstate",
+        field_type: "int",
+        offset: 16,
+        size: 4,
+    },
+    ExpectedField {
+        name: "newstate",
+        field_type: "int",
+        offset: 20,
+        size: 4,
+    },
+    ExpectedField {
+        name: "sport",
+        field_type: "__u16",
+        offset: 24,
+        size: 2,
+    },
+    ExpectedField {
+        name: "dport",
+        field_type: "__u16",
+        offset: 26,
+        size: 2,
+    },
+    ExpectedField {
+        name: "family",
+        field_type: "__u16",
+        offset: 28,
+        size: 2,
+    },
+    ExpectedField {
+        name: "saddr",
+        field_type: "__u8",
+        offset: 32,
+        size: 4,
+    },
+    ExpectedField {
+        name: "daddr",
+        field_type: "__u8",
+        offset: 36,
+        size: 4,
+    },
+    ExpectedField {
+        name: "saddr_v6",
+        field_type: "__u8",
+        offset: 40,
+        size: 16,
+    },
+    ExpectedField {
+        name: "daddr_v6",
+        field_type: "__u8",
+        offset: 56,
+        size: 16,
+    },
+];
+
 // Memory programs count event occurrences and do not read any payload fields.
 // Their tracepoint existence is still checked before attachment.
 const NO_PAYLOAD_FIELDS: &[ExpectedField] = &[];
@@ -196,6 +251,11 @@ const EVENTS: &[ExpectedEvent] = &[
         category: "tcp",
         name: "tcp_retransmit_skb",
         fields: TCP_RETRANSMIT_FIELDS,
+    },
+    ExpectedEvent {
+        category: "sock",
+        name: "inet_sock_set_state",
+        fields: INET_SOCK_SET_STATE_FIELDS,
     },
     ExpectedEvent {
         category: "exceptions",
@@ -375,14 +435,12 @@ mod tests {
         }
     }
 
-    /// The 6.1 and 6.6 `tcp_probe` tracepoint has no `skaddr` field. TCP is
-    /// disabled on every kernel, so this is a documented gap rather than a
-    /// supported measurement; the non-TCP collectors must still validate.
-    fn assert_non_tcp_fixture_matches(fixture: &str) {
-        for spec in EVENTS.iter().filter(|spec| spec.category != "tcp") {
-            validate_format(spec, section(fixture, spec.name))
-                .unwrap_or_else(|error| panic!("{} / {}: {error:#}", spec.category, spec.name));
-        }
+    /// TCP attribution keys on the connection tuple, which every supported
+    /// kernel carries in the payload. A fixture therefore has to describe
+    /// every field every collector consumes, including the LTS kernels whose
+    /// `tcp_probe` has no `skaddr`.
+    fn assert_fixture_matches_older_lts(fixture: &str) {
+        assert_fixture_matches(fixture);
     }
 
     #[test]
@@ -394,23 +452,24 @@ mod tests {
     }
 
     #[test]
-    fn older_lts_fixtures_match_every_non_tcp_collector() {
-        assert_non_tcp_fixture_matches(LINUX_6_1_191);
-        assert_non_tcp_fixture_matches(LINUX_6_6_161);
+    fn older_lts_fixtures_match_every_collector() {
+        assert_fixture_matches_older_lts(LINUX_6_1_191);
+        assert_fixture_matches_older_lts(LINUX_6_6_161);
     }
 
     #[test]
-    fn tcp_probe_without_skaddr_is_rejected_not_guessed() {
-        let spec = EVENTS
-            .iter()
-            .find(|spec| spec.category == "tcp" && spec.name == "tcp_probe")
-            .unwrap();
-        for fixture in [LINUX_6_1_191, LINUX_6_6_161] {
-            let error = validate_format(spec, section(fixture, "tcp_probe"))
-                .expect_err("a tcp_probe without skaddr must not validate");
+    fn the_consumed_tcp_fields_are_exactly_the_tracepoint_payload() {
+        // `skaddr` is the kernel's socket pointer. Recording it in an
+        // expectation would imply the collector depends on it, and it does
+        // not: ownership and joining both use the connection tuple.
+        for name in ["tcp_probe", "tcp_retransmit_skb"] {
+            let spec = EVENTS
+                .iter()
+                .find(|spec| spec.category == "tcp" && spec.name == name)
+                .unwrap();
             assert!(
-                error.to_string().contains("skaddr"),
-                "the error must name the missing field: {error}"
+                spec.fields.iter().all(|field| field.name != "skaddr"),
+                "{name} must not require a kernel pointer"
             );
         }
     }

@@ -14,7 +14,7 @@ found through `/proc/<pid>/task` and re-synchronized during collection. Use
 | `io` | Measure block I/O latency by device and operation. |
 | `off-cpu` | Measure waits and blocking stacks. |
 | `memory` | Measure faults, reclaim, PSI, and swap pressure. |
-| `net` | Report TCP measurement availability. |
+| `net` | Measure TCP RTT, retransmissions and connection setup for owned connections. |
 | `daemon` | Keep a rolling window and write incident bundles. |
 
 All commands take `--pid` and `--format text|json`. Single-shot commands
@@ -136,17 +136,37 @@ use per-second units (`_per_s`), and byte counts use bytes (`_bytes`).
 
 Unavailable measurements in v2 can be `null`; do not interpret `null` as zero:
 
-- `net` reports `tcp_available: false`, `samples: null`,
-  `retransmissions: null`, and an empty `endpoints` array.
-- `diagnose` reports `data.measured.tcp_available: false`, with
-  `net_samples` and `retrans_ratio` set to `null`. It does not score packet
-  loss; independently measured off-CPU socket waits can contribute to a
-  network cause.
-- Daemon intervals report `tcp_available: false` and `retrans: null`.
+- `net` reports `tcp_available` as whether ownership was established, not
+  whether traffic happened. A target that holds no TCP socket is available
+  with `samples: 0` and an empty `endpoints` array; `tcp_reason` explains every
+  unavailable measurement when attribution itself failed.
+- `net` endpoints are per-direction connections keyed by 5-tuple. `role` is
+  `client` for a connection the target opened and `server` for one accepted on
+  a listener it owns; `origin` is `created` when this run saw the connection
+  created and `seeded` when the target's descriptor table is the evidence.
+  `ownership_verified` is always true for a published row: an unverified row is
+  dropped and counted in `attribution.unverified_endpoints`.
+- `connection_latency` covers client handshakes only. Accepted sockets and
+  pre-existing connections have no observable start, so `available` is false
+  with a reason instead of a zero.
+- `retrans_ratio` is always `null`: the tracepoints carry no
+  transmitted-segment denominator. Use `retransmissions` and
+  `retransmissions_per_second`.
+- `attribution` states how many endpoints were excluded because the target
+  stopped holding the socket, how many owner records the kernel dropped, and
+  how many events had no owner.
+- `diagnose` reports `data.measured.tcp_available` and `tcp_reason`, plus
+  `net_rtt_p95_us`, `net_connect_p95_us`, `net_connects`,
+  `net_connect_failures`, `retrans_per_second`. All TCP fields are `null` when
+  attribution is unavailable, and the ranking then falls back to
+  independently measured off-CPU socket waits.
+- Daemon intervals report `tcp_available`, `tcp_reason`, `retrans` (null when
+  attribution is unavailable), `net_rtt_p95_us`, `net_connect_p95_us`,
+  `net_connects`, and `net_connect_failures`.
   `cpu_percent` is `null` when process accounting is unavailable. A failed
   `/proc` read breaks the baseline; the next successful read starts a new one.
-  CPU triggers do not fire on `null`; values above 100 are valid for a
-  multithreaded process.
+  CPU and retransmission triggers do not fire on `null`; values above 100 are
+  valid for a multithreaded process.
 
 Incident `manifest.json`, `complete.json`, and `diagnosis.json` use v2;
 `intervals.json` is an array identified by the manifest's schema. The recorder
@@ -179,11 +199,11 @@ or a skipped check is never evidence of support.
 
 | CI cell | Kernel | Scheduler, CPU, block I/O, off-CPU, memory | TCP attribution |
 | --- | --- | --- | --- |
-| `6.1.191` | 6.1.191 | supported | unavailable |
-| `6.6.161` | 6.6.161 | supported | unavailable |
-| `6.12.115` | 6.12.115 | supported | unavailable |
-| `7.2.15` | 7.2.15 | supported | unavailable |
-| `6.12.115-nopsi` | 6.12.115 | supported; PSI unavailable is explicit | unavailable |
+| `6.1.191` | 6.1.191 | supported | supported |
+| `6.6.161` | 6.6.161 | supported | supported |
+| `6.12.115` | 6.12.115 | supported | supported |
+| `7.2.15` | 7.2.15 | supported | supported |
+| `6.12.115-nopsi` | 6.12.115 | supported; PSI unavailable is explicit | supported |
 
 Layout fixtures also exist for 6.12.105 and 7.2.0-rc6, the kernels that were
 validated before the matrix was introduced. They are retained as regression
@@ -191,10 +211,9 @@ fixtures for the same layout family as 6.12.115 and 7.2.15, but they are not
 separate CI cells and are not advertised as independently supported cells.
 
 The layout fixtures record the exact consumed tracepoint fields for each
-kernel. 6.1 and 6.6 expose `tcp_probe` without an `skaddr` field, so the
-existing TCP profile is not applicable there; TCP is disabled on every kernel
-for the ownership reason below, and the matrix therefore tests the non-TCP
-collectors. PSI is enabled in the matrix profiles, and the separate 6.12.115
+kernel. 6.1 and 6.6 expose `tcp_probe` without an `skaddr` field; the collector
+does not read that field, because ownership and the event join both use the
+connection tuple, so those kernels are supported for TCP as well. PSI is enabled in the matrix profiles, and the separate 6.12.115
 `nopsi` cell proves that missing memory pressure information is reported as
 unavailable rather than as zero.
 
@@ -216,18 +235,25 @@ refresh procedure are in [the gate policy](benchmark-gates.md).
 
 ### TCP attribution
 
-TCP RTT and retransmission attribution is disabled. `tcp_probe` can run on the
-receive path in softirq context, where the current task need not own the
-socket. The retransmission tracepoint supplies a socket pointer without a
-socket cookie; pointers can be reused, and even a cookie alone does not prove
-ownership for shared or transferred sockets. Neither current task nor a
-remembered pointer establishes ownership.
+A TCP measurement is published only for a connection whose owner is proven:
+either the target's own thread group created it (`connect`, `listen`) or the
+target holds its descriptor according to `/proc/<pid>/fd` and
+`/proc/<pid>/net/tcp{,6}`. The join key is the connection 5-tuple, never a
+kernel pointer, and the record is removed when the socket closes. An unrelated
+process, a pre-existing connection that was handed away, and an address whose
+listener has more than one owner are reported as unattributed rather than
+guessed at.
 
-The TCP tracepoint programs are not attached and emit no events. Omitted TCP
-events cannot be counted per target without reliable attribution, and perf
-loss counts do not include those omissions. Restoring this feature requires a
-verified ownership source and socket lifetime identity covering sharing, exit,
-destruction, and reuse, plus corresponding lifecycle tests. The
-[ownership design](tcp-ownership-design.md) records the candidate sources, the
-prototype result, and the evidence required before enabling; the prototype did
-not establish positive attribution, so the feature remains off.
+Measurement limits, all stated in the output:
+
+- RTT samples come from `tcp_probe`'s smoothed RTT, at most one per connection
+  per 10 ms. `samples` counts those samples, not packets.
+- Retransmissions are counted from `tcp_retransmit_skb`; there is no
+  transmitted-segment denominator, so no ratio is reported.
+- Connection setup latency covers client handshakes only. Accepted sockets
+  have no observable handshake start.
+- A busy host costs a short map lookup per TCP state change in the namespace;
+  the benchmark gate measures the collector's own overhead.
+
+The [ownership design](tcp-ownership-design.md) records the evidence rules,
+the kernel objects, and the unavailable cases in full.

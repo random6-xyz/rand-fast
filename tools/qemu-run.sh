@@ -24,7 +24,7 @@
 #   RANK_REPETITIONS  runs per scenario when RANK_EVAL=1 (default 3)
 #   QEMU_TIMEOUT  seconds before the guest is killed (default 1800)
 #   ACCEL      auto, kvm or tcg (default auto: KVM when /dev/kvm is usable)
-#   QEMU_SMOKE_CASE  all or tcp-unavailable (default all)
+#   QEMU_SMOKE_CASE  all or tcp-ownership (default all)
 #
 # Exit status: 0 when the guest smoke run succeeded, 1 otherwise.
 set -u
@@ -49,7 +49,7 @@ BENCH_DURATION=${BENCH_DURATION:-3s}
 BENCH_REPETITIONS=${BENCH_REPETITIONS:-1}
 BENCH_WARMUP=${BENCH_WARMUP:-0}
 BENCH_MODES=${BENCH_MODES:-cpu,io,lock,net}
-case "$QEMU_SMOKE_CASE" in all|tcp-unavailable|bench) ;; *) echo "qemu-run: invalid QEMU_SMOKE_CASE" >&2; exit 2 ;; esac
+case "$QEMU_SMOKE_CASE" in all|tcp-ownership|bench) ;; *) echo "qemu-run: invalid QEMU_SMOKE_CASE" >&2; exit 2 ;; esac
 KEEP=0
 
 while [ "$#" -gt 0 ]; do
@@ -278,7 +278,7 @@ fi
 printf '\n===== guest summary =====\n'
 grep -E '^guest:|^=== .* (format|MISSING|present|available)' "$LOG" 2>/dev/null \
     | sed 's/^/  /'
-grep -E '^(TCP unavailable contract:|TCP verifier:|=== smoke run finished with rc=)' "$LOG" 2>/dev/null | sed 's/^/  /'
+grep -E '^(TCP ownership contract:|=== smoke run finished with rc=)' "$LOG" 2>/dev/null | sed 's/^/  /'
 
 printf '\n===== smoke reports =====\n'
 sed -n '/^=== reports ===/,$p' "$LOG" 2>/dev/null \
