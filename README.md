@@ -33,10 +33,10 @@ retransmission ratio is reported.
 
 Prebuilt archives target Linux x86_64 and embed the eBPF object. Pick a version
 from [GitHub Releases](https://github.com/random6-xyz/rand-fast/releases/latest)
-and replace `v0.2.1` below with that tag.
+and replace `v0.3.0` below with that tag.
 
 ```bash
-VERSION=v0.2.1
+VERSION=v0.3.0
 BASE_URL="https://github.com/random6-xyz/rand-fast/releases/download/${VERSION}"
 ARCHIVE="rand-fast-${VERSION}-linux-x86_64.tar.gz"
 

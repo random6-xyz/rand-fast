@@ -357,7 +357,7 @@ dependencies = [
 
 [[package]]
 name = "fast"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "aya",
@@ -375,7 +375,7 @@ dependencies = [
 
 [[package]]
 name = "fast-bench"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -387,7 +387,7 @@ dependencies = [
 
 [[package]]
 name = "fast-common"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "aya",
  "bytemuck",
@@ -395,7 +395,7 @@ dependencies = [
 
 [[package]]
 name = "fast-ebpf"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "aya-ebpf",
  "fast-common",
@@ -403,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "fast-workload"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "clap",
  "humantime",
@@ -649,7 +649,7 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "sched-workload"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "clap",
  "humantime",
