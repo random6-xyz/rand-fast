@@ -551,6 +551,18 @@ pub struct DaemonArgs {
     #[arg(long, default_value = "off", value_name = "PERCENT|off")]
     pub trigger_cpu: PercentThreshold,
 
+    /// Minimum time between written incidents; `0s` writes every firing interval.
+    ///
+    /// A trigger that stays above its threshold fires on every interval, and
+    /// each firing would write a bundle from the same window. That is premature
+    /// beats rather than evidence: on a host that is over the line for ten
+    /// minutes, dozens of near-identical bundles say nothing more than one.
+    /// Intervals inside the cooldown are still recorded and their signals still
+    /// counted, and the next bundle's window contains them, so throttling drops
+    /// duplicate reports, not measurements.
+    #[arg(long, default_value = "60s", value_name = "DURATION", value_parser = parse_daemon_duration)]
+    pub min_incident_interval: Duration,
+
     /// Incident output (root: /var/lib/rand-fast/incidents; otherwise: $HOME/.local/state/rand-fast/incidents).
     ///
     /// The path must have trusted owners, no symlinks, and no group/other-writable
@@ -695,6 +707,41 @@ mod tests {
             panic!("expected daemon command");
         };
         assert_eq!(args.duration, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn incident_cooldown_defaults_to_a_minute_and_accepts_zero() {
+        let cli = Cli::try_parse_from(["fast", "daemon", "--pid", "123"]).unwrap();
+        let Command::Daemon(args) = cli.command else {
+            panic!("expected daemon command");
+        };
+        assert_eq!(args.min_incident_interval, Duration::from_secs(60));
+
+        let cli = Cli::try_parse_from([
+            "fast",
+            "daemon",
+            "--pid",
+            "123",
+            "--min-incident-interval",
+            "0s",
+        ])
+        .unwrap();
+        let Command::Daemon(args) = cli.command else {
+            panic!("expected daemon command");
+        };
+        assert_eq!(args.min_incident_interval, Duration::ZERO);
+
+        assert!(
+            Cli::try_parse_from([
+                "fast",
+                "daemon",
+                "--pid",
+                "123",
+                "--min-incident-interval",
+                "soon",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

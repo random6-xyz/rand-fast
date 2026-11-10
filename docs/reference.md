@@ -59,11 +59,24 @@ trigger fires:
 | `--trigger-psi-full` | `5` | Memory PSI full, percent. |
 | `--trigger-cpu` | `off` | CPU usage as a percentage of one CPU. |
 | `--trigger-retrans` | `8` | Unavailable; cannot fire without TCP attribution. |
+| `--min-incident-interval` | `60s` | Minimum time between written incidents. |
 
 Use `off` to disable an individual trigger. The recorder warns when the
 unavailable retransmission trigger is configured; pass `--trigger-retrans off`
 to silence the warning. `--restore` defaults to `true` and controls whether
 history from a previous run is restored.
+
+`--min-incident-interval` bounds how often a trigger that stays above its
+threshold can produce a bundle. Without it a trigger firing every interval
+writes a bundle every interval, each covering nearly the same window, which
+costs writing and says nothing new. Intervals inside the cooldown are still
+recorded, their signals are still counted in `incidents written`, and the next
+bundle's window contains them; the report prints how many firing intervals the
+cooldown held back. `0s` writes every firing interval. A cooldown longer than
+`--window` would let a throttled interval roll out of the window before the next
+bundle could contain it, so it is shortened to the window and the recorder says
+so on startup. The cooldown is per run: a restarted recorder may write one
+bundle as soon as it trips, even if the previous run wrote one a moment before.
 
 Each interval's scheduler p95 and I/O p99 use its own samples, and slow-sample
 lists reset at the interval boundary. A bounded histogram reports a bucket

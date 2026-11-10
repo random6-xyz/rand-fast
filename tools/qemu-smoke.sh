@@ -1383,8 +1383,11 @@ check_daemon_storage() {
     # acceptance criterion and because it is the case that matters: a process
     # killed mid-write is exactly what the completion marker exists to detect,
     # and a restart after a clean exit never exercises that path.
+    # The cooldown is off here on purpose: this check is about rotation, so the
+    # run has to write more bundles than the cap can hold.
     "$FAST" daemon --pid "$target_pid" --duration 300s \
         --interval 1s --window 120s --output "$dir" --max-disk-bytes "$cap" \
+        --min-incident-interval 0s \
         --trigger-sched-p95 100us \
         --trigger-io-p99 off --trigger-retrans off \
         --trigger-psi-some off --trigger-psi-full off \
@@ -1709,6 +1712,7 @@ check_incidents() {
         sleep 0.3
         "$FAST" daemon --pid "$target_pid" --duration 6s \
             --interval 1s --window 30s --output "$capped" --max-incidents 1 \
+            --min-incident-interval 0s \
             --trigger-sched-p95 100us \
             --trigger-io-p99 off --trigger-retrans off \
             --trigger-psi-some off --trigger-psi-full off --trigger-cpu off \
@@ -1729,7 +1733,59 @@ check_incidents() {
         return
     fi
 
-    echo "incidents: listed, showed, summarized, exported and capped"
+    # A trigger that stays hot must not write a bundle per interval. Same
+    # fixture, default cooldown: one bundle has to cover the episode, and the
+    # report has to say how many firing intervals it held back.
+    local cooled="$OUT_DIR/incidents-cooled"
+    rm -rf "$cooled"
+    mkdir -p "$cooled"
+    "$FAST_WORKLOAD" lock-hog --duration 20s --workers 32 >/dev/null 2>&1 &
+    target_pid=$!
+    sleep 0.3
+    "$FAST" daemon --pid "$target_pid" --duration 8s \
+        --interval 1s --window 60s --output "$cooled" \
+        --trigger-sched-p95 100us \
+        --trigger-io-p99 off --trigger-retrans off \
+        --trigger-psi-some off --trigger-psi-full off --trigger-cpu off \
+        >"$OUT_DIR/incidents-cooldown.txt" 2>&1 || true
+    kill "$target_pid" 2>/dev/null
+    wait "$target_pid" 2>/dev/null
+    local cooled_count
+    cooled_count=$(count_bundles "$cooled")
+    if [ "$cooled_count" -ne 1 ]; then
+        echo "incidents cooldown: FAIL (wrote $cooled_count bundles for one hot trigger, expected 1)"
+        ls -la "$cooled" 2>/dev/null | sed 's/^/    /' >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if ! grep -q 'firing intervals inside the' "$OUT_DIR/incidents-cooldown.txt"; then
+        echo "incidents cooldown: FAIL (the report does not say how many firing intervals it throttled)"
+        sed -n '/^Triggers/,+12p' "$OUT_DIR/incidents-cooldown.txt" | sed 's/^/    /' >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    # A cooldown longer than the window is shortened, because the throttled
+    # intervals would otherwise roll out before the next bundle contains them.
+    "$FAST_WORKLOAD" lock-hog --duration 6s --workers 32 >/dev/null 2>&1 &
+    target_pid=$!
+    sleep 0.3
+    "$FAST" daemon --pid "$target_pid" --duration 3s \
+        --interval 1s --window 10s --output "$cooled" \
+        --min-incident-interval 600s \
+        --trigger-sched-p95 100us \
+        --trigger-io-p99 off --trigger-retrans off \
+        --trigger-psi-some off --trigger-psi-full off --trigger-cpu off \
+        >"$OUT_DIR/incidents-cooldown-clamped.txt" 2>&1 || true
+    kill "$target_pid" 2>/dev/null
+    wait "$target_pid" 2>/dev/null
+    if ! grep -q 'longer than the 10s window' "$OUT_DIR/incidents-cooldown-clamped.txt"; then
+        echo "incidents cooldown: FAIL (a cooldown longer than the window was not reported as shortened)"
+        sed 's/^/    /' "$OUT_DIR/incidents-cooldown-clamped.txt" | head -10 >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    echo "incidents: listed, showed, summarized, exported, capped and cooled down"
 }
 
 check_daemon_triggers() {

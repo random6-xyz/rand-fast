@@ -30,8 +30,15 @@ sudo systemctl enable --now rand-fast@1234
 ```
 
 The unit runs as root with `StateDirectory=rand-fast`, so bundles land in
-`/var/lib/rand-fast/incidents`, and keeps the newest 200 bundles. Restarting
-the unit restores the previous window when it can.
+`/var/lib/rand-fast/incidents`, and keeps the newest 200 bundles. It writes at
+most one bundle a minute (`--min-incident-interval 60s`, the default), so a
+trigger that stays hot for ten minutes produces ten bundles rather than six
+hundred near-identical ones. Raise the interval on a host whose
+slow episodes last minutes, and set `0s` only when every firing interval has to
+be a separate bundle. A value longer than `--window` is shortened to the window,
+because a throttled interval reaches the next bundle only while it is still in
+the window; the recorder warns when it shortens one. Restarting the unit
+restores the previous window when it can.
 
 A recorder is tied to a process ID, which is not stable across a redeploy.
 Start a new instance with the new PID and stop the old one; do not point two
