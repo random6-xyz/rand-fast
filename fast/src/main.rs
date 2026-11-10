@@ -2,7 +2,10 @@ mod cli;
 mod collector;
 mod cpu;
 mod daemon;
+mod daemon_storage;
 mod diagnose;
+mod incident_store;
+mod incidents;
 mod io;
 mod io_request_layout;
 mod json;
@@ -21,6 +24,7 @@ mod tcp;
 mod tcp_ownership;
 mod tracepoint_layout;
 mod trigger;
+mod utc;
 
 use std::process::ExitCode;
 
@@ -48,6 +52,7 @@ fn run() -> anyhow::Result<()> {
         Command::Memory(args) => memory::run(args),
         Command::Diagnose(args) => diagnose::run(args),
         Command::Daemon(args) => daemon::run(args),
+        Command::Incidents(args) => incidents::run(args.command),
         Command::Debug(args) => tcp_ownership::run_debug(args),
     }
 }
