@@ -1,0 +1,37 @@
+# Starts one flight recorder per supervised process.
+#
+# The instance name is the process ID to observe:
+#
+#   systemctl enable --now rand-fast@1234
+#
+# A PID is not stable across a redeploy; stop the old instance and start a new
+# one with the new PID rather than pointing two recorders at one directory.
+[Unit]
+Description=rand-fast flight recorder for PID %i
+Documentation=https://github.com/random6-xyz/rand-fast/blob/main/docs/operations.md
+After=systemd-modules-load.service
+ConditionPathExists=/proc/%i
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fast daemon --pid %i --max-incidents 200 --trigger-retrans off
+Restart=on-failure
+RestartSec=5s
+StateDirectory=rand-fast
+StateDirectoryMode=0700
+User=root
+# The recorder needs to load eBPF and read perf events, and on kernels before
+# 5.8 it also needs CAP_SYS_ADMIN to do so. It reads the target's descriptors
+# and socket tables, so it cannot be confined away from /proc.
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_ADMIN CAP_SYS_RESOURCE
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+LockPersonality=yes
+# One perf event per observed thread, plus the ring buffers.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

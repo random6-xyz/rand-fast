@@ -47,6 +47,14 @@ The gate succeeds only when the script exits zero. The eBPF verifier and real
 kernel behavior require the separate QEMU gate below; a host-only gate is not a
 substitute for it.
 
+The incident reader is covered twice: unit tests build bundles in temporary
+directories (complete, incomplete, legacy, damaged, symlinked, oversized, and
+permission-denied) and assert that each is reported with its own reason, and
+the QEMU smoke matrix's `check_incidents` case produces a real bundle in the
+guest, then lists, shows, summarizes, exports, and caps it. The reader is not
+an eBPF consumer, so its unit tests are the primary coverage; the guest case
+proves it reads what the real recorder writes.
+
 ### Diagnosis scenarios
 
 `tools/scenarios.json` is the single source of truth for the diagnosis matrix:

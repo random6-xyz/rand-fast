@@ -19,8 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[path = "daemon_storage.rs"]
-mod storage;
+use crate::daemon_storage as storage;
 use anyhow::{Context, Result};
 use aya::{Ebpf, include_bytes_aligned};
 use fast_common::{
@@ -216,10 +215,21 @@ fn write_incident(
     let total_entries = ring.entries().count();
     let carried = total_entries.min(BUNDLE_MAX_INTERVALS);
 
+    // `entry.at` is elapsed time, which places an incident inside its own
+    // recording but not in an operator's day. Both absolute ends are recorded
+    // now, while the clock is still the one the trigger was observed with.
+    // Whole seconds: a bundle's name is second-granular anyway, and a
+    // fractional rendering would make identical bundles differ in size.
+    let recorded_at_unix_s = crate::utc::now_unix_seconds().map(f64::floor);
+    let recording_started_unix_s =
+        recorded_at_unix_s.map(|now| (now - entry.at.as_secs_f64()).floor());
+
     let manifest = serde_json::json!({
         "schema": DAEMON_SCHEMA,
         "command": "daemon.incident",
         "recorded_at_s": entry.at.as_secs_f64(),
+        "recorded_at_unix_s": recorded_at_unix_s,
+        "recording_started_unix_s": recording_started_unix_s,
         "process": { "pid": args.pid },
         "triggered_by": entry
             .fired
@@ -289,7 +299,14 @@ fn write_incident(
     // contention was looked for and not found".
     let diagnosis = diagnose_from(&entry, args.pid, slow);
     directory.json("diagnosis.json", &diagnosis)?;
-    directory.write("summary.txt", &incident_text(&entry, triggers, &diagnosis))?;
+    let mut summary = incident_text(&entry, triggers, &diagnosis);
+    if let Some(recorded) = recorded_at_unix_s {
+        summary.insert_str(
+            0,
+            &format!("Recorded at {}\n", crate::utc::timestamp(recorded)),
+        );
+    }
+    directory.write("summary.txt", &summary)?;
 
     // Written last, and on its own, so a bundle is either complete or absent
     // rather than a directory that looks finished and is not.
@@ -306,7 +323,11 @@ fn write_incident(
             ],
         }),
     )?;
-    let rotation_error = match output.rotate(args.max_disk_bytes, directory.name()) {
+    let rotation_error = match output.rotate(
+        args.max_disk_bytes,
+        args.max_incidents,
+        directory.name(),
+    ) {
         Ok(state) => {
             if state.unknown {
                 eprintln!(
@@ -367,8 +388,22 @@ fn directory_total(dir: &std::path::Path) -> Option<u64> {
     size(dir)
 }
 
+/// States the retention policy in the terms the recorder applies it.
+fn retention(max_disk_bytes: u64, max_incidents: Option<usize>) -> String {
+    match max_incidents {
+        Some(count) => format!(
+            "at most {count} bundles and {} in total, oldest dropped first",
+            human_bytes(max_disk_bytes)
+        ),
+        None => format!(
+            "kept under {} by dropping the oldest bundles",
+            human_bytes(max_disk_bytes)
+        ),
+    }
+}
+
 /// A byte count in the largest unit that leaves the number readable.
-fn human_bytes(bytes: u64) -> String {
+pub(crate) fn human_bytes(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = 1024 * 1024;
     const GIB: u64 = 1024 * 1024 * 1024;
@@ -1284,6 +1319,7 @@ pub fn run(args: DaemonArgs) -> Result<()> {
             state.incident_write_failed,
             &state.restored,
             args.max_disk_bytes,
+            args.max_incidents,
         );
     }
     Ok(())
@@ -1660,6 +1696,7 @@ fn print_summary(
     incident_write_failed: bool,
     restored: &Restored,
     max_disk_bytes: u64,
+    max_incidents: Option<usize>,
 ) {
     println!("Flight recorder for {name} ({pid})");
     println!("Measurement: {MEASUREMENT_SEMANTICS}");
@@ -1684,9 +1721,9 @@ fn print_summary(
     }
     println!("Intervals recorded: {ticks}");
     println!(
-        "Output: {} (kept under {} by dropping the oldest bundles)",
+        "Output: {} ({})",
         args.output.display(),
-        human_bytes(max_disk_bytes)
+        retention(max_disk_bytes, max_incidents)
     );
     println!();
     println!("Overhead budget");
@@ -2519,6 +2556,7 @@ mod tests {
             trigger_cpu: "off".parse().expect("threshold"),
             output: output.to_path_buf(),
             max_disk_bytes: 512 * 1024 * 1024,
+            max_incidents: None,
             restore: true,
             format: crate::cli::FormatArg {
                 format: Format::Text,
@@ -2569,6 +2607,21 @@ mod tests {
         .expect("parse manifest");
 
         assert_eq!(manifest["schema"], "rand-fast/v2");
+        // The absolute time is recorded beside the elapsed one: a bundle that
+        // only says "11s into the recording" cannot be placed on a timeline.
+        let recorded = manifest["recorded_at_unix_s"]
+            .as_f64()
+            .expect("recorded wall clock");
+        let started = manifest["recording_started_unix_s"]
+            .as_f64()
+            .expect("recording start");
+        let elapsed = manifest["recorded_at_s"]
+            .as_f64()
+            .expect("elapsed recording time");
+        assert!(
+            (recorded - started - elapsed).abs() < 1.0,
+            "absolute time agrees with elapsed time"
+        );
         assert_eq!(manifest["interval"]["tcp_available"], false);
         assert!(manifest["interval"]["retrans"].is_null());
         let triggered = &manifest["triggered_by"];
@@ -2594,8 +2647,30 @@ mod tests {
         assert_eq!(intervals.as_array().map(Vec::len), Some(1));
 
         let text = std::fs::read_to_string(bundle.join("summary.txt")).expect("read summary");
+        assert!(
+            text.starts_with("Recorded at 20"),
+            "summary states the wall clock: {text}"
+        );
         assert!(text.contains("io_p99"), "summary names the trigger: {text}");
         assert!(text.contains("900000"), "summary states the value: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_count_cap_keeps_the_newest_bundles_only() {
+        let dir = temp_dir("count_cap");
+        let mut args = default_args(&dir);
+        args.max_incidents = Some(1);
+        let triggers = Triggers::from_args(&args);
+        let ring = Ring::new(Duration::from_secs(60), Duration::from_secs(1));
+        let slow = SlowSamples {
+            sched_us: vec![],
+            io_us: vec![],
+        };
+        write_incident(&ring, slow_io_entry(), &triggers, &args, &slow).expect("first");
+        write_incident(&ring, slow_io_entry(), &triggers, &args, &slow).expect("second");
+        let count = std::fs::read_dir(&dir).expect("read output dir").count();
+        assert_eq!(count, 1, "only the newest bundle is kept");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
