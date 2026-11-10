@@ -1704,17 +1704,20 @@ check_incidents() {
     # newest bundle and remove the older ones rather than stopping the recorder.
     # The CPU trigger drives this check, not the scheduler one: rotation has to
     # be proven under a trigger that fires on every interval, and under emulation
-    # the scheduler percentile only has samples on a fraction of the intervals,
-    # so a short run could fire once or not at all and prove nothing.
+    # the scheduler percentile only has samples on a fraction of the intervals.
+    # The run is longer than the other incident checks because a CPU percentage
+    # needs a previous /proc snapshot to compare against, so the first interval
+    # of a run can never fire it, and an interval under emulation can take
+    # several seconds of wall clock.
     local capped="$OUT_DIR/incidents-capped"
     rm -rf "$capped"
     mkdir -p "$capped"
     local run=1
     while [ "$run" -le 2 ]; do
-        "$FAST_WORKLOAD" lock-hog --duration 8s --workers 32 >/dev/null 2>&1 &
+        "$FAST_WORKLOAD" lock-hog --duration 25s --workers 32 >/dev/null 2>&1 &
         target_pid=$!
         sleep 0.3
-        "$FAST" daemon --pid "$target_pid" --duration 6s \
+        "$FAST" daemon --pid "$target_pid" --duration 20s \
             --interval 1s --window 30s --output "$capped" --max-incidents 1 \
             --min-incident-interval 0s \
             --trigger-cpu 5 \
@@ -1743,10 +1746,10 @@ check_incidents() {
     local cooled="$OUT_DIR/incidents-cooled"
     rm -rf "$cooled"
     mkdir -p "$cooled"
-    "$FAST_WORKLOAD" lock-hog --duration 20s --workers 32 >/dev/null 2>&1 &
+    "$FAST_WORKLOAD" lock-hog --duration 30s --workers 32 >/dev/null 2>&1 &
     target_pid=$!
     sleep 0.3
-    "$FAST" daemon --pid "$target_pid" --duration 12s \
+    "$FAST" daemon --pid "$target_pid" --duration 20s \
         --interval 1s --window 60s --output "$cooled" \
         --trigger-cpu 5 \
         --trigger-sched-p95 off --trigger-io-p99 off --trigger-retrans off \
@@ -1770,10 +1773,10 @@ check_incidents() {
     fi
     # A cooldown longer than the window is shortened, because the throttled
     # intervals would otherwise roll out before the next bundle contains them.
-    "$FAST_WORKLOAD" lock-hog --duration 10s --workers 32 >/dev/null 2>&1 &
+    "$FAST_WORKLOAD" lock-hog --duration 12s --workers 32 >/dev/null 2>&1 &
     target_pid=$!
     sleep 0.3
-    "$FAST" daemon --pid "$target_pid" --duration 5s \
+    "$FAST" daemon --pid "$target_pid" --duration 8s \
         --interval 1s --window 10s --output "$cooled" \
         --min-incident-interval 600s \
         --trigger-cpu 5 \
