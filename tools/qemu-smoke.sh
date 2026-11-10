@@ -1702,6 +1702,10 @@ check_incidents() {
 
     # The count cap is the policy knob an operator sets; it has to keep the
     # newest bundle and remove the older ones rather than stopping the recorder.
+    # The CPU trigger drives this check, not the scheduler one: rotation has to
+    # be proven under a trigger that fires on every interval, and under emulation
+    # the scheduler percentile only has samples on a fraction of the intervals,
+    # so a short run could fire once or not at all and prove nothing.
     local capped="$OUT_DIR/incidents-capped"
     rm -rf "$capped"
     mkdir -p "$capped"
@@ -1713,9 +1717,9 @@ check_incidents() {
         "$FAST" daemon --pid "$target_pid" --duration 6s \
             --interval 1s --window 30s --output "$capped" --max-incidents 1 \
             --min-incident-interval 0s \
-            --trigger-sched-p95 100us \
-            --trigger-io-p99 off --trigger-retrans off \
-            --trigger-psi-some off --trigger-psi-full off --trigger-cpu off \
+            --trigger-cpu 5 \
+            --trigger-sched-p95 off --trigger-io-p99 off --trigger-retrans off \
+            --trigger-psi-some off --trigger-psi-full off \
             >>"$OUT_DIR/incidents-count-cap.txt" 2>&1 &
         daemon_pid=$!
         wait_for_bundles "$capped" 1 60 || true
@@ -1742,11 +1746,11 @@ check_incidents() {
     "$FAST_WORKLOAD" lock-hog --duration 20s --workers 32 >/dev/null 2>&1 &
     target_pid=$!
     sleep 0.3
-    "$FAST" daemon --pid "$target_pid" --duration 8s \
+    "$FAST" daemon --pid "$target_pid" --duration 12s \
         --interval 1s --window 60s --output "$cooled" \
-        --trigger-sched-p95 100us \
-        --trigger-io-p99 off --trigger-retrans off \
-        --trigger-psi-some off --trigger-psi-full off --trigger-cpu off \
+        --trigger-cpu 5 \
+        --trigger-sched-p95 off --trigger-io-p99 off --trigger-retrans off \
+        --trigger-psi-some off --trigger-psi-full off \
         >"$OUT_DIR/incidents-cooldown.txt" 2>&1 || true
     kill "$target_pid" 2>/dev/null
     wait "$target_pid" 2>/dev/null
@@ -1766,15 +1770,15 @@ check_incidents() {
     fi
     # A cooldown longer than the window is shortened, because the throttled
     # intervals would otherwise roll out before the next bundle contains them.
-    "$FAST_WORKLOAD" lock-hog --duration 6s --workers 32 >/dev/null 2>&1 &
+    "$FAST_WORKLOAD" lock-hog --duration 10s --workers 32 >/dev/null 2>&1 &
     target_pid=$!
     sleep 0.3
-    "$FAST" daemon --pid "$target_pid" --duration 3s \
+    "$FAST" daemon --pid "$target_pid" --duration 5s \
         --interval 1s --window 10s --output "$cooled" \
         --min-incident-interval 600s \
-        --trigger-sched-p95 100us \
-        --trigger-io-p99 off --trigger-retrans off \
-        --trigger-psi-some off --trigger-psi-full off --trigger-cpu off \
+        --trigger-cpu 5 \
+        --trigger-sched-p95 off --trigger-io-p99 off --trigger-retrans off \
+        --trigger-psi-some off --trigger-psi-full off \
         >"$OUT_DIR/incidents-cooldown-clamped.txt" 2>&1 || true
     kill "$target_pid" 2>/dev/null
     wait "$target_pid" 2>/dev/null
