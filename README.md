@@ -33,10 +33,10 @@ retransmission ratio is reported.
 
 Prebuilt archives target Linux x86_64 and embed the eBPF object. Pick a version
 from [GitHub Releases](https://github.com/random6-xyz/rand-fast/releases/latest)
-and replace `v0.3.0` below with that tag.
+and replace `v0.4.0` below with that tag.
 
 ```bash
-VERSION=v0.3.0
+VERSION=v0.4.0
 BASE_URL="https://github.com/random6-xyz/rand-fast/releases/download/${VERSION}"
 ARCHIVE="rand-fast-${VERSION}-linux-x86_64.tar.gz"
 
@@ -69,13 +69,30 @@ sudo ./fast daemon --pid 1234 --trigger-retrans off
 ```
 
 The daemon runs until interrupted or the target exits; `--duration` can bound
-it. See the [reference](docs/reference.md) for command options, output formats,
-incident storage, and measurement limitations. Run `./fast --help` or
+it. `--max-incidents` and `--max-disk-bytes` bound what it keeps.
+
+Read what it recorded:
+
+```bash
+sudo fast incidents list --since 24h
+sudo fast incidents show latest
+sudo fast incidents export latest --format markdown --output incident.md
+```
+
+These commands are read-only and report unavailable measurements as
+unavailable, never as zero. A bundle written before v0.4.0 carries no wall
+clock; it is reported that way rather than dated from its file timestamp.
+
+See the [reference](docs/reference.md) for command options, JSON output,
+incident storage, and measurement limitations, and
+[operations](docs/operations.md) for running the recorder under systemd and
+reading it on a production host. Run `./fast --help` or
 `./fast <command> --help` for the complete CLI options.
 
 ## Documentation
 
 - [Reference](docs/reference.md): commands, JSON, incident storage, and limits.
+- [Operations](docs/operations.md): running the recorder and reading incidents.
 - [Development](docs/development.md): project structure, building, and QEMU
   verification.
 

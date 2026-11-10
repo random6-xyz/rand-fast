@@ -37,9 +37,143 @@ pub enum Command {
     Diagnose(DiagnoseArgs),
     /// Flight recorder daemon.
     Daemon(DaemonArgs),
+    /// Read incidents recorded by the daemon.
+    Incidents(IncidentsArgs),
     /// Inspect the evidence rand-fast uses, without running a collector.
     #[command(hide = true)]
     Debug(DebugArgs),
+}
+
+/// The incident commands, all read-only.
+///
+/// They share a directory default and nothing else: a listing, a single
+/// bundle, an export and an aggregate are different enough that one flag set
+/// with three modes would document the wrong thing.
+#[derive(Debug, Clone, Args)]
+pub struct IncidentsArgs {
+    #[command(subcommand)]
+    pub command: IncidentsCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum IncidentsCommand {
+    /// List recorded incidents, newest first.
+    List(IncidentListArgs),
+    /// Print one recorded incident in full.
+    Show(IncidentShowArgs),
+    /// Write one incident to a file or standard output.
+    Export(IncidentExportArgs),
+    /// Summarize what the incident directory still holds.
+    Summary(IncidentSummaryArgs),
+}
+
+/// The incident directory a read command inspects.
+#[derive(Debug, Clone, Args)]
+pub struct IncidentDirArg {
+    /// Incident directory (root: /var/lib/rand-fast/incidents; otherwise: $HOME/.local/state/rand-fast/incidents).
+    #[arg(long, default_value_os_t = default_daemon_output(), value_name = "PATH")]
+    pub dir: std::path::PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct IncidentListArgs {
+    /// How many incidents to list (0 for all).
+    #[arg(long, default_value_t = 20, value_name = "N")]
+    pub limit: usize,
+
+    /// Only incidents recorded within this window, for example 24h or 7days.
+    #[arg(long, value_name = "DURATION", value_parser = parse_since)]
+    pub since: Option<Duration>,
+
+    #[command(flatten)]
+    pub dir: IncidentDirArg,
+
+    #[command(flatten)]
+    pub format: FormatArg,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct IncidentShowArgs {
+    /// Incident name, or `latest`.
+    #[arg(value_name = "NAME|latest")]
+    pub name: String,
+
+    #[command(flatten)]
+    pub dir: IncidentDirArg,
+
+    #[command(flatten)]
+    pub format: FormatArg,
+}
+
+/// The formats an exported incident can take.
+///
+/// Separate from [`Format`] because an export is a shareable document, and a
+/// Markdown report is what a person pastes into a ticket; the JSON listing and
+/// JSON export share a value but not a purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ReportFormat {
+    /// The plain-text incident summary.
+    #[default]
+    Text,
+    /// A Markdown incident report.
+    Markdown,
+    /// The bundle's own documents, embedded.
+    Json,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct IncidentExportArgs {
+    /// Incident name, or `latest`.
+    #[arg(value_name = "NAME|latest")]
+    pub name: String,
+
+    /// Report format.
+    #[arg(long, value_enum, default_value_t = ReportFormat::Text)]
+    pub format: ReportFormat,
+
+    /// Where to write the report (`-` for standard output; default: NAME.EXT).
+    #[arg(long, value_name = "PATH|-")]
+    pub output: Option<std::path::PathBuf>,
+
+    /// Replace an existing output file.
+    #[arg(long)]
+    pub force: bool,
+
+    #[command(flatten)]
+    pub dir: IncidentDirArg,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct IncidentSummaryArgs {
+    /// Only incidents recorded within this window, for example 24h or 7days.
+    #[arg(long, value_name = "DURATION", value_parser = parse_since)]
+    pub since: Option<Duration>,
+
+    #[command(flatten)]
+    pub dir: IncidentDirArg,
+
+    #[command(flatten)]
+    pub format: FormatArg,
+}
+
+/// A window for `--since`: positive, so an empty window is a mistake rather
+/// than a silent empty report.
+fn parse_since(value: &str) -> Result<Duration, String> {
+    parse_duration(value).map_err(|error| format!("invalid window `{value}`: {error}"))
+}
+
+/// A bundle count that can actually be kept.
+///
+/// Zero is refused rather than accepted as "keep nothing": a recorder with no
+/// history cannot be used to explain the incident that beat it, and `--once`
+/// would write a bundle and delete it in the same tick.
+fn parse_incident_cap(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(0) => Err("must keep at least one incident".to_string()),
+        Ok(count) if count > 1_000_000 => Err("must be at most 1000000".to_string()),
+        Ok(count) => Ok(count),
+        Err(_) => Err(format!("`{value}` is not a whole number of incidents")),
+    }
 }
 
 /// Arguments for the hidden inspection commands.
@@ -417,6 +551,18 @@ pub struct DaemonArgs {
     #[arg(long, default_value = "off", value_name = "PERCENT|off")]
     pub trigger_cpu: PercentThreshold,
 
+    /// Minimum time between written incidents; `0s` writes every firing interval.
+    ///
+    /// A trigger that stays above its threshold fires on every interval, and
+    /// each firing would write a bundle from the same window. That is premature
+    /// beats rather than evidence: on a host that is over the line for ten
+    /// minutes, dozens of near-identical bundles say nothing more than one.
+    /// Intervals inside the cooldown are still recorded and their signals still
+    /// counted, and the next bundle's window contains them, so throttling drops
+    /// duplicate reports, not measurements.
+    #[arg(long, default_value = "60s", value_name = "DURATION", value_parser = parse_daemon_duration)]
+    pub min_incident_interval: Duration,
+
     /// Incident output (root: /var/lib/rand-fast/incidents; otherwise: $HOME/.local/state/rand-fast/incidents).
     ///
     /// The path must have trusted owners, no symlinks, and no group/other-writable
@@ -434,6 +580,15 @@ pub struct DaemonArgs {
     /// have.
     #[arg(long, default_value = "512m", value_name = "BYTES", value_parser = parse_bytes)]
     pub max_disk_bytes: u64,
+
+    /// Keep at most this many incident bundles, oldest removed first.
+    ///
+    /// A byte cap bounds the disk but not the number of reports: a host that
+    /// trips once a minute would hold hundreds of unreadable-size bundles once
+    /// each one is small. This bounds the directory itself. Off by default,
+    /// because trimming history is a policy the operator has to choose.
+    #[arg(long, value_name = "N", value_parser = parse_incident_cap)]
+    pub max_incidents: Option<usize>,
 
     /// Keep the rolling window from the previous run instead of starting empty.
     ///
@@ -552,6 +707,41 @@ mod tests {
             panic!("expected daemon command");
         };
         assert_eq!(args.duration, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn incident_cooldown_defaults_to_a_minute_and_accepts_zero() {
+        let cli = Cli::try_parse_from(["fast", "daemon", "--pid", "123"]).unwrap();
+        let Command::Daemon(args) = cli.command else {
+            panic!("expected daemon command");
+        };
+        assert_eq!(args.min_incident_interval, Duration::from_secs(60));
+
+        let cli = Cli::try_parse_from([
+            "fast",
+            "daemon",
+            "--pid",
+            "123",
+            "--min-incident-interval",
+            "0s",
+        ])
+        .unwrap();
+        let Command::Daemon(args) = cli.command else {
+            panic!("expected daemon command");
+        };
+        assert_eq!(args.min_incident_interval, Duration::ZERO);
+
+        assert!(
+            Cli::try_parse_from([
+                "fast",
+                "daemon",
+                "--pid",
+                "123",
+                "--min-incident-interval",
+                "soon",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

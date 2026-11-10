@@ -1383,8 +1383,11 @@ check_daemon_storage() {
     # acceptance criterion and because it is the case that matters: a process
     # killed mid-write is exactly what the completion marker exists to detect,
     # and a restart after a clean exit never exercises that path.
+    # The cooldown is off here on purpose: this check is about rotation, so the
+    # run has to write more bundles than the cap can hold.
     "$FAST" daemon --pid "$target_pid" --duration 300s \
         --interval 1s --window 120s --output "$dir" --max-disk-bytes "$cap" \
+        --min-incident-interval 0s \
         --trigger-sched-p95 100us \
         --trigger-io-p99 off --trigger-retrans off \
         --trigger-psi-some off --trigger-psi-full off \
@@ -1566,6 +1569,232 @@ trigger_flags() {
     esac
 }
 
+# Proves that what the recorder wrote can be read back, and that the reader
+# reports what is there rather than what it would like to be there.
+#
+# The collector is exercised by every other check; here it is only the producer.
+# So this case asks for one incident, then reads it four ways, then checks the
+# two properties a report must never get wrong: an absolute time is present, and
+# something that is not an incident is not described as one.
+check_incidents() {
+    local dir="$OUT_DIR/incidents"
+    rm -rf "$dir"
+    mkdir -p "$dir"
+
+    "$FAST_WORKLOAD" lock-hog --duration 20s --workers 32 >/dev/null 2>&1 &
+    local target_pid=$!
+    sleep 0.3
+    "$FAST" daemon --pid "$target_pid" --duration 12s \
+        --interval 1s --window 30s --output "$dir" \
+        --trigger-sched-p95 100us \
+        --trigger-io-p99 off --trigger-retrans off \
+        --trigger-psi-some off --trigger-psi-full off --trigger-cpu off \
+        >"$OUT_DIR/incidents-daemon.txt" 2>&1 &
+    local daemon_pid=$!
+
+    if ! wait_for_bundles "$dir" 1 60; then
+        echo "incidents: FAIL (the recorder wrote no bundle to read)"
+        sed 's/^/    /' "$OUT_DIR/incidents-daemon.txt" 2>/dev/null | head -20 >&2
+        FAILURES=$((FAILURES + 1))
+        cleanup_killed_pid "$daemon_pid"
+        cleanup_killed_pid "$target_pid"
+        return
+    fi
+    wait "$daemon_pid" 2>/dev/null || true
+    kill "$target_pid" 2>/dev/null
+    wait "$target_pid" 2>/dev/null
+
+    local report
+    report="$OUT_DIR/incidents-$(count_bundles "$dir").txt"
+    if ! "$FAST" incidents list --dir "$dir" >"$report" 2>&1; then
+        echo "incidents list: FAIL (exit status)"
+        sed 's/^/    /' "$report" >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if ! grep -q '^incident-[0-9]' "$report"; then
+        echo "incidents list: FAIL (no incident listed)"
+        sed 's/^/    /' "$report" >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    # The wall clock is part of the record. A bundle that only knows how far it
+    # is into its own recording cannot be placed in the day it happened.
+    if ! "$FAST" incidents list --dir "$dir" --format json >"$OUT_DIR/incidents-list.json" 2>&1; then
+        echo "incidents list --format json: FAIL (exit status)"
+        sed 's/^/    /' "$OUT_DIR/incidents-list.json" >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if ! grep -q '"schema": "rand-fast/v3"' "$OUT_DIR/incidents-list.json" ||
+        ! grep -q '"recorded_at_unix_s": [0-9]' "$OUT_DIR/incidents-list.json"; then
+        echo "incidents list --format json: FAIL (missing schema or recorded time)"
+        sed 's/^/    /' "$OUT_DIR/incidents-list.json" >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    local show
+    show=$("$FAST" incidents show latest --dir "$dir" 2>&1)
+    if ! printf '%s\n' "$show" | grep -q '^Recorded: 20'; then
+        echo "incidents show: FAIL (no absolute recorded time)"
+        printf '%s\n' "$show" | sed 's/^/    /' >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if ! printf '%s\n' "$show" | grep -q '^Status: complete'; then
+        echo "incidents show: FAIL (a finished bundle did not read as complete)"
+        printf '%s\n' "$show" | sed 's/^/    /' >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    if ! "$FAST" incidents summary --dir "$dir" --since 1h >"$OUT_DIR/incidents-summary.txt" 2>&1; then
+        echo "incidents summary: FAIL (exit status)"
+        sed 's/^/    /' "$OUT_DIR/incidents-summary.txt" >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if ! grep -q '^Bundles: ' "$OUT_DIR/incidents-summary.txt"; then
+        echo "incidents summary: FAIL (no bundle count)"
+        sed 's/^/    /' "$OUT_DIR/incidents-summary.txt" >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    if ! "$FAST" incidents export latest --format markdown --output - --dir "$dir" \
+        >"$OUT_DIR/incidents-report.md" 2>&1; then
+        echo "incidents export: FAIL (exit status)"
+        sed 's/^/    /' "$OUT_DIR/incidents-report.md" >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if ! grep -q '^# Incident incident-' "$OUT_DIR/incidents-report.md"; then
+        echo "incidents export: FAIL (no report title)"
+        sed 's/^/    /' "$OUT_DIR/incidents-report.md" >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    # A directory that the daemon never used is a normal state, not an error,
+    # and something that is not a bundle must be named as skipped instead of
+    # being rendered as a damaged incident.
+    local empty="$OUT_DIR/incidents-empty"
+    rm -rf "$empty"
+    mkdir -p "$empty"
+    mkdir -p "$empty/notes"
+    if ! "$FAST" incidents list --dir "$empty" >"$OUT_DIR/incidents-empty.txt" 2>&1; then
+        echo "incidents list on an empty directory: FAIL (exit status)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if ! grep -q 'notes: no bundle marker (skipped)' "$OUT_DIR/incidents-empty.txt"; then
+        echo "incidents list: FAIL (unrelated data was not skipped with a reason)"
+        sed 's/^/    /' "$OUT_DIR/incidents-empty.txt" >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if "$FAST" incidents show latest --dir "$empty" >/dev/null 2>&1; then
+        echo "incidents show on an empty directory: FAIL (exit status 0 with nothing to show)"
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    # The count cap is the policy knob an operator sets; it has to keep the
+    # newest bundle and remove the older ones rather than stopping the recorder.
+    # The CPU trigger drives this check, not the scheduler one: rotation has to
+    # be proven under a trigger that fires on every interval, and under emulation
+    # the scheduler percentile only has samples on a fraction of the intervals.
+    # The run is longer than the other incident checks because a CPU percentage
+    # needs a previous /proc snapshot to compare against, so the first interval
+    # of a run can never fire it, and an interval under emulation can take
+    # several seconds of wall clock.
+    local capped="$OUT_DIR/incidents-capped"
+    rm -rf "$capped"
+    mkdir -p "$capped"
+    local run=1
+    while [ "$run" -le 2 ]; do
+        "$FAST_WORKLOAD" lock-hog --duration 25s --workers 32 >/dev/null 2>&1 &
+        target_pid=$!
+        sleep 0.3
+        "$FAST" daemon --pid "$target_pid" --duration 20s \
+            --interval 1s --window 30s --output "$capped" --max-incidents 1 \
+            --min-incident-interval 0s \
+            --trigger-cpu 5 \
+            --trigger-sched-p95 off --trigger-io-p99 off --trigger-retrans off \
+            --trigger-psi-some off --trigger-psi-full off \
+            >>"$OUT_DIR/incidents-count-cap.txt" 2>&1 &
+        daemon_pid=$!
+        wait_for_bundles "$capped" 1 60 || true
+        wait "$daemon_pid" 2>/dev/null || true
+        kill "$target_pid" 2>/dev/null
+        wait "$target_pid" 2>/dev/null
+        run=$((run + 1))
+    done
+    local capped_count
+    capped_count=$(count_bundles "$capped")
+    if [ "$capped_count" -ne 1 ]; then
+        echo "incidents count cap: FAIL (kept $capped_count bundles, expected 1)"
+        ls -la "$capped" 2>/dev/null | sed 's/^/    /' >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    # A trigger that stays hot must not write a bundle per interval. Same
+    # fixture, default cooldown: one bundle has to cover the episode, and the
+    # report has to say how many firing intervals it held back.
+    local cooled="$OUT_DIR/incidents-cooled"
+    rm -rf "$cooled"
+    mkdir -p "$cooled"
+    "$FAST_WORKLOAD" lock-hog --duration 30s --workers 32 >/dev/null 2>&1 &
+    target_pid=$!
+    sleep 0.3
+    "$FAST" daemon --pid "$target_pid" --duration 20s \
+        --interval 1s --window 60s --output "$cooled" \
+        --trigger-cpu 5 \
+        --trigger-sched-p95 off --trigger-io-p99 off --trigger-retrans off \
+        --trigger-psi-some off --trigger-psi-full off \
+        >"$OUT_DIR/incidents-cooldown.txt" 2>&1 || true
+    kill "$target_pid" 2>/dev/null
+    wait "$target_pid" 2>/dev/null
+    local cooled_count
+    cooled_count=$(count_bundles "$cooled")
+    if [ "$cooled_count" -ne 1 ]; then
+        echo "incidents cooldown: FAIL (wrote $cooled_count bundles for one hot trigger, expected 1)"
+        ls -la "$cooled" 2>/dev/null | sed 's/^/    /' >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if ! grep -q 'firing intervals inside the' "$OUT_DIR/incidents-cooldown.txt"; then
+        echo "incidents cooldown: FAIL (the report does not say how many firing intervals it throttled)"
+        sed -n '/^Triggers/,+12p' "$OUT_DIR/incidents-cooldown.txt" | sed 's/^/    /' >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    # A cooldown longer than the window is shortened, because the throttled
+    # intervals would otherwise roll out before the next bundle contains them.
+    "$FAST_WORKLOAD" lock-hog --duration 12s --workers 32 >/dev/null 2>&1 &
+    target_pid=$!
+    sleep 0.3
+    "$FAST" daemon --pid "$target_pid" --duration 8s \
+        --interval 1s --window 10s --output "$cooled" \
+        --min-incident-interval 600s \
+        --trigger-cpu 5 \
+        --trigger-sched-p95 off --trigger-io-p99 off --trigger-retrans off \
+        --trigger-psi-some off --trigger-psi-full off \
+        >"$OUT_DIR/incidents-cooldown-clamped.txt" 2>&1 || true
+    kill "$target_pid" 2>/dev/null
+    wait "$target_pid" 2>/dev/null
+    if ! grep -q 'longer than the 10s window' "$OUT_DIR/incidents-cooldown-clamped.txt"; then
+        echo "incidents cooldown: FAIL (a cooldown longer than the window was not reported as shortened)"
+        sed 's/^/    /' "$OUT_DIR/incidents-cooldown-clamped.txt" | head -10 >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+
+    echo "incidents: listed, showed, summarized, exported, capped and cooled down"
+}
+
 check_daemon_triggers() {
     # The block device is real, because reads served from tmpfs never reach the
     # block tracepoints and the I/O trigger could then only be tested against a
@@ -1602,6 +1831,7 @@ check_daemon_infinite_default
 check_daemon_budget
 check_daemon_triggers
 check_daemon_storage
+check_incidents
 
 echo "=== key metrics ==="
 print_metrics() {

@@ -19,8 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[path = "daemon_storage.rs"]
-mod storage;
+use crate::daemon_storage as storage;
 use anyhow::{Context, Result};
 use aya::{Ebpf, include_bytes_aligned};
 use fast_common::{
@@ -216,10 +215,21 @@ fn write_incident(
     let total_entries = ring.entries().count();
     let carried = total_entries.min(BUNDLE_MAX_INTERVALS);
 
+    // `entry.at` is elapsed time, which places an incident inside its own
+    // recording but not in an operator's day. Both absolute ends are recorded
+    // now, while the clock is still the one the trigger was observed with.
+    // Whole seconds: a bundle's name is second-granular anyway, and a
+    // fractional rendering would make identical bundles differ in size.
+    let recorded_at_unix_s = crate::utc::now_unix_seconds().map(f64::floor);
+    let recording_started_unix_s =
+        recorded_at_unix_s.map(|now| (now - entry.at.as_secs_f64()).floor());
+
     let manifest = serde_json::json!({
         "schema": DAEMON_SCHEMA,
         "command": "daemon.incident",
         "recorded_at_s": entry.at.as_secs_f64(),
+        "recorded_at_unix_s": recorded_at_unix_s,
+        "recording_started_unix_s": recording_started_unix_s,
         "process": { "pid": args.pid },
         "triggered_by": entry
             .fired
@@ -289,7 +299,14 @@ fn write_incident(
     // contention was looked for and not found".
     let diagnosis = diagnose_from(&entry, args.pid, slow);
     directory.json("diagnosis.json", &diagnosis)?;
-    directory.write("summary.txt", &incident_text(&entry, triggers, &diagnosis))?;
+    let mut summary = incident_text(&entry, triggers, &diagnosis);
+    if let Some(recorded) = recorded_at_unix_s {
+        summary.insert_str(
+            0,
+            &format!("Recorded at {}\n", crate::utc::timestamp(recorded)),
+        );
+    }
+    directory.write("summary.txt", &summary)?;
 
     // Written last, and on its own, so a bundle is either complete or absent
     // rather than a directory that looks finished and is not.
@@ -306,7 +323,11 @@ fn write_incident(
             ],
         }),
     )?;
-    let rotation_error = match output.rotate(args.max_disk_bytes, directory.name()) {
+    let rotation_error = match output.rotate(
+        args.max_disk_bytes,
+        args.max_incidents,
+        directory.name(),
+    ) {
         Ok(state) => {
             if state.unknown {
                 eprintln!(
@@ -367,8 +388,22 @@ fn directory_total(dir: &std::path::Path) -> Option<u64> {
     size(dir)
 }
 
+/// States the retention policy in the terms the recorder applies it.
+fn retention(max_disk_bytes: u64, max_incidents: Option<usize>) -> String {
+    match max_incidents {
+        Some(count) => format!(
+            "at most {count} bundles and {} in total, oldest dropped first",
+            human_bytes(max_disk_bytes)
+        ),
+        None => format!(
+            "kept under {} by dropping the oldest bundles",
+            human_bytes(max_disk_bytes)
+        ),
+    }
+}
+
 /// A byte count in the largest unit that leaves the number readable.
-fn human_bytes(bytes: u64) -> String {
+pub(crate) fn human_bytes(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = 1024 * 1024;
     const GIB: u64 = 1024 * 1024 * 1024;
@@ -1085,6 +1120,15 @@ pub fn run(args: DaemonArgs) -> Result<()> {
             args.output.display()
         )
     })?;
+    let cooldown = effective_cooldown(&args);
+    if cooldown < args.min_incident_interval {
+        eprintln!(
+            "warning: --min-incident-interval {} is longer than the {} window that carries throttled intervals; using {}",
+            humantime::format_duration(args.min_incident_interval),
+            humantime::format_duration(args.window),
+            humantime::format_duration(cooldown),
+        );
+    }
     // Read before anything else happens, so the report can separate the
     // program's own footprint from what setting the recording up costs. A
     // budget that counts the interpreter's own text is not a budget anyone can
@@ -1261,6 +1305,8 @@ pub fn run(args: DaemonArgs) -> Result<()> {
                     state.incidents.write_failures,
                     state.incidents.rotation_failures,
                     state.incidents.skipped,
+                    args.min_incident_interval,
+                    state.incidents.throttled,
                     state.incident_write_failed,
                 ),
             )
@@ -1284,6 +1330,7 @@ pub fn run(args: DaemonArgs) -> Result<()> {
             state.incident_write_failed,
             &state.restored,
             args.max_disk_bytes,
+            args.max_incidents,
         );
     }
     Ok(())
@@ -1369,6 +1416,10 @@ struct Incidents {
     write_failures: u64,
     rotation_failures: u64,
     skipped: u64,
+    /// Intervals that fired inside the cooldown, so no bundle was written.
+    throttled: u64,
+    /// Timeline position of the last written bundle, for the cooldown.
+    last_written_at: Option<Duration>,
 }
 
 impl Incidents {
@@ -1403,6 +1454,25 @@ impl Incidents {
         counts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
         counts
     }
+}
+
+/// The cooldown actually used.
+///
+/// A cooldown longer than the window would drop intervals that fired inside it
+/// before any bundle could contain them: a throttled interval reaches the next
+/// bundle only as long as it is still in the window. Clamping keeps throttling
+/// a reporting policy rather than a gap in the record.
+fn effective_cooldown(args: &DaemonArgs) -> Duration {
+    args.min_incident_interval.min(args.window)
+}
+
+/// Whether a firing interval falls inside the incident cooldown.
+///
+/// `last` is where the previous bundle was written on the same timeline as
+/// `at`, so a restored run compares like with like. A cooldown of zero writes
+/// every firing interval; that is the only value that does.
+fn incident_is_throttled(last: Option<Duration>, at: Duration, cooldown: Duration) -> bool {
+    cooldown > Duration::ZERO && last.is_some_and(|last| at.saturating_sub(last) < cooldown)
 }
 
 /// One tick: append interval latency snapshots and differenced counters.
@@ -1583,9 +1653,14 @@ fn tick_with_target_cpu(
         },
     );
     entry.fired = fired.clone();
+    // A trigger that stays hot fires on every interval, and each firing would
+    // write a bundle over the same window. Inside the cooldown the interval is
+    // still recorded and its signals still counted; only the duplicate bundle
+    // is skipped, and the next bundle's window covers the interval.
+    let throttled = incident_is_throttled(incidents.last_written_at, at, effective_cooldown(args));
     // The incident file is written before the entry goes into the ring, so a
     // bundle that exists always has its triggering interval in it.
-    let incident_result = if !fired.is_empty() && !*incident_write_failed {
+    let incident_result = if !fired.is_empty() && !*incident_write_failed && !throttled {
         let slow = SlowSamples {
             sched_us: slow_sched.clone(),
             io_us: slow_io.clone(),
@@ -1593,6 +1668,7 @@ fn tick_with_target_cpu(
         match write_incident(ring, entry.clone(), &triggers, args, &slow) {
             Ok(completed) => {
                 incidents.record(&fired);
+                incidents.last_written_at = Some(at);
                 if let Some(error) = completed.rotation_error {
                     incidents.rotation_failures = incidents.rotation_failures.saturating_add(1);
                     *incident_write_failed = true;
@@ -1609,7 +1685,11 @@ fn tick_with_target_cpu(
         }
     } else {
         if !fired.is_empty() {
-            incidents.skipped = incidents.skipped.saturating_add(1);
+            if throttled {
+                incidents.throttled = incidents.throttled.saturating_add(1);
+            } else {
+                incidents.skipped = incidents.skipped.saturating_add(1);
+            }
         }
         Ok(())
     };
@@ -1660,6 +1740,7 @@ fn print_summary(
     incident_write_failed: bool,
     restored: &Restored,
     max_disk_bytes: u64,
+    max_incidents: Option<usize>,
 ) {
     println!("Flight recorder for {name} ({pid})");
     println!("Measurement: {MEASUREMENT_SEMANTICS}");
@@ -1684,9 +1765,9 @@ fn print_summary(
     }
     println!("Intervals recorded: {ticks}");
     println!(
-        "Output: {} (kept under {} by dropping the oldest bundles)",
+        "Output: {} ({})",
         args.output.display(),
-        human_bytes(max_disk_bytes)
+        retention(max_disk_bytes, max_incidents)
     );
     println!();
     println!("Overhead budget");
@@ -1745,6 +1826,13 @@ fn print_summary(
         incidents.rotation_failures
     );
     println!("  incidents skipped after failure: {}", incidents.skipped);
+    if incidents.throttled != 0 {
+        println!(
+            "  firing intervals inside the {} cooldown: {}",
+            humantime::format_duration(effective_cooldown(args)),
+            incidents.throttled
+        );
+    }
     if incident_write_failed {
         println!("  incident writing disabled for this run");
     }
@@ -2045,10 +2133,24 @@ mod tests {
             Duration::from_secs(1),
             false,
             false,
-            crate::json_payloads::daemon_json(&ring, 0.0, 0, 1, 0, 0, 0, 0, false),
+            crate::json_payloads::daemon_json(
+                &ring,
+                0.0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                Duration::from_secs(60),
+                0,
+                false,
+            ),
         );
         let document = serde_json::to_value(envelope).unwrap();
         assert_eq!(document["schema"], "rand-fast/v2");
+        assert_eq!(document["data"]["incident_cooldown_ms"], 60_000);
+        assert_eq!(document["data"]["incidents_throttled"], 0);
         assert!(document["data"]["intervals_detail"][0]["cpu_percent"].is_null());
         let dir = temp_dir("restore_v1_cpu");
         std::fs::create_dir_all(&dir).unwrap();
@@ -2519,11 +2621,120 @@ mod tests {
             trigger_cpu: "off".parse().expect("threshold"),
             output: output.to_path_buf(),
             max_disk_bytes: 512 * 1024 * 1024,
+            max_incidents: None,
+            min_incident_interval: Duration::from_secs(60),
             restore: true,
             format: crate::cli::FormatArg {
                 format: Format::Text,
             },
         }
+    }
+
+    #[test]
+    fn a_cooldown_longer_than_the_window_is_shortened_to_it() {
+        // Past the window the throttled interval would roll out before the next
+        // bundle could contain it, so the longer value is not honored.
+        let dir = temp_dir("incident_cooldown_window");
+        let mut args = default_args(&dir);
+        args.min_incident_interval = Duration::from_secs(600);
+        assert_eq!(effective_cooldown(&args), args.window);
+        args.min_incident_interval = Duration::from_secs(30);
+        assert_eq!(effective_cooldown(&args), Duration::from_secs(30));
+        args.min_incident_interval = Duration::ZERO;
+        assert_eq!(effective_cooldown(&args), Duration::ZERO);
+    }
+
+    #[test]
+    fn cooldown_throttles_duplicate_bundles_but_keeps_the_intervals() {
+        // A trigger over its threshold for several minutes would otherwise
+        // write a bundle per interval, all covering the same window. The
+        // throttled intervals must still be in the ring, and their signals
+        // still counted, or the next bundle would be missing the evidence.
+        let dir = temp_dir("incident_cooldown");
+        let mut args = default_args(&dir);
+        args.min_incident_interval = Duration::from_secs(60);
+        let mut state = tick_test_state();
+        let hot = || serde_json::json!({"p95_us": 90_000, "samples": 100});
+        for second in 1..=4 {
+            tick(
+                args.pid,
+                Instant::now(),
+                Duration::from_secs(second),
+                vec![("sched", hot())],
+                &mut state,
+                &args,
+            )
+            .unwrap();
+        }
+        // The first interval is the baseline; the second writes the bundle and
+        // the third and fourth fall inside its cooldown.
+        assert_eq!(state.incidents.total, 1);
+        assert_eq!(state.incidents.throttled, 2);
+        assert_eq!(state.incidents.skipped, 0);
+        assert_eq!(
+            state.ring.entries().filter(|e| !e.fired.is_empty()).count(),
+            3
+        );
+    }
+
+    #[test]
+    fn zero_cooldown_writes_every_firing_interval() {
+        let dir = temp_dir("incident_cooldown_zero");
+        let mut args = default_args(&dir);
+        args.min_incident_interval = Duration::ZERO;
+        let mut state = tick_test_state();
+        let hot = || serde_json::json!({"p95_us": 90_000, "samples": 100});
+        for second in 1..=4 {
+            tick(
+                args.pid,
+                Instant::now(),
+                Duration::from_secs(second),
+                vec![("sched", hot())],
+                &mut state,
+                &args,
+            )
+            .unwrap();
+        }
+        assert_eq!(state.incidents.total, 3);
+        assert_eq!(state.incidents.throttled, 0);
+    }
+
+    #[test]
+    fn cooldown_boundary_and_defaults_are_exact() {
+        let cooldown = Duration::from_secs(60);
+        let last = Some(Duration::from_secs(10));
+        assert!(!incident_is_throttled(
+            None,
+            Duration::from_secs(10),
+            cooldown
+        ));
+        assert!(incident_is_throttled(
+            last,
+            Duration::from_secs(10),
+            cooldown
+        ));
+        assert!(incident_is_throttled(
+            last,
+            Duration::from_secs(69),
+            cooldown
+        ));
+        assert!(!incident_is_throttled(
+            last,
+            Duration::from_secs(70),
+            cooldown
+        ));
+        // A restored timeline can start before the last write it carries.
+        assert!(incident_is_throttled(
+            last,
+            Duration::from_secs(1),
+            cooldown
+        ));
+        // A cooldown that is off never throttles, even with no write yet.
+        assert!(!incident_is_throttled(
+            None,
+            Duration::from_secs(10),
+            Duration::ZERO
+        ));
     }
 
     fn slow_io_entry() -> RingEntry {
@@ -2569,6 +2780,21 @@ mod tests {
         .expect("parse manifest");
 
         assert_eq!(manifest["schema"], "rand-fast/v2");
+        // The absolute time is recorded beside the elapsed one: a bundle that
+        // only says "11s into the recording" cannot be placed on a timeline.
+        let recorded = manifest["recorded_at_unix_s"]
+            .as_f64()
+            .expect("recorded wall clock");
+        let started = manifest["recording_started_unix_s"]
+            .as_f64()
+            .expect("recording start");
+        let elapsed = manifest["recorded_at_s"]
+            .as_f64()
+            .expect("elapsed recording time");
+        assert!(
+            (recorded - started - elapsed).abs() < 1.0,
+            "absolute time agrees with elapsed time"
+        );
         assert_eq!(manifest["interval"]["tcp_available"], false);
         assert!(manifest["interval"]["retrans"].is_null());
         let triggered = &manifest["triggered_by"];
@@ -2594,8 +2820,30 @@ mod tests {
         assert_eq!(intervals.as_array().map(Vec::len), Some(1));
 
         let text = std::fs::read_to_string(bundle.join("summary.txt")).expect("read summary");
+        assert!(
+            text.starts_with("Recorded at 20"),
+            "summary states the wall clock: {text}"
+        );
         assert!(text.contains("io_p99"), "summary names the trigger: {text}");
         assert!(text.contains("900000"), "summary states the value: {text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_count_cap_keeps_the_newest_bundles_only() {
+        let dir = temp_dir("count_cap");
+        let mut args = default_args(&dir);
+        args.max_incidents = Some(1);
+        let triggers = Triggers::from_args(&args);
+        let ring = Ring::new(Duration::from_secs(60), Duration::from_secs(1));
+        let slow = SlowSamples {
+            sched_us: vec![],
+            io_us: vec![],
+        };
+        write_incident(&ring, slow_io_entry(), &triggers, &args, &slow).expect("first");
+        write_incident(&ring, slow_io_entry(), &triggers, &args, &slow).expect("second");
+        let count = std::fs::read_dir(&dir).expect("read output dir").count();
+        assert_eq!(count, 1, "only the newest bundle is kept");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

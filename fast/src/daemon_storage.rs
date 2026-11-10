@@ -12,8 +12,12 @@ use std::{
     path::{Component, Path},
 };
 
-const MARKER: &str = ".rand-fast-incident";
-const CONTENT: &str = "rand-fast incident bundle v1\n";
+/// The file that makes a directory a bundle, and its only accepted content.
+///
+/// Shared with the reader, which treats a missing or different marker as user
+/// data rather than as a damaged incident.
+pub(crate) const MARKER: &str = ".rand-fast-incident";
+pub(crate) const MARKER_CONTENT: &str = "rand-fast incident bundle v1\n";
 const FILES: &[&str] = &[
     MARKER,
     "manifest.json",
@@ -202,7 +206,7 @@ impl Output {
                     let dir = open_dir(&self.dir, OsStr::new(&name))?;
                     trusted(&dir)?;
                     let bundle = Bundle { dir, name };
-                    bundle.write(MARKER, CONTENT)?;
+                    bundle.write(MARKER, MARKER_CONTENT)?;
                     return Ok(bundle);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -213,12 +217,18 @@ impl Output {
     }
     // Size accounting is independent of deletion eligibility. Inaccessible
     // entries and links leave the total as a lower bound, never as zero.
-    pub(super) fn rotate(&self, max: u64, current: &str) -> Result<Rotation> {
-        self.rotate_with(max, current, |_| {}, |name| self.remove(name))
+    pub(super) fn rotate(
+        &self,
+        max: u64,
+        max_count: Option<usize>,
+        current: &str,
+    ) -> Result<Rotation> {
+        self.rotate_with(max, max_count, current, |_| {}, |name| self.remove(name))
     }
     fn rotate_with(
         &self,
         max: u64,
+        max_count: Option<usize>,
         current: &str,
         mut before_remove: impl FnMut(&OsStr),
         mut remove: impl FnMut(&OsStr) -> Result<()>,
@@ -239,28 +249,66 @@ impl Output {
                 bundles.push((name, size));
             }
         }
-        for (name, size) in bundles {
+        // `bundles` is in name order, which is time order: the stamp is
+        // zero-padded seconds. Both caps remove from the same end, so the
+        // newest incident and the window leading to it are the last to go.
+        let mut alive = vec![true; bundles.len()];
+        let mut removed_by_count = 0usize;
+        if let Some(max_count) = max_count {
+            let mut excess = bundles.len().saturating_sub(max_count);
+            for (index, (name, size)) in bundles.iter().enumerate() {
+                if excess == 0 {
+                    break;
+                }
+                if name == OsStr::new(current) {
+                    continue;
+                }
+                before_remove(name);
+                if let Err(error) = remove(name) {
+                    eprintln!("warning: failed to remove incident {:?}: {error:#}", name);
+                    unknown = true;
+                    continue;
+                }
+                total = total.saturating_sub(*size);
+                alive[index] = false;
+                removed_by_count += 1;
+                excess -= 1;
+            }
+        }
+        let mut removed_by_bytes = 0usize;
+        for (index, (name, size)) in bundles.iter().enumerate() {
+            if !alive[index] {
+                continue;
+            }
             if total <= max {
                 break;
             }
             if name == OsStr::new(current) {
                 continue;
             }
-            before_remove(&name);
-            if let Err(error) = remove(&name) {
+            before_remove(name);
+            if let Err(error) = remove(name) {
                 eprintln!("warning: failed to remove incident {:?}: {error:#}", name);
                 unknown = true;
                 continue;
             }
-            total = total.saturating_sub(size);
+            total = total.saturating_sub(*size);
+            alive[index] = false;
+            removed_by_bytes += 1;
         }
-        Ok(Rotation { total, unknown })
+        Ok(Rotation {
+            total,
+            unknown,
+            removed_by_count,
+            removed_by_bytes,
+            kept: alive.iter().filter(|alive| **alive).count(),
+        })
     }
     fn inspect(&self, name: &OsStr) -> Result<Option<u64>> {
         let Some(name_str) = name.to_str() else {
             return Ok(None);
         };
-        if !valid_name(name_str) {
+        if !crate::incident_store::valid_bundle_name(name_str) {
             return Ok(None);
         }
         let dir = open_dir(&self.dir, name)?;
@@ -285,7 +333,7 @@ impl Output {
             if s == MARKER {
                 let mut contents = String::new();
                 file.take(128).read_to_string(&mut contents)?;
-                marker = contents == CONTENT;
+                marker = contents == MARKER_CONTENT;
             }
         }
         Ok(marker.then_some(total))
@@ -360,23 +408,21 @@ impl Output {
         Ok(None)
     }
 }
-fn valid_name(name: &str) -> bool {
-    let Some((digits, suffix)) = name
-        .strip_prefix("incident-")
-        .and_then(|s| s.split_once('s'))
-    else {
-        return false;
-    };
-    digits.len() >= 12
-        && digits.bytes().all(|b| b.is_ascii_digit())
-        && (suffix.is_empty()
-            || suffix
-                .strip_prefix('-')
-                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())))
-}
 pub(super) struct Rotation {
     pub total: u64,
     pub unknown: bool,
+    // The counts are what the rotation tests assert on; the daemon acts on
+    // the result and logs only the warnings, so they are not read in a
+    // non-test build.
+    /// Bundles removed because the directory held more than the count cap.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub removed_by_count: usize,
+    /// Bundles removed because the directory was over the byte cap.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub removed_by_bytes: usize,
+    /// Bundles the directory still holds after rotation.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub kept: usize,
 }
 pub(super) struct Bundle {
     dir: File,
@@ -515,7 +561,7 @@ mod tests {
             t.0.join(link.name()).join("summary.txt"),
         )
         .unwrap();
-        let result = output.rotate(0, "current").unwrap();
+        let result = output.rotate(0, None, "current").unwrap();
         assert!(result.unknown);
         assert!(!t.0.join(partial.name()).exists());
         assert!(legacy.exists() && t.0.join(nested.name()).join("user-data/file").exists());
@@ -543,7 +589,7 @@ mod tests {
         let old_size = output.inspect(OsStr::new(old.name())).unwrap().unwrap();
         let current_size = output.inspect(OsStr::new(current.name())).unwrap().unwrap();
         let retained = 104 + 80 + current_size;
-        let result = output.rotate(retained, current.name()).unwrap();
+        let result = output.rotate(retained, None, current.name()).unwrap();
         assert!(!result.unknown);
         assert_eq!(result.total, retained);
         assert!(old_size > 0 && !t.0.join(old.name()).exists());
@@ -562,10 +608,10 @@ mod tests {
         let old = output.create("000000001000s").unwrap();
         let current = output.create("000000002000s").unwrap();
         let state = output
-            .rotate(512 + CONTENT.len() as u64, current.name())
+            .rotate(512 + MARKER_CONTENT.len() as u64, None, current.name())
             .unwrap();
         assert!(!state.unknown);
-        assert_eq!(state.total, 512 + CONTENT.len() as u64);
+        assert_eq!(state.total, 512 + MARKER_CONTENT.len() as u64);
         assert!(!t.0.join(old.name()).exists());
         assert!(file.exists());
         fs::set_permissions(file, fs::Permissions::from_mode(0o600)).unwrap();
@@ -577,7 +623,7 @@ mod tests {
         let output = Output::open(&t.0).unwrap();
         fs::write(t.0.join("user-file"), vec![1; 1024]).unwrap();
         let current = output.create("000000002000s").unwrap();
-        let state = output.rotate(10, current.name()).unwrap();
+        let state = output.rotate(10, None, current.name()).unwrap();
         assert!(!state.unknown);
         assert!(state.total >= 1024);
         assert!(t.0.join("user-file").exists());
@@ -593,6 +639,7 @@ mod tests {
         let result = output
             .rotate_with(
                 0,
+                None,
                 "current",
                 |name| {
                     fs::write(t.0.join(name).join("user-file"), "keep").unwrap();
@@ -609,6 +656,61 @@ mod tests {
     }
 
     #[test]
+    fn count_cap_removes_the_oldest_bundles_and_keeps_the_newest() {
+        let t = Temp::new();
+        let output = Output::open(&t.0).unwrap();
+        for stamp in [
+            "000000001000",
+            "000000002000",
+            "000000003000",
+            "000000004000",
+        ] {
+            output.create(&format!("{stamp}s")).unwrap();
+        }
+        let state = output
+            .rotate(u64::MAX, Some(2), "incident-000000004000s")
+            .unwrap();
+        assert_eq!(state.removed_by_count, 2);
+        assert_eq!(state.removed_by_bytes, 0);
+        assert_eq!(state.kept, 2);
+        assert!(!t.0.join("incident-000000001000s").exists());
+        assert!(!t.0.join("incident-000000002000s").exists());
+        assert!(t.0.join("incident-000000003000s").exists());
+        assert!(t.0.join("incident-000000004000s").exists());
+    }
+
+    #[test]
+    fn count_cap_never_removes_the_current_bundle() {
+        let t = Temp::new();
+        let output = Output::open(&t.0).unwrap();
+        for stamp in ["000000001000", "000000002000", "000000003000"] {
+            output.create(&format!("{stamp}s")).unwrap();
+        }
+        // The current bundle is the oldest here, which is what a long
+        // collection with many later triggers would look like.
+        let state = output
+            .rotate(u64::MAX, Some(1), "incident-000000001000s")
+            .unwrap();
+        assert_eq!(state.removed_by_count, 2);
+        assert!(t.0.join("incident-000000001000s").exists());
+        assert!(!t.0.join("incident-000000002000s").exists());
+    }
+
+    #[test]
+    fn byte_and_count_caps_apply_together() {
+        let t = Temp::new();
+        let output = Output::open(&t.0).unwrap();
+        for stamp in ["000000001000", "000000002000", "000000003000"] {
+            output.create(&format!("{stamp}s")).unwrap();
+        }
+        let state = output.rotate(0, Some(3), "incident-000000003000s").unwrap();
+        assert_eq!(state.removed_by_count, 0);
+        assert_eq!(state.removed_by_bytes, 2);
+        assert_eq!(state.kept, 1);
+        assert!(t.0.join("incident-000000003000s").exists());
+    }
+
+    #[test]
     fn rotation_failure_and_unreadable_unrelated_data_leave_cap_unknown() {
         let t = Temp::new();
         let output = Output::open(&t.0).unwrap();
@@ -619,6 +721,7 @@ mod tests {
         let result = output
             .rotate_with(
                 0,
+                None,
                 "current",
                 |_| {},
                 |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into()),

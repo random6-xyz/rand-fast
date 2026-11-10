@@ -257,6 +257,10 @@ pub struct DaemonJson {
     pub incident_rotation_failures: u64,
     /// Fired intervals skipped because incident writing was disabled.
     pub incidents_skipped: u64,
+    /// Minimum time between written incidents, in milliseconds.
+    pub incident_cooldown_ms: u64,
+    /// Firing intervals that fell inside the cooldown, so no bundle was written.
+    pub incidents_throttled: u64,
     /// Whether incident writing is disabled for the remainder of this run.
     pub incident_writes_disabled: bool,
     /// Semantics for newly collected interval values.
@@ -276,6 +280,8 @@ pub fn daemon_json(
     incident_write_failures: u64,
     incident_rotation_failures: u64,
     incidents_skipped: u64,
+    incident_cooldown: Duration,
+    incidents_throttled: u64,
     incident_writes_disabled: bool,
 ) -> DaemonJson {
     let window = ring.window();
@@ -308,6 +314,8 @@ pub fn daemon_json(
         incident_write_failures,
         incident_rotation_failures,
         incidents_skipped,
+        incident_cooldown_ms: u64::try_from(incident_cooldown.as_millis()).unwrap_or(u64::MAX),
+        incidents_throttled,
         incident_writes_disabled,
         measurement_semantics: crate::daemon::MEASUREMENT_SEMANTICS,
         intervals_detail: ring
