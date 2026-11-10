@@ -16,6 +16,7 @@ found through `/proc/<pid>/task` and re-synchronized during collection. Use
 | `memory` | Measure faults, reclaim, PSI, and swap pressure. |
 | `net` | Measure TCP RTT, retransmissions and connection setup for owned connections. |
 | `daemon` | Keep a rolling window and write incident bundles. |
+| `incidents` | Read, summarize, and export recorded incident bundles. |
 
 All commands take `--pid` and `--format text|json`. Single-shot commands
 except `diagnose` require `--duration`; `diagnose` defaults to `10s`. The
@@ -77,6 +78,13 @@ It preserves the trigger and recent history leading up to it; the manifest
 states how many intervals were carried. The diagnosis identifies signals that
 were not collected.
 
+`manifest.json` records `recorded_at_s` (elapsed from the start of the run) and,
+from v0.4.0, `recorded_at_unix_s` and `recording_started_unix_s` (whole seconds
+of wall clock). The wall clock is what places an incident in an operator's day;
+the elapsed value is what places it inside its own recording. Bundles written
+before v0.4.0 have no wall clock, and readers report it as absent rather than
+estimating it.
+
 ### Output and retention
 
 The default output depends on the effective user:
@@ -101,12 +109,14 @@ recursively change ownership or permissions of a directory other users can
 modify. In particular, do not use a normal user's home as an ancestor of a
 root daemon's output.
 
-`--max-disk-bytes` defaults to `512m`. The cap is checked after writing an
-incident and is a **soft ceiling**. Rotation retains the newest incident and
-only deletes bundles it can prove it owns. Legacy bundles and unrelated files
-are counted but not deleted; an oversized incident, unreadable entry,
-interrupted bundle, or rotation failure can also leave the directory over the
-cap. The recorder warns when the size cannot be fully verified.
+`--max-disk-bytes` defaults to `512m`; `--max-incidents` defaults to off. Both
+caps are checked after writing an incident and are **soft ceilings**. When the
+directory is over either cap, the oldest bundles are removed first and the
+incident that just triggered is never removed. Rotation only deletes bundles it
+can prove it owns. Legacy bundles and unrelated files are counted but not
+deleted; an oversized incident, unreadable entry, interrupted bundle, or
+rotation failure can also leave the directory over the cap. The recorder warns
+when the size cannot be fully verified.
 
 ### Upgrading existing installations
 
@@ -119,6 +129,58 @@ without the ownership marker are not automatically deleted. Manually archive or
 remove legacy and unrelated files only after verifying their ownership and
 contents. Do not copy untrusted ownership markers into a trusted output.
 
+### Reading incidents
+
+`fast incidents` reads what the recorder wrote. The commands are read-only, do
+not load eBPF, and need only filesystem read access, so a root-owned recording
+can be inspected with `sudo` and a user's own recording without it.
+
+```bash
+sudo fast incidents list                       # newest first, with what was skipped
+sudo fast incidents list --since 24h --limit 5
+sudo fast incidents show latest                # one bundle in full
+sudo fast incidents summary --since 7days      # aggregate over the window
+sudo fast incidents export latest --format markdown --output incident.md
+```
+
+| Command | Options | Notes |
+| --- | --- | --- |
+| `list` | `--limit N`, `--since DURATION`, `--dir`, `--format` | `--limit 0` shows all. |
+| `show` | `NAME\|latest`, `--dir`, `--format` | Incomplete bundles are shown, not refused. |
+| `export` | `NAME\|latest`, `--format text\|markdown\|json`, `--output PATH\|-`, `--force` | Default file name is `NAME.EXT`. |
+| `summary` | `--since DURATION`, `--dir`, `--format` | Counts what the directory holds; deleted incidents are gone. |
+
+`--dir` defaults to the daemon's default output for the effective user, so
+`sudo fast incidents list` reads root's directory. `latest` is the newest
+readable bundle by recorded wall-clock time; bundles without one are ordered by
+name, which is why a v0.3.0 bundle can still be inspected.
+
+The reader enforces its own rules, which are looser than the writer's and
+stricter than a plain directory listing:
+
+- Every bundle and bundle file is opened relative to an already-open directory
+  with `O_NOFOLLOW`; symlinked components, symlinked bundles, and files that are
+  not regular files are refused instead of followed.
+- The `.rand-fast-incident` marker defines a bundle. A directory without it is
+  reported as skipped user data, not as a damaged incident.
+- Every read is bounded: 1 MiB for `manifest.json`, `diagnosis.json`,
+  `complete.json`, and `summary.txt`; 8 MiB for `intervals.json` and
+  `slow-samples.json`; at most 64 files per bundle.
+- Ownership equality and the "not group/other writable" rule are **not**
+  enforced on read: reading root's directory as root, or another user's bundle
+  with permission, is the point. A reader that demanded the writer's rules
+  could not do either.
+
+Nothing is recomputed. A bundle's `manifest.json` and `diagnosis.json` are
+reported as recorded; an unavailable measurement stays unavailable and is never
+rendered as zero. A bundle that fails to parse is named with the offending file
+and the command exits 1 rather than printing a plausible report.
+
+`list` and `summary` exit 0 on a missing or empty directory; `show` and `export`
+exit 1 when there is nothing readable to select. Usage errors exit 2. Rotation
+means history is bounded: `summary` covers what the directory still holds and
+states that rotated-away incidents are not included.
+
 ## JSON output
 
 Every command accepts `--format json` and emits a single-line report. Dispatch
@@ -128,6 +190,7 @@ on **both** `schema` and `command` and ignore unknown fields:
 | --- | --- |
 | `rand-fast/v1` | `sched`, `cpu`, `io`, `off-cpu`, `memory` |
 | `rand-fast/v2` | `net`, `diagnose`, `daemon` |
+| `rand-fast/v3` | `incidents.list`, `incidents.show`, `incidents.export`, `incidents.summary` |
 
 The report envelope includes `schema`, `command`, `pid`, `duration_s`,
 `interrupted`, `process_exited`, and command-specific `data`; `process` is
@@ -167,6 +230,16 @@ Unavailable measurements in v2 can be `null`; do not interpret `null` as zero:
   `/proc` read breaks the baseline; the next successful read starts a new one.
   CPU and retransmission triggers do not fire on `null`; values above 100 are
   valid for a multithreaded process.
+
+Incident reader documents use v3 and do not follow the report envelope: they
+describe a directory or a bundle, not a process run. They embed the bundle's
+own documents verbatim (raw JSON, not a re-serialization) so a consumer reads
+exactly what the recorder wrote. `incidents.list` reports `directory_exists`,
+the applied filters, `count`/`total`, `unreadable_count`,
+`excluded_without_timestamp`, and a `skipped` list with a reason per entry.
+`incidents.show` reports the file list, the missing files, and the documents.
+`incidents.summary` reports counts, the observed time range, trigger and
+top-cause counts, and `share_of: "readable bundles"` for its shares.
 
 Incident `manifest.json`, `complete.json`, and `diagnosis.json` use v2;
 `intervals.json` is an array identified by the manifest's schema. The recorder
