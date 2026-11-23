@@ -496,7 +496,6 @@ pub fn run(args: IoArgs) -> Result<()> {
         json::emit(
             args.format.format,
             &Envelope::new(
-                "io",
                 pid,
                 Some(process_name),
                 collection.elapsed,

@@ -4,6 +4,7 @@ mod cpu;
 mod daemon;
 mod daemon_storage;
 mod diagnose;
+mod incident_contract;
 mod incident_store;
 mod incidents;
 mod io;

@@ -47,8 +47,70 @@ use serde::Serialize;
 
 /// The default schema identifier for v1 JSON documents.
 pub const SCHEMA: &str = "rand-fast/v1";
-/// Schema for reports with unavailable TCP measurements.
+/// Schema for reports with explicit unavailable measurements.
 pub const SCHEMA_V2: &str = "rand-fast/v2";
+
+#[derive(Clone, Copy)]
+pub(crate) enum ReportKind {
+    Sched,
+    Cpu,
+    Io,
+    OffCpu,
+    Memory,
+    DebugTcpSockets,
+    Net,
+    Diagnose,
+    Daemon,
+}
+
+impl ReportKind {
+    const fn wire_metadata(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Sched => ("sched", SCHEMA),
+            Self::Cpu => ("cpu", SCHEMA),
+            Self::Io => ("io", SCHEMA),
+            Self::OffCpu => ("off-cpu", SCHEMA),
+            Self::Memory => ("memory", SCHEMA),
+            Self::DebugTcpSockets => ("debug-tcp-sockets", SCHEMA),
+            Self::Net => ("net", SCHEMA_V2),
+            Self::Diagnose => ("diagnose", SCHEMA_V2),
+            Self::Daemon => ("daemon", SCHEMA_V2),
+        }
+    }
+}
+
+/// A report's payload type determines both parts of its wire identity.
+pub(crate) trait ReportPayload: Serialize {
+    const KIND: ReportKind;
+}
+
+impl ReportPayload for crate::output::SchedulerJson {
+    const KIND: ReportKind = ReportKind::Sched;
+}
+impl ReportPayload for crate::json_payloads::CpuJson {
+    const KIND: ReportKind = ReportKind::Cpu;
+}
+impl ReportPayload for crate::json_payloads::IoJson {
+    const KIND: ReportKind = ReportKind::Io;
+}
+impl ReportPayload for crate::json_payloads::OffCpuJson {
+    const KIND: ReportKind = ReportKind::OffCpu;
+}
+impl ReportPayload for crate::json_payloads::MemoryJson {
+    const KIND: ReportKind = ReportKind::Memory;
+}
+impl ReportPayload for crate::tcp_ownership::TcpSocketsJson {
+    const KIND: ReportKind = ReportKind::DebugTcpSockets;
+}
+impl ReportPayload for crate::json_payloads::NetJson {
+    const KIND: ReportKind = ReportKind::Net;
+}
+impl ReportPayload for crate::json_payloads::DiagnoseJson {
+    const KIND: ReportKind = ReportKind::Diagnose;
+}
+impl ReportPayload for crate::json_payloads::DaemonJson {
+    const KIND: ReportKind = ReportKind::Daemon;
+}
 
 /// The output format a command was asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -65,11 +127,11 @@ pub enum Format {
 /// Serialized in a fixed order so a document is byte-stable for a given set of
 /// measurements, which makes it diffable and cacheable.
 #[derive(Debug, Clone, Serialize)]
-pub struct Envelope<T: Serialize> {
+pub(crate) struct Envelope<T: ReportPayload> {
     /// Schema identifier for this document.
-    pub schema: &'static str,
+    schema: &'static str,
     /// The subcommand that produced this document.
-    pub command: &'static str,
+    command: &'static str,
     /// Process the report is about.
     pub pid: u32,
     /// Process name at the time of the report, when it could be read.
@@ -85,10 +147,9 @@ pub struct Envelope<T: Serialize> {
     pub data: T,
 }
 
-impl<T: Serialize> Envelope<T> {
-    /// Builds an envelope for one run.
+impl<T: ReportPayload> Envelope<T> {
+    /// Builds an envelope for one run using the payload's wire contract.
     pub fn new(
-        command: &'static str,
         pid: u32,
         process: Option<String>,
         elapsed: Duration,
@@ -96,12 +157,9 @@ impl<T: Serialize> Envelope<T> {
         process_exited: bool,
         data: T,
     ) -> Self {
+        let (command, schema) = T::KIND.wire_metadata();
         Self {
-            schema: if matches!(command, "net" | "diagnose") {
-                SCHEMA_V2
-            } else {
-                SCHEMA
-            },
+            schema,
             command,
             pid,
             process,
@@ -112,12 +170,6 @@ impl<T: Serialize> Envelope<T> {
             process_exited,
             data,
         }
-    }
-
-    /// Marks a report whose measurement types use the v2 contract.
-    pub fn with_v2(mut self) -> Self {
-        self.schema = SCHEMA_V2;
-        self
     }
 
     /// Serializes to a single line, which is what a streaming consumer wants
@@ -138,7 +190,7 @@ impl<T: Serialize> Envelope<T> {
 ///
 /// The command-specific printer owns the human output, so this is the only
 /// place the format choice is applied.
-pub fn emit<T: Serialize>(format: Format, envelope: &Envelope<T>) {
+pub fn emit<T: ReportPayload>(format: Format, envelope: &Envelope<T>) {
     if format == Format::Json {
         println!("{}", envelope.to_line());
     }
@@ -150,7 +202,7 @@ mod tests {
     use serde_json::{Value, json};
 
     /// Renders an envelope to a [`Value`], for asserting on fields.
-    fn to_value<T: Serialize>(envelope: &Envelope<T>) -> Value {
+    fn to_value<T: ReportPayload>(envelope: &Envelope<T>) -> Value {
         serde_json::to_value(envelope).expect("a plain serializable value")
     }
 
@@ -162,9 +214,12 @@ mod tests {
         note: Option<String>,
     }
 
+    impl ReportPayload for Sample {
+        const KIND: ReportKind = ReportKind::Sched;
+    }
+
     fn envelope(data: Sample) -> Envelope<Sample> {
         Envelope::new(
-            "sched",
             42,
             Some("api-server".to_string()),
             Duration::from_millis(10_500),
@@ -172,16 +227,6 @@ mod tests {
             false,
             data,
         )
-    }
-
-    #[test]
-    fn v2_reports_are_explicit_while_other_reports_remain_v1() {
-        let original = envelope(Sample {
-            count: 3,
-            note: None,
-        });
-        assert_eq!(to_value(&original)["schema"], "rand-fast/v1");
-        assert_eq!(to_value(&original.with_v2())["schema"], "rand-fast/v2");
     }
 
     #[test]
@@ -311,7 +356,7 @@ mod tests {
 
     /// The testable form of [`emit`], so the choice can be checked without
     /// capturing stdout.
-    fn emit_to<T: Serialize>(format: Format, envelope: &Envelope<T>, out: &mut Vec<String>) {
+    fn emit_to<T: ReportPayload>(format: Format, envelope: &Envelope<T>, out: &mut Vec<String>) {
         if format == Format::Json {
             out.push(envelope.to_line());
         }
@@ -345,7 +390,6 @@ mod schema_tests {
         }
         stats.record_lost(1);
         Envelope::new(
-            "sched",
             1234,
             Some("api-server".to_string()),
             Duration::from_secs(10),
@@ -370,15 +414,22 @@ mod schema_tests {
     }
 
     #[test]
-    fn corrected_network_reports_use_v2_without_changing_other_commands() {
-        for (command, schema) in [
-            ("net", SCHEMA_V2),
-            ("diagnose", SCHEMA_V2),
-            ("sched", SCHEMA),
-        ] {
-            let envelope = Envelope::new(command, 1, None, Duration::ZERO, false, false, ());
-            assert_eq!(envelope.schema, schema);
+    fn report_payloads_keep_their_wire_contracts() {
+        use crate::{json_payloads::*, output::SchedulerJson, tcp_ownership::TcpSocketsJson};
+
+        fn check<T: ReportPayload>(command: &str, schema: &str) {
+            assert_eq!(T::KIND.wire_metadata(), (command, schema));
         }
+
+        check::<SchedulerJson>("sched", "rand-fast/v1");
+        check::<CpuJson>("cpu", "rand-fast/v1");
+        check::<IoJson>("io", "rand-fast/v1");
+        check::<OffCpuJson>("off-cpu", "rand-fast/v1");
+        check::<MemoryJson>("memory", "rand-fast/v1");
+        check::<TcpSocketsJson>("debug-tcp-sockets", "rand-fast/v1");
+        check::<NetJson>("net", "rand-fast/v2");
+        check::<DiagnoseJson>("diagnose", "rand-fast/v2");
+        check::<DaemonJson>("daemon", "rand-fast/v2");
     }
 
     #[test]

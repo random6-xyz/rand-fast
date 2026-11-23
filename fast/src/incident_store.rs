@@ -1,7 +1,7 @@
 //! Read-only access to incident bundles.
 //!
-//! The daemon's writer in [`crate::daemon_storage`] owns the layout and the
-//! deletion rules. Readers are a different trust problem: they may be a
+//! The daemon's writer in [`crate::daemon_storage`] owns the deletion rules.
+//! Readers are a different trust problem: they may be a
 //! different user, running `fast incidents` against a directory they do not
 //! own, and the bundles they open may have been damaged by a full disk or
 //! edited by someone else. So this module never writes, never follows a
@@ -30,7 +30,7 @@ use std::{
     path::{Component, Path},
 };
 
-use crate::daemon_storage::{MARKER, MARKER_CONTENT};
+use crate::incident_contract::{MARKER, MARKER_CONTENT};
 
 /// Largest manifest, diagnosis, completion marker or summary a reader accepts.
 pub(crate) const TEXT_CAP: u64 = 1024 * 1024;
@@ -291,29 +291,10 @@ fn read_file(dir: &File, name: &OsStr, cap: u64) -> Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
-/// Is this a name the daemon could have written?
-///
-/// The writer and the reader have to agree on this, or rotation and `latest`
-/// would disagree about which directories are incidents. One definition, used
-/// by both.
-pub(crate) fn valid_bundle_name(name: &str) -> bool {
-    let Some((digits, suffix)) = name
-        .strip_prefix("incident-")
-        .and_then(|s| s.split_once('s'))
-    else {
-        return false;
-    };
-    digits.len() >= 12
-        && digits.bytes().all(|b| b.is_ascii_digit())
-        && (suffix.is_empty()
-            || suffix
-                .strip_prefix('-')
-                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())))
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::incident_contract::valid_bundle_name;
     use std::{
         os::unix::fs::{PermissionsExt, symlink},
         sync::atomic::{AtomicU64, Ordering},

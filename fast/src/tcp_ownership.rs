@@ -447,7 +447,6 @@ fn run_tcp_sockets(args: DebugTcpSocketsArgs) -> Result<()> {
     json::emit(
         args.format.format,
         &Envelope::new(
-            "debug-tcp-sockets",
             pid,
             process_name,
             std::time::Duration::ZERO,

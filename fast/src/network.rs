@@ -429,15 +429,13 @@ pub fn run(args: NetArgs) -> Result<()> {
         json::emit(
             args.format.format,
             &Envelope::new(
-                "net",
                 pid,
                 Some(process_name),
                 summary.elapsed,
                 summary.interrupted,
                 summary.process_exited,
                 crate::json_payloads::network_json(&report),
-            )
-            .with_v2(),
+            ),
         );
     }
     Ok(())

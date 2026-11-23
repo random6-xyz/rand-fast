@@ -31,6 +31,7 @@ use serde_json::Value;
 use crate::{
     cli::DaemonArgs,
     cpu,
+    incident_contract::{self as contract, stamp},
     json::{self, Envelope, Format},
     process, runtime,
     trigger::{Interval, Signal, Triggers},
@@ -50,9 +51,6 @@ const PERF_PAGE_COUNT: usize = 4;
 /// readers several hundred times a second, and those wakeups are the dominant
 /// cost of the whole program.
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(1000);
-
-/// Schema for daemon reports and their incident bundles.
-const DAEMON_SCHEMA: &str = "rand-fast/v2";
 
 /// Documented CPU budget, as a fraction of one CPU.
 ///
@@ -209,120 +207,7 @@ fn write_incident(
 ) -> Result<IncidentWrite> {
     let output = storage::Output::open(&args.output)?;
     let directory = output.create(&stamp(entry.at))?;
-
-    // The most recent intervals, not all of them: see BUNDLE_MAX_INTERVALS.
-    // Taken from the end, because the newest is what leads to the trigger.
-    let total_entries = ring.entries().count();
-    let carried = total_entries.min(BUNDLE_MAX_INTERVALS);
-
-    // `entry.at` is elapsed time, which places an incident inside its own
-    // recording but not in an operator's day. Both absolute ends are recorded
-    // now, while the clock is still the one the trigger was observed with.
-    // Whole seconds: a bundle's name is second-granular anyway, and a
-    // fractional rendering would make identical bundles differ in size.
-    let recorded_at_unix_s = crate::utc::now_unix_seconds().map(f64::floor);
-    let recording_started_unix_s =
-        recorded_at_unix_s.map(|now| (now - entry.at.as_secs_f64()).floor());
-
-    let manifest = serde_json::json!({
-        "schema": DAEMON_SCHEMA,
-        "command": "daemon.incident",
-        "recorded_at_s": entry.at.as_secs_f64(),
-        "recorded_at_unix_s": recorded_at_unix_s,
-        "recording_started_unix_s": recording_started_unix_s,
-        "process": { "pid": args.pid },
-        "triggered_by": entry
-            .fired
-            .iter()
-            .map(|signal| serde_json::json!({
-                "signal": signal.name(),
-                "unit": signal.unit(),
-                "threshold": signal.threshold(triggers),
-                "measured": entry.measured(*signal),
-            }))
-            .collect::<Vec<_>>(),
-        "thresholds": triggers
-            .enabled()
-            .iter()
-            .map(|signal| serde_json::json!({
-                "signal": signal.name(),
-                "unit": signal.unit(),
-                "at_or_above": signal.threshold(triggers),
-                "available": *signal != Signal::Retransmissions || entry.tcp_available,
-            }))
-            .collect::<Vec<_>>(),
-        // Stated in the bundle, because a reader who assumed it holds the whole
-        // window would draw the wrong conclusion from a short one.
-        "history": {
-            "intervals_carried": carried,
-            "interval_limit": BUNDLE_MAX_INTERVALS,
-            "ring_window_s": args.window.as_secs_f64(),
-        },
-        "interval": {
-            "at_s": entry.at.as_secs_f64(),
-            "sched_p95_us": entry.sched_p95_us,
-            "sched_samples": entry.sched_samples,
-            "io_p99_us": entry.io_p99_us,
-            "io_samples": entry.io_samples,
-            "io_unmatched": entry.io_unmatched,
-            "retrans": entry.tcp_available.then_some(entry.retrans),
-            "tcp_available": entry.tcp_available,
-            "tcp_reason": entry.tcp_reason,
-            "net_rtt_p95_us": entry.net_rtt_p95_us,
-            "net_connect_p95_us": entry.net_connect_p95_us,
-            "net_connects": entry.net_connects,
-            "net_connect_failures": entry.net_connect_failures,
-            "psi_some_pct": entry.psi_some_pct,
-            "psi_full_pct": entry.psi_full_pct,
-            "lost_events": entry.lost,
-            "queue_lost_events": entry.queue_lost,
-            "lost_events_by_stream": entry.lost_by_stream,
-            "measurement_semantics": MEASUREMENT_SEMANTICS,
-            "recorder_cpu_pct": entry.cpu_cost_pct,
-            "recorder_memory_bytes": entry.memory_bytes,
-        },
-    });
-    directory.json("manifest.json", &manifest)?;
-
-    let intervals: Vec<Value> = ring
-        .entries()
-        .skip(total_entries - carried)
-        .map(RingEntry::to_json)
-        .collect();
-    directory.json("intervals.json", &Value::Array(intervals))?;
-    directory.json("slow-samples.json", &slow.to_json())?;
-
-    // The diagnosis is the same ranking `fast diagnose` prints, fed with what
-    // the recorder has measured. It is not a second, weaker copy of that
-    // command: the signals a background recorder does not collect are named as
-    // uncollected, so "no lock contention found" cannot be read as "lock
-    // contention was looked for and not found".
-    let diagnosis = diagnose_from(&entry, args.pid, slow);
-    directory.json("diagnosis.json", &diagnosis)?;
-    let mut summary = incident_text(&entry, triggers, &diagnosis);
-    if let Some(recorded) = recorded_at_unix_s {
-        summary.insert_str(
-            0,
-            &format!("Recorded at {}\n", crate::utc::timestamp(recorded)),
-        );
-    }
-    directory.write("summary.txt", &summary)?;
-
-    // Written last, and on its own, so a bundle is either complete or absent
-    // rather than a directory that looks finished and is not.
-    directory.json(
-        "complete.json",
-        &serde_json::json!({
-            "schema": DAEMON_SCHEMA,
-            "files": [
-                "manifest.json",
-                "intervals.json",
-                "slow-samples.json",
-                "diagnosis.json",
-                "summary.txt",
-            ],
-        }),
-    )?;
+    write_incident_documents(&directory, ring, &entry, triggers, args, slow)?;
     let rotation_error = match output.rotate(
         args.max_disk_bytes,
         args.max_incidents,
@@ -345,6 +230,107 @@ fn write_incident(
         Err(error) => Some(error),
     };
     Ok(IncidentWrite { rotation_error })
+}
+
+fn write_incident_documents(
+    directory: &storage::Bundle,
+    ring: &Ring,
+    entry: &RingEntry,
+    triggers: &Triggers,
+    args: &DaemonArgs,
+    slow: &SlowSamples,
+) -> Result<()> {
+    // The most recent intervals, not all of them: see BUNDLE_MAX_INTERVALS.
+    // Taken from the end, because the newest is what leads to the trigger.
+    let total_entries = ring.entries().count();
+    let carried = total_entries.min(BUNDLE_MAX_INTERVALS);
+
+    // `entry.at` is elapsed time, which places an incident inside its own
+    // recording but not in an operator's day. Both absolute ends are recorded
+    // now, while the clock is still the one the trigger was observed with.
+    // Whole seconds: a bundle's name is second-granular anyway, and a
+    // fractional rendering would make identical bundles differ in size.
+    let recorded_at_unix_s = crate::utc::now_unix_seconds().map(f64::floor);
+    let recording_started_unix_s =
+        recorded_at_unix_s.map(|now| (now - entry.at.as_secs_f64()).floor());
+
+    let manifest = contract::ManifestV2 {
+        recorded_at_s: entry.at.as_secs_f64(),
+        recorded_at_unix_s,
+        recording_started_unix_s,
+        process: contract::Process { pid: args.pid },
+        triggered_by: entry
+            .fired
+            .iter()
+            .map(|signal| contract::FiredTrigger {
+                signal: signal.name(),
+                unit: signal.unit(),
+                threshold: signal.threshold(triggers),
+                measured: entry.measured(*signal),
+            })
+            .collect(),
+        thresholds: triggers
+            .enabled()
+            .iter()
+            .map(|signal| contract::Threshold {
+                signal: signal.name(),
+                unit: signal.unit(),
+                at_or_above: signal.threshold(triggers),
+                available: *signal != Signal::Retransmissions || entry.tcp_available,
+            })
+            .collect(),
+        // Stated in the bundle, because a reader who assumed it holds the whole
+        // window would draw the wrong conclusion from a short one.
+        history: contract::History {
+            intervals_carried: carried,
+            interval_limit: BUNDLE_MAX_INTERVALS,
+            ring_window_s: args.window.as_secs_f64(),
+        },
+        interval: contract::Interval {
+            at_s: entry.at.as_secs_f64(),
+            sched_p95_us: entry.sched_p95_us,
+            sched_samples: entry.sched_samples,
+            io_p99_us: entry.io_p99_us,
+            io_samples: entry.io_samples,
+            io_unmatched: entry.io_unmatched,
+            retrans: entry.tcp_available.then_some(entry.retrans),
+            tcp_available: entry.tcp_available,
+            tcp_reason: entry.tcp_reason.as_deref(),
+            net_rtt_p95_us: entry.net_rtt_p95_us,
+            net_connect_p95_us: entry.net_connect_p95_us,
+            net_connects: entry.net_connects,
+            net_connect_failures: entry.net_connect_failures,
+            psi_some_pct: entry.psi_some_pct,
+            psi_full_pct: entry.psi_full_pct,
+            lost_events: entry.lost,
+            queue_lost_events: entry.queue_lost,
+            lost_events_by_stream: entry.lost_by_stream,
+            measurement_semantics: MEASUREMENT_SEMANTICS,
+            recorder_cpu_pct: entry.cpu_cost_pct,
+            recorder_memory_bytes: entry.memory_bytes,
+        },
+    };
+
+    let intervals: Vec<Value> = ring
+        .entries()
+        .skip(total_entries - carried)
+        .map(RingEntry::to_json)
+        .collect();
+
+    // The diagnosis is the same ranking `fast diagnose` prints, fed with what
+    // the recorder has measured. It is not a second, weaker copy of that
+    // command: the signals a background recorder does not collect are named as
+    // uncollected, so "no lock contention found" cannot be read as "lock
+    // contention was looked for and not found".
+    let diagnosis = diagnose_from(entry, args.pid, slow);
+    let mut summary = incident_text(entry, triggers, &diagnosis);
+    if let Some(recorded) = recorded_at_unix_s {
+        summary.insert_str(
+            0,
+            &format!("Recorded at {}\n", crate::utc::timestamp(recorded)),
+        );
+    }
+    directory.write_documents(&manifest, intervals, &slow.to_json(), &diagnosis, &summary)
 }
 
 /// A complete bundle may survive even when the subsequent rotation fails.
@@ -578,7 +564,7 @@ fn diagnose_from(entry: &RingEntry, pid: u32, slow: &SlowSamples) -> Value {
     };
     let causes = crate::scoring::score(&evidence);
     serde_json::json!({
-        "schema": DAEMON_SCHEMA,
+        "schema": json::SCHEMA_V2,
         "command": "daemon.incident.diagnosis",
         "pid": pid,
         "scored_by": "the ranking fast diagnose uses, fed with the recorder's own measurements",
@@ -599,21 +585,6 @@ fn diagnose_from(entry: &RingEntry, pid: u32, slow: &SlowSamples) -> Value {
     })
 }
 
-/// The directory an incident at `at` goes in.
-///
-/// The name sorts lexicographically in time order, so `ls` on the output
-/// directory is a timeline. That is not decoration: rotation deletes the oldest
-/// first, and a restart recovers from the newest, so if the names did not sort
-/// by time both would act on the wrong bundle.
-///
-/// The stamp is therefore a zero-padded millisecond count, not a formatted
-/// duration. A human-readable one sorts wrongly: `10s` sorts after `2s`, so
-/// `max()` over the names picks the wrong bundle and rotation would delete a
-/// recent one before an old one. The readable form is in the manifest, where
-/// nothing has to sort it.
-fn stamp(at: Duration) -> String {
-    format!("{:012}s", at.as_millis())
-}
 /// The measurement a signal fired on, in the signal's own unit.
 impl RingEntry {
     fn measured(&self, signal: Signal) -> Option<f64> {
@@ -1289,8 +1260,7 @@ pub fn run(args: DaemonArgs) -> Result<()> {
     if args.format.format == Format::Json {
         json::emit(
             args.format.format,
-            &daemon_envelope(
-                "daemon",
+            &Envelope::new(
                 pid,
                 Some(process_name),
                 summary.elapsed,
@@ -1309,8 +1279,7 @@ pub fn run(args: DaemonArgs) -> Result<()> {
                     state.incidents.throttled,
                     state.incident_write_failed,
                 ),
-            )
-            .with_v2(),
+            ),
         );
     } else {
         print_summary(
@@ -1334,28 +1303,6 @@ pub fn run(args: DaemonArgs) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn daemon_envelope<T: serde::Serialize>(
-    command: &'static str,
-    pid: u32,
-    process: Option<String>,
-    elapsed: Duration,
-    interrupted: bool,
-    process_exited: bool,
-    data: T,
-) -> Envelope<T> {
-    let mut envelope = Envelope::new(
-        command,
-        pid,
-        process,
-        elapsed,
-        interrupted,
-        process_exited,
-        data,
-    );
-    envelope.schema = DAEMON_SCHEMA;
-    envelope
 }
 
 /// Everything a tick updates and the report reads back.
@@ -2126,8 +2073,7 @@ mod tests {
     fn daemon_report_v2_and_v1_bundle_restoration() {
         let mut ring = Ring::new(Duration::from_secs(60), Duration::from_secs(1));
         ring.push(RingEntry::default());
-        let envelope = daemon_envelope(
-            "daemon",
+        let envelope = Envelope::new(
             1,
             None,
             Duration::from_secs(1),
@@ -2158,15 +2104,14 @@ mod tests {
         // marker are the ones the reader expects.
         let output = storage::Output::open(&dir).unwrap();
         let bundle = output.create("000000001000").unwrap();
-        bundle
-            .write("manifest.json", r#"{"schema":"rand-fast/v1"}"#)
-            .unwrap();
-        bundle
-            .write("intervals.json", r#"[{"at_s":1.0,"cpu_percent":87.5}]"#)
-            .unwrap();
-        bundle
-            .write("complete.json", r#"{"schema":"rand-fast/v1"}"#)
-            .unwrap();
+        let path = dir.join(bundle.name());
+        std::fs::write(path.join("manifest.json"), r#"{"schema":"rand-fast/v1"}"#).unwrap();
+        std::fs::write(
+            path.join("intervals.json"),
+            r#"[{"at_s":1.0,"cpu_percent":87.5}]"#,
+        )
+        .unwrap();
+        std::fs::write(path.join("complete.json"), r#"{"schema":"rand-fast/v1"}"#).unwrap();
         let restored = restore_ring(&dir, Duration::from_secs(60));
         assert_eq!(restored.entries.len(), 1);
         assert_eq!(restored.entries[0].cpu_percent, Some(87.5));
@@ -2766,7 +2711,9 @@ mod tests {
             sched_us: vec![],
             io_us: vec![],
         };
-        write_incident(&ring, slow_io_entry(), &triggers, &args, &slow).expect("write bundle");
+        let mut entry = slow_io_entry();
+        entry.psi_some_pct = Some(0.1);
+        write_incident(&ring, entry, &triggers, &args, &slow).expect("write bundle");
 
         let bundle = std::fs::read_dir(&dir)
             .expect("read output dir")
@@ -2774,12 +2721,61 @@ mod tests {
             .expect("one bundle")
             .expect("entry")
             .path();
-        let manifest: Value = serde_json::from_str(
-            &std::fs::read_to_string(bundle.join("manifest.json")).expect("read manifest"),
-        )
-        .expect("parse manifest");
-
+        let manifest_text =
+            std::fs::read_to_string(bundle.join("manifest.json")).expect("read manifest");
+        let manifest: Value = serde_json::from_str(&manifest_text).expect("parse manifest");
+        assert_eq!(
+            manifest_text,
+            serde_json::to_string_pretty(&manifest).unwrap()
+        );
+        assert_eq!(
+            manifest
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "command",
+                "history",
+                "interval",
+                "process",
+                "recorded_at_s",
+                "recorded_at_unix_s",
+                "recording_started_unix_s",
+                "schema",
+                "thresholds",
+                "triggered_by",
+            ]
+        );
         assert_eq!(manifest["schema"], "rand-fast/v2");
+        assert_eq!(manifest["command"], "daemon.incident");
+        assert_eq!(manifest["process"], serde_json::json!({"pid": args.pid}));
+        assert_eq!(
+            manifest["history"],
+            serde_json::json!({
+                "intervals_carried": 1,
+                "interval_limit": 60,
+                "ring_window_s": args.window.as_secs_f64(),
+            })
+        );
+        assert_eq!(
+            manifest["interval"]["psi_some_pct"],
+            serde_json::json!(0.1_f32)
+        );
+
+        let complete = std::fs::read_to_string(bundle.join("complete.json")).unwrap();
+        let expected = serde_json::json!({
+            "schema": "rand-fast/v2",
+            "files": [
+                "manifest.json", "intervals.json", "slow-samples.json", "diagnosis.json",
+                "summary.txt",
+            ],
+        });
+        assert_eq!(complete, serde_json::to_string_pretty(&expected).unwrap());
+        for file in expected["files"].as_array().unwrap() {
+            assert!(bundle.join(file.as_str().unwrap()).is_file());
+        }
         // The absolute time is recorded beside the elapsed one: a bundle that
         // only says "11s into the recording" cannot be placed on a timeline.
         let recorded = manifest["recorded_at_unix_s"]
@@ -2827,6 +2823,31 @@ mod tests {
         assert!(text.contains("io_p99"), "summary names the trigger: {text}");
         assert!(text.contains("900000"), "summary states the value: {text}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_summary_write_does_not_mark_the_bundle_complete() {
+        let dir = crate::incident_store::tests::Temp::new();
+        let args = default_args(&dir.0);
+        let triggers = Triggers::from_args(&args);
+        let ring = Ring::new(Duration::from_secs(60), Duration::from_secs(1));
+        let slow = SlowSamples {
+            sched_us: vec![],
+            io_us: vec![],
+        };
+        let entry = slow_io_entry();
+        let output = storage::Output::open(&args.output).unwrap();
+        let bundle = output.create(&stamp(entry.at)).unwrap();
+        let path = args.output.join(bundle.name());
+        std::fs::write(path.join("summary.txt"), "must not overwrite").unwrap();
+
+        assert!(write_incident_documents(&bundle, &ring, &entry, &triggers, &args, &slow).is_err());
+        assert!(path.join("diagnosis.json").is_file());
+        assert_eq!(
+            std::fs::read_to_string(path.join("summary.txt")).unwrap(),
+            "must not overwrite"
+        );
+        assert!(!path.join("complete.json").exists());
     }
 
     #[test]
