@@ -258,6 +258,7 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
                         &mut offcpu_stats,
                     ),
                 ],
+                on_start: None,
                 on_tick: Some(Box::new(move |_at, _summary| {
                     collector.borrow_mut().reconcile();
                     clock.elapsed()

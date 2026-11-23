@@ -705,37 +705,43 @@ fn incident_text(entry: &RingEntry, triggers: &Triggers, diagnosis: &Value) -> S
     text
 }
 
-/// The recorder's own resource use, read from `/proc/self`.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct SelfUsage {
-    /// CPU time consumed, in ticks.
-    pub ticks: u64,
-    /// Resident set size in bytes.
-    pub rss_bytes: u64,
+#[derive(Debug, Clone, Copy)]
+struct RecorderCpuSample {
+    at: Instant,
+    cpu_time: Duration,
 }
 
-/// Reads the current process' CPU time and resident set.
-///
-/// Both come from `/proc/self` rather than from a library so the measurement
-/// cannot itself inflate what it measures: no allocation, no formatting, two
-/// small file reads.
-pub fn read_self_usage() -> SelfUsage {
-    SelfUsage {
-        ticks: read_self_cpu_ticks().unwrap_or(0),
-        rss_bytes: read_self_rss_bytes().unwrap_or(0),
+fn read_recorder_cpu() -> Option<RecorderCpuSample> {
+    let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    // The process clock includes user and system time across all recorder
+    // threads, with finer resolution than the scheduler ticks in /proc/stat.
+    if unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, time.as_mut_ptr()) } != 0 {
+        return None;
     }
+    let at = Instant::now();
+    // Success guarantees that clock_gettime initialized the timespec.
+    let time = unsafe { time.assume_init() };
+    let cpu_time = Duration::new(time.tv_sec.try_into().ok()?, time.tv_nsec.try_into().ok()?);
+    Some(RecorderCpuSample { at, cpu_time })
 }
 
-/// CPU time consumed so far, in clock ticks.
-pub fn read_self_cpu_ticks() -> Result<u64> {
-    let stat = fs::read_to_string("/proc/self/stat").context("read /proc/self/stat")?;
-    let end = stat.rfind(')').context("malformed /proc/self/stat")?;
-    let fields: Vec<&str> = stat[end + 2..].split_whitespace().collect();
-    // Fields after the comm field start at index 0 = state; utime is the 12th
-    // and stime the 13th, which is index 11 and 12 here.
-    let utime = fields.get(11).and_then(|v| v.parse().ok()).unwrap_or(0);
-    let stime = fields.get(12).and_then(|v| v.parse().ok()).unwrap_or(0);
-    Ok(utime + stime)
+fn record_cpu_cost(
+    previous: &mut Option<RecorderCpuSample>,
+    current: Option<RecorderCpuSample>,
+    peak_cpu_pct: &mut f64,
+) -> Option<f64> {
+    // A failed sample breaks the baseline, rather than charging two windows of
+    // CPU time to the next reported interval.
+    let before = std::mem::replace(previous, current)?;
+    let after = current?;
+    let wall = after.at.checked_duration_since(before.at)?;
+    if wall.is_zero() {
+        return None;
+    }
+    let cpu = after.cpu_time.checked_sub(before.cpu_time)?;
+    let cost = cpu.as_secs_f64() / wall.as_secs_f64() * 100.0;
+    *peak_cpu_pct = peak_cpu_pct.max(cost);
+    Some(cost)
 }
 
 /// Resident set size of the current process, in bytes.
@@ -752,23 +758,6 @@ pub fn read_self_rss_bytes() -> Result<u64> {
         }
     }
     Ok(0)
-}
-
-/// Clock ticks per second, from the kernel.
-pub fn clock_ticks_per_second() -> f64 {
-    // getconf would need a subprocess; the value is fixed at 100 on every
-    // architecture Linux supports for getrusage, and a wrong value here would
-    // only affect the reported cost, not the collection.
-    100.0
-}
-
-/// Converts a tick delta into a percentage of one CPU over a wall interval.
-pub fn cpu_cost_pct(ticks: u64, elapsed: Duration) -> f64 {
-    let seconds = elapsed.as_secs_f64();
-    if seconds <= 0.0 {
-        return 0.0;
-    }
-    ticks as f64 / clock_ticks_per_second() / seconds * 100.0
 }
 
 /// The rolling window.
@@ -1060,7 +1049,8 @@ struct Cumulative {
 #[derive(Debug, Clone, Copy, Default)]
 struct PreviousTick {
     at: Duration,
-    usage: SelfUsage,
+    rss_bytes: u64,
+    recorder_cpu: Option<RecorderCpuSample>,
     totals: Cumulative,
     /// The previous successful target accounting reading.
     target_cpu: Option<(Instant, u64)>,
@@ -1161,7 +1151,6 @@ pub fn run(args: DaemonArgs) -> Result<()> {
         ring,
         previous: PreviousTick {
             at: restored.previous_at,
-            usage: read_self_usage(),
             ..PreviousTick::default()
         },
         peak_cpu_pct: 0.0,
@@ -1176,6 +1165,7 @@ pub fn run(args: DaemonArgs) -> Result<()> {
         tcp_available: false,
         tcp_reason: Some("collection has not started".to_string()),
     }));
+    let start_state = std::rc::Rc::clone(&state);
     let tick_state = std::rc::Rc::clone(&state);
     // The tick callback needs the thresholds and the output directory, both of
     // which come from the command line, so it holds its own copy rather than a
@@ -1232,6 +1222,9 @@ pub fn run(args: DaemonArgs) -> Result<()> {
                     connect_snapshot,
                 ),
             ],
+            on_start: Some(Box::new(move || {
+                start_state.borrow_mut().previous.recorder_cpu = read_recorder_cpu();
+            })),
             on_tick: Some(Box::new(move |at, summary| {
                 let tick_started = Instant::now();
                 let mut state = tick_state.borrow_mut();
@@ -1505,35 +1498,36 @@ fn tick_with_target_cpu(
         }
     }
 
-    let usage = read_self_usage();
+    let rss_bytes = read_self_rss_bytes().unwrap_or(0);
+    let cost = record_cpu_cost(
+        &mut previous.recorder_cpu,
+        read_recorder_cpu(),
+        peak_cpu_pct,
+    )
+    .unwrap_or(0.0);
     // End the interval when the CPU counters were sampled, not before the
-    // callback and /proc reads. The individual reads are not atomic.
+    // callback and accounting reads. The individual reads are not atomic.
     let at = at
         .saturating_add(tick_started.elapsed())
         .saturating_add(*time_offset);
     let psi = crate::memory::read_psi("/proc/pressure/memory");
     let target_cpu_percent = interval_cpu_percent(previous.target_cpu, target_cpu);
 
-    // The first tick has nothing to difference against, so it only records the
-    // baseline. Reporting a difference against zero would make the very first
-    // interval look like the entire run so far.
+    // The first tick primes target accounting and stream counters. Recorder
+    // CPU already has its own baseline at collection start and contributed to
+    // the peak above, even though this tick does not append a ring entry.
     if !previous.primed {
         previous.at = at;
-        previous.usage = usage;
+        previous.rss_bytes = rss_bytes;
         previous.primed = true;
         previous.totals = current;
         previous.target_cpu = target_cpu;
         *ticks = 1;
-        *peak_cpu_pct = (*peak_cpu_pct).max(cpu_cost_pct(usage.ticks, at));
-        *peak_memory_bytes = (*peak_memory_bytes).max(usage.rss_bytes);
+        *peak_memory_bytes = (*peak_memory_bytes).max(rss_bytes);
         return Ok(());
     }
 
-    // Both sides carry the same offset, so the interval is unaffected by it.
-    let window = at.saturating_sub(previous.at);
-    let cpu_ticks = usage.ticks.saturating_sub(previous.usage.ticks);
-    let cost = cpu_cost_pct(cpu_ticks, window);
-    let memory = usage.rss_bytes.max(previous.usage.rss_bytes);
+    let memory = rss_bytes.max(previous.rss_bytes);
 
     let before = previous.totals;
     // The queue counter is already an interval count: the runtime swaps it to
@@ -1642,11 +1636,10 @@ fn tick_with_target_cpu(
     };
     ring.push(entry);
 
-    *peak_cpu_pct = (*peak_cpu_pct).max(cost);
     *peak_memory_bytes = (*peak_memory_bytes).max(memory);
     *ticks = ticks.saturating_add(1);
     previous.at = at;
-    previous.usage = usage;
+    previous.rss_bytes = rss_bytes;
     previous.totals = current;
     previous.target_cpu = target_cpu;
     incident_result
@@ -3377,38 +3370,68 @@ mod tests {
     }
 
     #[test]
-    fn cpu_cost_is_a_percentage_of_one_cpu() {
-        // A hundred ticks over one second is a whole core, so 100%.
-        assert!((cpu_cost_pct(100, Duration::from_secs(1)) - 100.0).abs() < 1e-9);
-        assert!((cpu_cost_pct(50, Duration::from_secs(1)) - 50.0).abs() < 1e-9);
-        assert_eq!(cpu_cost_pct(100, Duration::ZERO), 0.0);
+    fn recorder_cpu_peak_excludes_setup_but_includes_the_first_interval() {
+        let started = Instant::now();
+        let sample = |wall_ms, cpu_ms| {
+            Some(RecorderCpuSample {
+                at: started + Duration::from_millis(wall_ms),
+                cpu_time: Duration::from_millis(cpu_ms),
+            })
+        };
+        let mut baseline = sample(0, 500);
+        let mut peak = 0.0;
+        let first = record_cpu_cost(&mut baseline, sample(1000, 540), &mut peak).unwrap();
+        assert_eq!(first, 4.0);
+        assert_eq!(peak, first);
+        assert!(peak < BUDGET_CPU_PCT);
+
+        // The final half-second interval gets its own denominator. A genuine
+        // peak still fails the budget, even after an inexpensive first tick.
+        let tail = record_cpu_cost(&mut baseline, sample(1500, 580), &mut peak).unwrap();
+        assert_eq!(tail, 8.0);
+        assert_eq!(peak, tail);
+        assert!(peak > BUDGET_CPU_PCT);
     }
 
     #[test]
-    fn a_two_percent_budget_is_two_percent_of_one_cpu() {
-        // The documented budget is a fraction of one CPU, not of the host, so
-        // it means the same thing on a 4-core box and a 64-core one.
-        let within = cpu_cost_pct(2, Duration::from_secs(1)) <= BUDGET_CPU_PCT;
-        assert!(within, "two ticks a second is inside a two percent budget");
-        let over = cpu_cost_pct(10, Duration::from_secs(1)) > BUDGET_CPU_PCT;
-        assert!(over, "ten ticks a second is not");
+    fn recorder_cpu_missing_or_invalid_samples_do_not_create_a_spike() {
+        let started = Instant::now();
+        let sample = |wall_s, cpu_ms| {
+            Some(RecorderCpuSample {
+                at: started + Duration::from_secs(wall_s),
+                cpu_time: Duration::from_millis(cpu_ms),
+            })
+        };
+        let mut baseline = sample(0, 500);
+        let mut peak = 0.0;
+        assert_eq!(record_cpu_cost(&mut baseline, None, &mut peak), None);
+        assert_eq!(
+            record_cpu_cost(&mut baseline, sample(2, 800), &mut peak),
+            None
+        );
+        assert_eq!(
+            record_cpu_cost(&mut baseline, sample(2, 800), &mut peak),
+            None
+        );
+        assert_eq!(
+            record_cpu_cost(&mut baseline, sample(3, 790), &mut peak),
+            None
+        );
+        assert_eq!(peak, 0.0);
+        assert_eq!(
+            record_cpu_cost(&mut baseline, sample(4, 810), &mut peak),
+            Some(2.0)
+        );
+        assert_eq!(peak, 2.0);
     }
 
     #[test]
     fn the_recorder_reads_its_own_usage() {
-        // The budget is measured, not asserted, so the measurement has to work
-        // on the platform the recorder runs on.
-        let usage = read_self_usage();
-        assert!(usage.rss_bytes > 0, "a running process has a resident set");
-        // The tick count is not asserted to be positive: a process that started
-        // moments ago has legitimately consumed nothing at the ten-millisecond
-        // resolution this reads at. What is checked is that the parse agrees
-        // with the file it came from, which is the part that can be wrong.
-        let stat = fs::read_to_string("/proc/self/stat").expect("read own stat");
-        let end = stat.rfind(')').expect("own stat has a comm field");
-        let fields: Vec<&str> = stat[end + 2..].split_whitespace().collect();
-        let expected: u64 = fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap();
-        assert!(read_self_cpu_ticks().expect("parse own ticks") >= expected);
+        assert!(read_self_rss_bytes().expect("read own RSS") > 0);
+        let first = read_recorder_cpu().expect("read own process CPU clock");
+        let next = read_recorder_cpu().expect("read own process CPU clock again");
+        assert!(next.at >= first.at);
+        assert!(next.cpu_time >= first.cpu_time);
     }
 
     #[test]

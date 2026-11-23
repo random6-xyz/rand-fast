@@ -401,6 +401,7 @@ pub fn run(args: NetArgs) -> Result<()> {
                     SharedStats(Rc::clone(&stats)),
                 ),
             ],
+            on_start: None,
             on_tick: Some(Box::new(move |_at, _summary| {
                 reconcile.borrow_mut().reconcile();
                 tick_started.elapsed()

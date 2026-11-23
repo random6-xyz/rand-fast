@@ -663,6 +663,9 @@ fn should_run_tick(next_tick: Instant, now: Instant, ticked_this_iteration: &mut
 pub struct MultiStreams<'a> {
     /// One entry per `PerfEventArray` to consume.
     pub streams: Vec<EventStream<'a>>,
+    /// Called once after perf readers are set up, immediately before timing
+    /// the collection. A caller can take a baseline that excludes setup.
+    pub on_start: Option<Box<dyn FnOnce() + 'a>>,
     /// Called periodically and once after the final drain. Each stream defines
     /// its snapshot semantics. `None` for a collection that only reports at the end.
     pub on_tick: Option<TickCallback<'a>>,
@@ -690,6 +693,7 @@ pub fn run_multi_collection<'a>(
 ) -> Result<CollectionSummary> {
     let MultiStreams {
         mut streams,
+        on_start,
         mut on_tick,
         mut on_progress,
     } = consumers;
@@ -778,6 +782,9 @@ pub fn run_multi_collection<'a>(
     }
     drop(sender);
 
+    if let Some(start) = on_start {
+        start();
+    }
     let started = Instant::now();
     let mut next_refresh = started + THREAD_REFRESH_INTERVAL;
     let mut next_tick = started + options.tick_interval;
