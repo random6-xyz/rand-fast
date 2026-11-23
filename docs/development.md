@@ -40,20 +40,25 @@ The build produces `target/release/fast`, `target/release/sched-workload`, and
 8. `tools/test-rank-eval.sh`: the ranking gate rejects missing, empty, and wrong
    runs
 9. `tools/test-qemu-ci.sh`: the CI guest-log audit rejects partial runs
-10. `tools/test-kernel-build.sh`: the kernel pin table and build failure paths
-11. `tools/check-license-metadata.sh`: workspace license metadata
+10. `tools/test-bench.sh`: the paired benchmark accepts valid and rejects
+    zero-work runs
+11. `tools/test-bench-check.sh`: the calibrated gate detects regressions and
+    missing data
+12. `tools/test-kernel-build.sh`: the kernel pin table and build failure paths
+13. `python3 tools/test-kernel-changes.py`: the PR change classifier catches
+    kernel-sensitive paths and reports comparison errors
+14. `tools/check-license-metadata.sh`: workspace license metadata
 
 The gate succeeds only when the script exits zero. The eBPF verifier and real
 kernel behavior require the separate QEMU gate below; a host-only gate is not a
 substitute for it.
 
-The incident reader is covered twice: unit tests build bundles in temporary
-directories (complete, incomplete, legacy, damaged, symlinked, oversized, and
-permission-denied) and assert that each is reported with its own reason, and
-the QEMU smoke matrix's `check_incidents` case produces a real bundle in the
-guest, then lists, shows, summarizes, exports, and caps it. The reader is not
-an eBPF consumer, so its unit tests are the primary coverage; the guest case
-proves it reads what the real recorder writes.
+Workspace tests pin each command's JSON envelope and representative payload
+encoding. Incident tests check the files and completion marker written by the
+recorder and the reader's handling of complete, incomplete, legacy, damaged,
+symlinked, oversized, and permission-denied bundles. The QEMU smoke matrix's
+`check_incidents` case records a real bundle in the guest, then lists, shows,
+summarizes, exports, and caps it.
 
 ### Diagnosis scenarios
 
@@ -83,15 +88,16 @@ repeated ranking evaluation records where the cause ranked.
 ### Real-kernel CI gate
 
 The `qemu-real-kernel` job in `.github/workflows/ci.yml` runs on every pull
-request and main push. The weekly `kernel-matrix` job covers the pinned
-compatibility set, and also runs on main pushes, manual dispatches, and pull
-requests that touch kernel-facing paths (`fast-ebpf/`, the tracepoint and
-block-request layout code, `tools/kernel/`, the QEMU scripts, or the scenario
-manifest) or carry the `kernel-matrix` label. Each cell provisions QEMU and
-kernel build tools, builds its kernel from the verified tarball in
-`tools/kernel/kernels.tsv` with the profile's config fragment, boots the guest
-with `tools/qemu-run.sh`, and audits the log with
-`tools/check-qemu-results.sh`.
+request and main push. The expanded `kernel-matrix` also runs on weekly,
+main-push, and manual events, or on a pull request with the `kernel-matrix`
+label or kernel-sensitive changes. `tools/kernel/changes.py` compares the PR
+head with the merge base and classifies paths in the product crates, build
+configuration, QEMU tooling, fixtures, and workflows. A PR skips the expanded
+matrix only when classification succeeds and reports no relevant changes and
+the label is absent. Each cell provisions QEMU and kernel build tools, builds
+its kernel from the verified tarball in `tools/kernel/kernels.tsv` with the
+profile's config fragment, boots the guest with `tools/qemu-run.sh`, and audits
+the log with `tools/check-qemu-results.sh`.
 
 The audit is what makes the job meaningful: a missing BTF/tracefs facility, a
 required verifier check that did not run, an unexpected `SKIP`, a scenario
@@ -167,8 +173,8 @@ KERNEL=/path/to/bzImage tools/qemu-run.sh --duration 5s
 RANK_EVAL=1 KERNEL=/path/to/bzImage tools/qemu-run.sh
 ```
 
-The runner builds release binaries and an initramfs, boots the guest under KVM,
-runs `tools/qemu-smoke.sh` in the guest, and prints the results. `OUT_DIR`
+The runner builds release binaries and an initramfs, boots the guest under KVM
+or TCG, runs `tools/qemu-smoke.sh` in the guest, and prints the results. `OUT_DIR`
 selects the host staging directory; `CPUS`, `MEM_MB`, `FAST`, and `DURATION`
 provide other overrides. `--keep` retains generated artifacts. The guest is
 packed with root-owned files and normal permissions to exercise incident
@@ -195,8 +201,9 @@ with `SCM_RIGHTS`. The assertions are in `check_tcp_ownership` in
 endpoint from the unrelated process, fails the case.
 
 The CI gate uses the pinned Linux 6.12.115 build with `CONFIG_PSI=y`, four
-vCPUs, and TCG on GitHub-hosted runners; local validation uses the
-kernel-server bpf-next 7.2.0-rc6 image with KVM and eight vCPUs. Latency and
-cost vary by accelerator and host; only explicit smoke script thresholds are
-acceptance criteria, and the accelerator is recorded in the guest log and the
-cell artifact.
+vCPUs, and TCG on GitHub-hosted runners. With a different local image, audit
+`$OUT_DIR/guest.log` with `tools/check-qemu-results.sh`, passing the expected
+kernel release with `--kernel` and its PSI setting with `--psi yes|no`.
+Record the image and accelerator separately from the pinned CI results.
+Latency and cost vary by accelerator and host; the daemon CPU budget is
+reported but not enforced under TCG.

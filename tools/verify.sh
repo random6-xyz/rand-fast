@@ -14,7 +14,8 @@
 #  10. test-bench.sh          the paired benchmark accepts valid and rejects zero-work runs
 #  11. test-bench-check.sh    calibrated gate detects regressions and missing data
 #  12. test-kernel-build.sh   the kernel pin table and build failure paths
-#  13. check-license-metadata.sh every workspace package declares both licenses
+#  13. test-kernel-changes.py  kernel CI catches relevant changes and diff failures
+#  14. check-license-metadata.sh every workspace package declares both licenses
 #
 # The eBPF verifier needs a real kernel; tools/qemu-smoke.sh runs that inside
 # the QEMU guest and is a separate, manual step.
@@ -50,6 +51,7 @@ step 'QEMU CI result audit' tools/test-qemu-ci.sh
 step 'benchmark harness' tools/test-bench.sh
 step 'benchmark gate' tools/test-bench-check.sh
 step 'kernel build contract' tools/test-kernel-build.sh
+step 'kernel change classification' python3 tools/test-kernel-changes.py
 step 'license metadata' tools/check-license-metadata.sh
 
 printf '\n'
