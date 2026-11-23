@@ -54,14 +54,20 @@ EOF
 }
 
 run_check() {
-    # run_check <name> <expected-status> [mutator]
+    # run_check <name> <expected-status> [mutator] [accelerator; empty to infer]
     name=$1
     expected=$2
     make_good_log "$TMP/good.log"
-    if [ $# -ge 3 ]; then
-        "$3" "$TMP/good.log"
+    if [ $# -ge 3 ] && ! "$3" "$TMP/good.log"; then
+        fail "could not prepare $name fixture"
+        return
     fi
-    "$CHECK" --log "$TMP/good.log" --kernel 6.12.115 --accelerator tcg \
+    accelerator=${4-tcg}
+    set --
+    if [ -n "$accelerator" ]; then
+        set -- --accelerator "$accelerator"
+    fi
+    "$CHECK" --log "$TMP/good.log" --kernel 6.12.115 "$@" \
         --psi yes --scenarios "$SCENARIO_COUNT" --output "$TMP/$name.json" >"$TMP/$name.out" 2>&1
     status=$?
     if [ "$status" -ne "$expected" ]; then
@@ -80,8 +86,15 @@ mutate_bootfail() { printf 'Booting the kernel...\nNo working init found.\n' >"$
 mutate_btf() { sed -i '/guest: BTF present/d' "$1"; }
 mutate_tracefs() { sed -i '/guest: tracefs mounted/d' "$1"; }
 mutate_psi() { sed -i 's/guest: pressure\/memory available/guest: pressure\/memory unavailable/' "$1"; }
+mutate_crlf() {
+    awk '{ printf "%s\r\n", $0 }' "$1" >"$1.crlf" && mv "$1.crlf" "$1"
+}
+mutate_crlf_failed() { mutate_rc "$1" && mutate_crlf "$1"; }
 
 run_check good 0
+run_check crlf_pinned 0 mutate_crlf
+run_check crlf_inferred 0 mutate_crlf ''
+run_check crlf_failed 1 mutate_crlf_failed ''
 run_check rc 1 mutate_rc
 run_check skip 1 mutate_skip
 run_check missing_verifier 1 mutate_missing_verifier
@@ -131,9 +144,28 @@ fi
 if ! grep -q '"result":"fail"' "$TMP/rc.json"; then
     fail "a failing run did not write result=fail"
 fi
+if ! python3 - "$TMP" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+for name, expected in (
+    ("crlf_pinned", "pass"),
+    ("crlf_inferred", "pass"),
+    ("crlf_failed", "fail"),
+):
+    record = json.loads((Path(sys.argv[1]) / f"{name}.json").read_bytes())
+    assert record["schema"] == "rand-fast/qemu-cell/v1", name
+    assert record["accelerator"] == "tcg", name
+    assert record["result"] == expected, name
+    assert record["problems"] == ("" if expected == "pass" else "missing:rc=0"), name
+PY
+then
+    fail "CRLF logs did not produce the expected cell JSON"
+fi
 
 if [ "$FAILURES" -ne 0 ]; then
     echo "test-qemu-ci: $FAILURES case(s) failed" >&2
     exit 1
 fi
-echo "test-qemu-ci: pass, rc, skip, missing-verifier, kernel, scenario, accelerator, boot, BTF, tracefs and PSI cases passed"
+echo "test-qemu-ci: pass, rc, skip, missing-verifier, kernel, scenario, accelerator, boot, BTF, tracefs, PSI and CRLF cases passed"

@@ -299,7 +299,6 @@ pub fn run(args: CpuArgs) -> Result<()> {
         json::emit(
             args.format.format,
             &Envelope::new(
-                "cpu",
                 pid,
                 Some(process_name),
                 summary.elapsed,

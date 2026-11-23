@@ -12,21 +12,12 @@ use std::{
     path::{Component, Path},
 };
 
-/// The file that makes a directory a bundle, and its only accepted content.
-///
-/// Shared with the reader, which treats a missing or different marker as user
-/// data rather than as a damaged incident.
-pub(crate) const MARKER: &str = ".rand-fast-incident";
-pub(crate) const MARKER_CONTENT: &str = "rand-fast incident bundle v1\n";
-const FILES: &[&str] = &[
-    MARKER,
-    "manifest.json",
-    "intervals.json",
-    "slow-samples.json",
-    "diagnosis.json",
-    "summary.txt",
-    "complete.json",
-];
+use serde_json::Value;
+
+use crate::incident_contract::{
+    COMPLETE, CompleteV2, DIAGNOSIS, INTERVALS, MANIFEST, MARKER, MARKER_CONTENT, ManifestV2,
+    SLOW_SAMPLES, SUMMARY, bundle_name, is_bundle_file, valid_bundle_name,
+};
 
 fn cstr(name: &OsStr) -> Result<CString> {
     Ok(CString::new(name.as_bytes())?)
@@ -196,11 +187,7 @@ impl Output {
     }
     pub(super) fn create(&self, stamp: &str) -> Result<Bundle> {
         for suffix in 1..=1000 {
-            let name = if suffix == 1 {
-                format!("incident-{stamp}")
-            } else {
-                format!("incident-{stamp}-{suffix}")
-            };
+            let name = bundle_name(stamp, suffix);
             match mkdirat(&self.dir, OsStr::new(&name)) {
                 Ok(()) => {
                     let dir = open_dir(&self.dir, OsStr::new(&name))?;
@@ -308,7 +295,7 @@ impl Output {
         let Some(name_str) = name.to_str() else {
             return Ok(None);
         };
-        if !crate::incident_store::valid_bundle_name(name_str) {
+        if !valid_bundle_name(name_str) {
             return Ok(None);
         }
         let dir = open_dir(&self.dir, name)?;
@@ -319,7 +306,7 @@ impl Output {
             let Some(s) = name.to_str() else {
                 return Ok(None);
             };
-            if !FILES.contains(&s) {
+            if !is_bundle_file(s) {
                 return Ok(None);
             }
             let file = openat(&dir, &name, libc::O_RDONLY | libc::O_NONBLOCK)?;
@@ -349,7 +336,7 @@ impl Output {
             let Some(s) = name.to_str() else {
                 bail!("unknown bundle entry")
             };
-            if !FILES.contains(&s) {
+            if !is_bundle_file(s) {
                 bail!("unknown bundle entry");
             }
             let file = openat(&dir, &name, libc::O_RDONLY | libc::O_NONBLOCK)?;
@@ -373,7 +360,7 @@ impl Output {
             }
             if openat(
                 &dir,
-                OsStr::new("complete.json"),
+                OsStr::new(COMPLETE),
                 libc::O_RDONLY | libc::O_NONBLOCK,
             )
             .and_then(|f| {
@@ -389,7 +376,7 @@ impl Output {
             }
             let Ok(file) = openat(
                 &dir,
-                OsStr::new("intervals.json"),
+                OsStr::new(INTERVALS),
                 libc::O_RDONLY | libc::O_NONBLOCK,
             ) else {
                 continue;
@@ -432,7 +419,24 @@ impl Bundle {
     pub(super) fn name(&self) -> &str {
         &self.name
     }
-    pub(super) fn write(&self, name: &str, text: &str) -> Result<()> {
+    pub(super) fn write_documents(
+        &self,
+        manifest: &ManifestV2<'_>,
+        intervals: Vec<Value>,
+        slow_samples: &Value,
+        diagnosis: &Value,
+        summary: &str,
+    ) -> Result<()> {
+        self.json(MANIFEST, &manifest.to_value()?)?;
+        self.json(INTERVALS, &Value::Array(intervals))?;
+        self.json(SLOW_SAMPLES, slow_samples)?;
+        self.json(DIAGNOSIS, diagnosis)?;
+        self.write(SUMMARY, summary)?;
+        // Readers use the presence of this file as the completion signal.
+        self.json(COMPLETE, &serde_json::to_value(CompleteV2::DOCUMENT)?)
+    }
+
+    fn write(&self, name: &str, text: &str) -> Result<()> {
         let mut file = openat(
             &self.dir,
             OsStr::new(name),
@@ -441,7 +445,7 @@ impl Bundle {
         file.write_all(text.as_bytes())?;
         Ok(())
     }
-    pub(super) fn json(&self, name: &str, value: &serde_json::Value) -> Result<()> {
+    fn json(&self, name: &str, value: &Value) -> Result<()> {
         self.write(name, &serde_json::to_string_pretty(value)?)
     }
 }

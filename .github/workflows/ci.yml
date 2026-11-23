@@ -52,21 +52,19 @@ jobs:
       - id: paths
         name: Compare the pull request with its base
         env:
-          BASE: ${{ github.base_ref }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
-          if git diff --name-only "origin/$BASE...HEAD" \
-            | grep -Eq '^(fast-ebpf/|fast-common/|fast/src/(tracepoint_layout|io_request_layout|network|json_payloads)\.rs|tools/kernel/|tools/qemu-|tools/scenarios\.json|\.github/(actions/run-qemu-gate|workflows/ci\.yml))'; then
-            echo "kernel=true" >>"$GITHUB_OUTPUT"
-          else
-            echo "kernel=false" >>"$GITHUB_OUTPUT"
-          fi
+          kernel=$(python3 tools/kernel/changes.py "$BASE" "$HEAD") || exit 1
+          echo "kernel=$kernel" >>"$GITHUB_OUTPUT"
 
   kernel-matrix:
     name: Kernel matrix (${{ matrix.id }})
     needs: kernel-changes
     if: |
       always() && (github.event_name != 'pull_request'
-        || needs.kernel-changes.outputs.kernel == 'true'
+        || needs.kernel-changes.result != 'success'
+        || needs.kernel-changes.outputs.kernel != 'false'
         || contains(github.event.pull_request.labels.*.name, 'kernel-matrix'))
     runs-on: ubuntu-24.04
     timeout-minutes: 180

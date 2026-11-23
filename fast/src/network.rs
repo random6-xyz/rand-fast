@@ -401,6 +401,7 @@ pub fn run(args: NetArgs) -> Result<()> {
                     SharedStats(Rc::clone(&stats)),
                 ),
             ],
+            on_start: None,
             on_tick: Some(Box::new(move |_at, _summary| {
                 reconcile.borrow_mut().reconcile();
                 tick_started.elapsed()
@@ -429,15 +430,13 @@ pub fn run(args: NetArgs) -> Result<()> {
         json::emit(
             args.format.format,
             &Envelope::new(
-                "net",
                 pid,
                 Some(process_name),
                 summary.elapsed,
                 summary.interrupted,
                 summary.process_exited,
                 crate::json_payloads::network_json(&report),
-            )
-            .with_v2(),
+            ),
         );
     }
     Ok(())

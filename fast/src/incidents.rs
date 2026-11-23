@@ -36,6 +36,7 @@ use crate::{
         IncidentExportArgs, IncidentListArgs, IncidentShowArgs, IncidentSummaryArgs,
         IncidentsCommand, ReportFormat,
     },
+    incident_contract::{COMPLETE, DIAGNOSIS, INTERVALS, MANIFEST, SLOW_SAMPLES, SUMMARY},
     incident_store::{BULK_CAP, Bundle, Store, TEXT_CAP},
     json::Format,
     utc,
@@ -44,15 +45,6 @@ use crate::{
 /// The reader's schema. New commands get a new number because a consumer has
 /// to handle documents that are not process reports at all.
 const SCHEMA: &str = "rand-fast/v3";
-
-/// A bundle is complete when the daemon wrote its last document.
-const COMPLETE: &str = "complete.json";
-
-const MANIFEST: &str = "manifest.json";
-const DIAGNOSIS: &str = "diagnosis.json";
-const INTERVALS: &str = "intervals.json";
-const SLOW_SAMPLES: &str = "slow-samples.json";
-const SUMMARY: &str = "summary.txt";
 
 pub(crate) fn run(command: IncidentsCommand) -> Result<()> {
     match command {
@@ -224,20 +216,18 @@ fn inspect(bundle: Bundle) -> Incident {
         Err(error) => incident.damage.push(format!("bundle listing: {error}")),
     }
     match bundle.read_json(MANIFEST, TEXT_CAP) {
-        Ok(Some(Value::Object(_))) => {}
+        Ok(Some(manifest @ Value::Object(_))) => {
+            // Preserve the unreadable state if listing the bundle failed.
+            if incident.damage.is_empty() {
+                read_manifest(&mut incident, &manifest);
+                incident.manifest = Some(manifest);
+            }
+        }
         Ok(Some(_)) => incident
             .damage
             .push(format!("{MANIFEST} is not a JSON object")),
         Ok(None) => incident.damage.push(format!("{MANIFEST} is missing")),
         Err(error) => incident.damage.push(format!("{MANIFEST}: {error}")),
-    }
-    if incident.damage.is_empty() {
-        // Only a parsed manifest can populate the fields, and only a manifest
-        // that parsed counts as readable.
-        incident.manifest = bundle.read_json(MANIFEST, TEXT_CAP).ok().flatten();
-        if let Some(manifest) = incident.manifest.clone() {
-            read_manifest(&mut incident, &manifest);
-        }
     }
     match bundle.read_json(DIAGNOSIS, TEXT_CAP) {
         Ok(Some(diagnosis)) => {
@@ -1532,8 +1522,7 @@ mod tests {
     use crate::incident_store::tests::Temp;
     use std::fs;
 
-    const MARKER: &str = crate::daemon_storage::MARKER;
-    const MARKER_CONTENT: &str = crate::daemon_storage::MARKER_CONTENT;
+    use crate::incident_contract::{MARKER, MARKER_CONTENT};
 
     /// Writes a bundle with the documents a real recorder produces.
     fn write_bundle(

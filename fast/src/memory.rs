@@ -316,7 +316,6 @@ pub fn run(args: MemoryArgs) -> Result<()> {
         json::emit(
             args.format.format,
             &Envelope::new(
-                "memory",
                 pid,
                 Some(process_name),
                 summary.elapsed,

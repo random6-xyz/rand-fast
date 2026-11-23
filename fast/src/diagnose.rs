@@ -258,6 +258,7 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
                         &mut offcpu_stats,
                     ),
                 ],
+                on_start: None,
                 on_tick: Some(Box::new(move |_at, _summary| {
                     collector.borrow_mut().reconcile();
                     clock.elapsed()
@@ -359,15 +360,13 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
         json::emit(
             args.format.format,
             &Envelope::new(
-                "diagnose",
                 pid,
                 Some(process_name),
                 summary.elapsed,
                 summary.interrupted,
                 summary.process_exited,
                 crate::json_payloads::diagnose_json(&evidence),
-            )
-            .with_v2(),
+            ),
         );
     } else {
         print_report(&process_name, pid, &summary, &evidence);

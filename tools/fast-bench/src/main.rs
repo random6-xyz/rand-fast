@@ -699,9 +699,9 @@ mod tests {
             .map(|value| value.to_string_lossy().into_owned())
             .collect();
         assert_eq!(text[0], "mem-hog");
-        assert!(text.contains(&"5s".to_string()));
-        assert!(text.contains(&"/tmp/report.json".to_string()));
-        assert!(!text.contains(&"/bin/fast-workload".to_string()));
+        assert!(text.iter().any(|arg| arg == "5s"));
+        assert!(text.iter().any(|arg| arg == "/tmp/report.json"));
+        assert!(!text.iter().any(|arg| arg == "/bin/fast-workload"));
     }
 
     #[test]

@@ -436,7 +436,6 @@ pub fn run(args: OffCpuArgs) -> Result<()> {
         json::emit(
             args.format.format,
             &Envelope::new(
-                "off-cpu",
                 pid,
                 Some(process_name),
                 summary.elapsed,

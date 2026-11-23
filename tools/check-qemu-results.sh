@@ -105,6 +105,8 @@ esac
 # (a self-hosted runner with KVM), and a mismatch is a failure. When omitted,
 # the recorded value is still required to exist and is copied into the cell.
 recorded_accelerator=$(sed -n 's/^guest: accelerator //p' "$log" | head -1)
+# The serial console can emit CRLF. Command substitution removes LF, not CR.
+recorded_accelerator=${recorded_accelerator%"$(printf '\r')"}
 if [ -z "$recorded_accelerator" ]; then
     problems="$problems missing:accelerator"
 elif [ -n "$accelerator" ] && [ "$recorded_accelerator" != "$accelerator" ]; then

@@ -71,7 +71,6 @@ pub fn run(args: SchedArgs) -> Result<()> {
         json::emit(
             args.format.format,
             &Envelope::new(
-                "sched",
                 pid,
                 Some(process_name),
                 summary.elapsed,

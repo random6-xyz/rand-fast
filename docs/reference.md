@@ -242,7 +242,11 @@ Unavailable measurements in v2 can be `null`; do not interpret `null` as zero:
   `cpu_percent` is `null` when process accounting is unavailable. A failed
   `/proc` read breaks the baseline; the next successful read starts a new one.
   CPU and retransmission triggers do not fire on `null`; values above 100 are
-  valid for a multithreaded process.
+  valid for a multithreaded process. `recorder_cpu_pct` measures the recorder
+  itself on the scale of one logical CPU. Its run-wide peak includes the
+  first collection interval but excludes one-time setup (including eBPF load,
+  attach, and perf-reader initialization). CPU and elapsed time are measured
+  between the same accounting samples, independently of restored history.
 
 Incident reader documents use v3 and do not follow the report envelope: they
 describe a directory or a bundle, not a process run. They embed the bundle's
