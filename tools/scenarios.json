@@ -38,16 +38,16 @@
     {
       "name": "sched-contention",
       "kind": "positive",
-      "description": "Thirty-two threads convoy on one futex in the observed process, so every handoff is a wakeup that can wait behind running threads. The assertion is that scheduler latency is measured and attributable, not that it outranks the lock wait; ranking is measured separately.",
+      "description": "A batch-scheduled periodic sleeper and four CPU-bound threads share one allowed CPU in the observed process. The sleeper's report independently checks wake-up latency while diagnose measures scheduler delay. This case checks attribution, not ranking.",
       "fixture": [
-        "fast-workload",
-        "lock-hog",
+        "sched-workload",
+        "target",
         "--duration",
         "6s",
-        "--workers",
-        "32",
-        "--hold-ms",
-        "1"
+        "--period",
+        "1ms",
+        "--contention-workers",
+        "4"
       ],
       "background": [],
       "prerequisites": [

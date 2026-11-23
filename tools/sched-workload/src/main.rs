@@ -51,6 +51,10 @@ struct TargetArgs {
     /// Time between wakeups.
     #[arg(long, default_value = "1ms", value_parser = parse_duration)]
     period: Duration,
+
+    /// Run this many CPU-bound threads on the same CPU as the waking thread.
+    #[arg(long, default_value_t = 0)]
+    contention_workers: usize,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -88,9 +92,79 @@ fn run_target(args: TargetArgs) -> Result<(), String> {
     }
 
     println!("target pid: {}", std::process::id());
+    if args.contention_workers > 0 {
+        pin_to_available_cpu()?;
+    }
+
+    let deadline = Instant::now() + args.duration;
+    let stop = AtomicBool::new(false);
+    thread::scope(|workers| {
+        let result = (|| {
+            for worker in 0..args.contention_workers {
+                let stop = &stop;
+                thread::Builder::new()
+                    .name(format!("sched-contender-{worker}"))
+                    .spawn_scoped(workers, move || burn_cpu(stop, deadline))
+                    .map_err(|error| format!("spawn scheduler contender: {error}"))?;
+            }
+            if args.contention_workers > 0 {
+                // The sleeper should wait behind runnable work instead of
+                // preempting a CPU-bound thread as soon as it wakes. Batch
+                // scheduling is unprivileged and applies only to this thread.
+                let params = libc::sched_param { sched_priority: 0 };
+                if unsafe { libc::sched_setscheduler(0, libc::SCHED_BATCH, &params) } != 0 {
+                    return Err(format!(
+                        "set sleeper scheduling policy: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            }
+            observe_wakeups(&args, deadline)
+        })();
+        stop.store(true, Ordering::Relaxed);
+        result
+    })
+}
+
+fn pin_to_available_cpu() -> Result<(), String> {
+    // Threads spawned by the target inherit its affinity. Constraining the
+    // fixture to one allowed CPU creates runnable contention regardless of how
+    // many CPUs the host or guest has or which CPU indices it permits.
+    let size = std::mem::size_of::<libc::cpu_set_t>();
+    // A zeroed cpu_set_t is an empty affinity mask.
+    let mut allowed: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sched_getaffinity(0, size, &mut allowed) } != 0 {
+        return Err(format!(
+            "read CPU affinity: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let cpu = (0..libc::CPU_SETSIZE as usize)
+        .find(|&cpu| unsafe { libc::CPU_ISSET(cpu, &allowed) })
+        .ok_or_else(|| "CPU affinity mask is empty".to_string())?;
+    let mut pinned: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    unsafe { libc::CPU_SET(cpu, &mut pinned) };
+    if unsafe { libc::sched_setaffinity(0, size, &pinned) } != 0 {
+        return Err(format!(
+            "pin to CPU {cpu}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+fn burn_cpu(stop: &AtomicBool, deadline: Instant) {
+    let mut value = 0u64;
+    while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+        for _ in 0..4096 {
+            value = black_box(value.wrapping_mul(31).wrapping_add(1));
+        }
+    }
+}
+
+fn observe_wakeups(args: &TargetArgs, deadline: Instant) -> Result<(), String> {
     let latencies = LatencySamples::default();
     mark_ready(&args.common)?;
-    let deadline = Instant::now() + args.duration;
     let mut cycles = 0u64;
     while Instant::now() < deadline {
         let started = Instant::now();

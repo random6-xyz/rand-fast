@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 clap.workspace = true
 humantime.workspace = true
+libc.workspace = true
