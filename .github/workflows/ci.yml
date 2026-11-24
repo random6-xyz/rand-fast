@@ -43,6 +43,7 @@ jobs:
             target/release/fast
             target/release/sched-workload
             target/release/fast-workload
+            target/release/fast-bench
           if-no-files-found: error
           retention-days: 7
 

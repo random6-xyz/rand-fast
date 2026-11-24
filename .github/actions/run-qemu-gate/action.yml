@@ -76,9 +76,9 @@ runs:
       # Artifact archives do not preserve the executable bit.
       run: |
         chmod +x target/release/fast target/release/sched-workload \
-          target/release/fast-workload
+          target/release/fast-workload target/release/fast-bench
         ls -l target/release/fast target/release/sched-workload \
-          target/release/fast-workload
+          target/release/fast-workload target/release/fast-bench
 
     - name: Boot the guest and run the real-kernel matrix
       shell: bash
