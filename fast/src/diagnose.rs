@@ -106,6 +106,12 @@ pub struct Evidence {
     pub psi_available: bool,
     /// Swap in use, in KiB.
     pub swap_kb: u64,
+    /// Swap in use when the collection started, in KiB.
+    ///
+    /// Swap pressure is growth over the window, not the amount resident, so
+    /// this baseline is what makes the evidence true: a machine that was
+    /// already swapped out before the run was not "leaning on swap" during it.
+    pub swap_start_kb: u64,
     /// Records the kernel dropped across the perf streams, with a note of
     /// which stream each count came from. A signal with losses is still
     /// reported, but the count says how far to trust it.
@@ -204,6 +210,11 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
     if let Some(progress) = progress.as_mut() {
         progress.started();
     }
+
+    // Swap pressure is growth over the window, so the baseline is taken
+    // before collection starts. Reading only the end value would make whatever
+    // was already resident look like it appeared during the run.
+    let swap_start_kb = memory::read_swap_used_kb();
 
     let collected = {
         let on_progress: Option<runtime::ProgressCallback<'_>> = progress
@@ -354,6 +365,7 @@ pub fn run(args: DiagnoseArgs) -> Result<()> {
         faults,
         psi,
         swap_kb,
+        swap_start_kb,
         lost,
     );
     if args.format.format == Format::Json {
@@ -391,6 +403,7 @@ fn collect_evidence(
     faults: memory::ProcFaults,
     psi: memory::Psi,
     swap_kb: u64,
+    swap_start_kb: u64,
     lost: Vec<(&'static str, u64)>,
 ) -> Evidence {
     // Rates need a window; a run shorter than a millisecond would divide by
@@ -439,6 +452,7 @@ fn collect_evidence(
         psi_full_pct: psi.full_pct,
         psi_available: psi.available,
         swap_kb,
+        swap_start_kb,
         lost,
     }
 }
@@ -520,7 +534,10 @@ fn print_report(name: &str, pid: u32, summary: &runtime::CollectionSummary, evid
         evidence.minor_faults_per_s, evidence.major_faults_per_s, evidence.reclaims_per_s
     );
     println!("  memory psi: {}", describe_psi(evidence));
-    println!("  swap used: {} KiB", evidence.swap_kb);
+    println!(
+        "  swap used: {} KiB ({} KiB when collection started)",
+        evidence.swap_kb, evidence.swap_start_kb
+    );
     println!("  lost events: {}", describe_lost(evidence));
 
     println!();

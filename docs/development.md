@@ -91,12 +91,17 @@ The `qemu-real-kernel` job in `.github/workflows/ci.yml` runs on every pull
 request and main push. The expanded `kernel-matrix` also runs on weekly,
 main-push, and manual events, or on a pull request with the `kernel-matrix`
 label or kernel-sensitive changes. `tools/kernel/changes.py` compares the PR
-head with the merge base and classifies paths in the product crates, build
-configuration, QEMU tooling, fixtures, and workflows. A PR skips the expanded
+head with the merge base and classifies only the paths that can change what a
+kernel does with the program: the eBPF crates, the collectors that read a
+tracepoint or a socket, the build inputs of the embedded object, the harness,
+and the workflow itself. Report formatting, the daemon, incidents, the CLI, and
+the documentation cannot change that surface, so a change there runs the
+always-on 6.12.115 gate only. A PR skips the expanded
 matrix only when classification succeeds and reports no relevant changes and
 the label is absent. Each cell provisions QEMU and kernel build tools, builds
 its kernel from the verified tarball in `tools/kernel/kernels.tsv` with the
-profile's config fragment, boots the guest with `tools/qemu-run.sh`, and audits
+profile's config fragment, restores the release binaries built once by the
+`build` job, boots the guest with `tools/qemu-run.sh`, and audits
 the log with `tools/check-qemu-results.sh`.
 
 The audit is what makes the job meaningful: a missing BTF/tracefs facility, a
@@ -119,9 +124,14 @@ version, the config fragment, and the build script, so a source change rebuilds
 and an unchanged matrix does not.
 
 GitHub-hosted runners have no `/dev/kvm`, so the job runs under QEMU's TCG
-emulation with a 70-minute guest timeout and a 180-minute job timeout; the
-kernel build dominates the first uncached run. The same path is reproducible on
-a KVM host with `ACCEL=tcg CPUS=2 tools/qemu-run.sh`. `QEMU_TIMEOUT` bounds the guest
+emulation with a 25-minute guest timeout and a 60-minute job timeout. The
+release binaries are built once by the `build` job and restored as an
+artifact, so a cell spends its time on the kernel build and the guest, not on
+recompiling the product. The measured durations and the reasoning behind the
+limits are recorded in [CI duration](ci-duration.md). The same path is
+reproducible on a KVM host with `ACCEL=tcg CPUS=2 tools/qemu-run.sh`, and
+`SKIP_BUILD=1` makes it reuse an existing `target/release` tree instead of
+rebuilding it. `QEMU_TIMEOUT` bounds the guest
 and `CPUS`/`MEM_MB` keep the guest inside the runner. A self-hosted runner with
 `/dev/kvm` uses KVM automatically and records the accelerator in the log. The
 local reproduction is the same command sequence documented above, with the

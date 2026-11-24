@@ -560,7 +560,11 @@ fn diagnose_from(entry: &RingEntry, pid: u32, slow: &SlowSamples) -> Value {
         // than as having none of the pressure, or the memory cause is ruled out
         // by a reading that was never taken.
         psi_available: entry.psi_some_pct.is_some(),
+        // The ring does not record swap at all, so there is no baseline to
+        // compare against; stating zero growth is honest, inventing a reading
+        // would not be.
         swap_kb: 0,
+        swap_start_kb: 0,
     };
     let causes = crate::scoring::score(&evidence);
     serde_json::json!({

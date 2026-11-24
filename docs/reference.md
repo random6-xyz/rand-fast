@@ -45,6 +45,15 @@ Diagnosis ranks causes using the measured evidence and thresholds in
 of the measured slowdown, not a probability. Missing measurements are not
 proof that a bottleneck is absent.
 
+Memory pressure is judged from major faults, direct reclaims, PSI and swap,
+and the swap signal is the amount that appeared *during* the window, not the
+amount resident. A host that was already using swap before the run is not
+reported as leaning on it during the run, which is why `data.measured`
+carries `swap_start_kb` (the baseline taken when collection started) beside
+`swap_kb` (the value at the end) and why the text report prints both numbers.
+`memory` and `diagnose` share one verdict, so the two commands cannot
+disagree about the same process.
+
 ## Flight recorder
 
 The daemon records an interval every `--interval` (default `1s`) and retains a

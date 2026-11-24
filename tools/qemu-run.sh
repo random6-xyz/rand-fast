@@ -23,6 +23,8 @@
 #   RANK_EVAL  1 repeats every scenario for the accuracy report (default 0)
 #   RANK_REPETITIONS  runs per scenario when RANK_EVAL=1 (default 3)
 #   QEMU_TIMEOUT  seconds before the guest is killed (default 1800)
+#   SKIP_BUILD  1 skips `cargo build --release`; the binaries must already
+#               exist in target/release (default 0)
 #   ACCEL      auto, kvm or tcg (default auto: KVM when /dev/kvm is usable)
 #   QEMU_SMOKE_CASE  all or tcp-ownership (default all)
 #
@@ -112,8 +114,15 @@ INITRAMFS="$OUT_DIR/initramfs.img.gz"
 LOG="$OUT_DIR/guest.log"
 
 # --- release binaries -------------------------------------------------------
-log "building release binaries"
-( cd "$ROOT" && cargo build --release ) >/dev/null 2>&1 || die "cargo build --release failed"
+# CI builds the binaries once and shares them between cells, so the rebuild is
+# optional. The presence checks below still run either way: a missing binary is
+# a staging error, not something to rebuild silently.
+if [ "${SKIP_BUILD:-0}" = 1 ]; then
+    log "skipping the release build (SKIP_BUILD=1)"
+else
+    log "building release binaries"
+    ( cd "$ROOT" && cargo build --release ) >/dev/null 2>&1 || die "cargo build --release failed"
+fi
 [ -x "$FAST" ] || die "fast binary is not executable: $FAST"
 log "testing fast binary $FAST"
 for binary in sched-workload fast-workload; do

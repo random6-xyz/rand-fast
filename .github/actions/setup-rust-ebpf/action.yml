@@ -13,8 +13,23 @@ runs:
         chmod +x /tmp/llvm.sh
         sudo /tmp/llvm.sh 19
         sudo apt-get install --yes llvm-19-dev libclang-19-dev
+    - name: Cache the cargo installations
+      uses: actions/cache@v4
+      with:
+        # bpf-linker takes minutes to compile and only changes with its version;
+        # the registry and git caches cover every other cargo invocation.
+        path: |
+          ~/.cargo/bin
+          ~/.cargo/registry
+          ~/.cargo/git
+        key: ${{ runner.os }}-rust-ebpf-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml') }}-bpf-linker-0.9.14
     - name: Install bpf-linker
       shell: bash
       env:
         LLVM_SYS_191_PREFIX: /usr/lib/llvm-19
-      run: cargo install bpf-linker --version 0.9.14 --locked
+      run: |
+        if bpf-linker --version 2>/dev/null | grep -q 'bpf-linker 0\.9\.14'; then
+          echo "bpf-linker 0.9.14 restored from the cache"
+        else
+          cargo install bpf-linker --version 0.9.14 --locked
+        fi

@@ -24,10 +24,41 @@ jobs:
       - name: Run verification gate
         run: tools/verify.sh
 
+  build:
+    name: Release binaries
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust-ebpf
+      # The QEMU cells all need the same binaries, and a release build is over
+      # a minute per cell. Building once here (on the older image, so the
+      # artifact runs on the newer one) removes it from every cell.
+      - name: Build the release binaries
+        run: cargo build --release --locked
+      - name: Upload the release binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast-binaries
+          path: |
+            target/release/fast
+            target/release/sched-workload
+            target/release/fast-workload
+            target/release/fast-bench
+          if-no-files-found: error
+          retention-days: 7
+
   qemu-real-kernel:
     name: Real-kernel QEMU gate (6.12.115)
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    needs: [build, kernel-changes]
+    # The gate is the per-pull-request check, so it runs unless the change
+    # classification asked for the whole matrix instead.
+    if: |
+      always() && needs.build.result == 'success' && (github.event_name != 'pull_request'
+        || needs.kernel-changes.result != 'success'
+        || needs.kernel-changes.outputs.kernel != 'false'
+        || contains(github.event.pull_request.labels.*.name, 'kernel-matrix'))
+    timeout-minutes: 60
     concurrency:
       group: qemu-${{ github.ref }}
       cancel-in-progress: true
@@ -38,6 +69,7 @@ jobs:
           kernel-id: 6.12.115
           kernel-version: 6.12.115
           psi: yes
+          binaries-artifact: fast-binaries
 
   kernel-changes:
     name: Detect kernel-sensitive changes
@@ -60,14 +92,14 @@ jobs:
 
   kernel-matrix:
     name: Kernel matrix (${{ matrix.id }})
-    needs: kernel-changes
+    needs: [build, kernel-changes]
     if: |
-      always() && (github.event_name != 'pull_request'
+      always() && needs.build.result == 'success' && (github.event_name != 'pull_request'
         || needs.kernel-changes.result != 'success'
         || needs.kernel-changes.outputs.kernel != 'false'
         || contains(github.event.pull_request.labels.*.name, 'kernel-matrix'))
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 60
     concurrency:
       group: qemu-matrix-${{ github.ref }}-${{ matrix.id }}
       cancel-in-progress: true
@@ -98,6 +130,7 @@ jobs:
           kernel-id: ${{ matrix.id }}
           kernel-version: ${{ matrix.version }}
           psi: ${{ matrix.psi }}
+          binaries-artifact: fast-binaries
 
   benchmark:
     name: Collector overhead benchmark
