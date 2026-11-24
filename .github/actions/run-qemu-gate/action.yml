@@ -18,7 +18,14 @@ inputs:
   guest-timeout:
     description: Seconds before the guest is killed
     required: false
-    default: '4200'
+    # 25 minutes: the measured guest run is about 10 minutes on TCG, and the
+    # retry below doubles the worst case, so a wedged cell fails fast instead
+    # of occupying a runner for an hour.
+    default: '1500'
+  binaries-artifact:
+    description: Artifact name holding prebuilt release binaries (empty builds them in this job)
+    required: false
+    default: ''
   psi:
     description: Whether this image was built with PSI (yes|no)
     required: false
@@ -56,12 +63,30 @@ runs:
         kernel=$(tools/kernel/build.sh "${{ inputs.kernel-id }}")
         echo "KERNEL=$kernel" >>"$GITHUB_ENV"
 
+    - name: Restore the prebuilt release binaries
+      if: inputs.binaries-artifact != ''
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.binaries-artifact }}
+        path: target/release
+
+    - name: Mark the restored binaries executable
+      if: inputs.binaries-artifact != ''
+      shell: bash
+      # Artifact archives do not preserve the executable bit.
+      run: |
+        chmod +x target/release/fast target/release/sched-workload \
+          target/release/fast-workload
+        ls -l target/release/fast target/release/sched-workload \
+          target/release/fast-workload
+
     - name: Boot the guest and run the real-kernel matrix
       shell: bash
       env:
         CPUS: ${{ inputs.cpus }}
         MEM_MB: ${{ inputs.mem-mb }}
         QEMU_TIMEOUT: ${{ inputs.guest-timeout }}
+        SKIP_BUILD: ${{ inputs.binaries-artifact != '' && '1' || '0' }}
       run: |
         # TCG is known to panic occasionally under SMP with heavy futex
         # traffic. One fresh boot is retried only for a kernel panic; a

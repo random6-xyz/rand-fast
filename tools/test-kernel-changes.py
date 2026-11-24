@@ -9,6 +9,11 @@ import unittest
 
 CLASSIFIER = Path(__file__).resolve().parent / "kernel" / "changes.py"
 
+# One baseline file on each side of the classification: the matrix gate must
+# notice the kernel-facing one and ignore the user-space one.
+SENSITIVE_BASELINE = "fast/src/memory.rs"
+USER_SPACE_BASELINE = "fast/src/runtime.rs"
+
 
 class KernelChangesTest(unittest.TestCase):
     def setUp(self):
@@ -17,7 +22,8 @@ class KernelChangesTest(unittest.TestCase):
         self.repo = Path(directory.name)
         self.git("init", "--quiet", "--template=")
         self.write("README.md", "before\n")
-        self.write("fast/src/runtime.rs", "baseline\n")
+        self.write(SENSITIVE_BASELINE, "baseline\n")
+        self.write(USER_SPACE_BASELINE, "baseline\n")
         self.base = self.commit()
 
     def git(self, *args):
@@ -53,26 +59,45 @@ class KernelChangesTest(unittest.TestCase):
 
     def test_documentation_and_similarly_named_paths_are_not_sensitive(self):
         self.write("README.md")
-        self.write("docs/fast/src/runtime.rs")
+        self.write("docs/fast/src/memory.rs")
         self.write("fast-tools/runtime.rs")
         self.write("tools/rank-eval.sh.bak")
-        self.write("docs/notes\nfast/src/fake.rs")
+        self.write("docs/notes\nfast/src/memory.rs")
         self.commit()
         self.expect(self.base, "false")
 
-    def test_runtime_build_and_gate_inputs_are_sensitive(self):
+    def test_user_space_changes_keep_the_expanded_matrix_out(self):
+        # Report formatting, the daemon, incidents, and the CLI cannot change
+        # what a kernel does with the eBPF program.
+        for path in (
+            USER_SPACE_BASELINE,
+            "fast/src/daemon.rs",
+            "fast/src/scoring.rs",
+            "fast/src/cli.rs",
+            "fast/tests/example.rs",
+            "tools/test-kernel-changes.py",
+        ):
+            with self.subTest(path=path):
+                self.write(path)
+                self.commit()
+                self.expect(self.base, "false")
+
+    def test_kernel_surface_paths_are_sensitive(self):
         base = self.base
         for path in (
-            "fast/src/runtime.rs", "fast/build.rs", "fast/tests/example.rs",
+            SENSITIVE_BASELINE, "fast/src/tcp.rs", "fast/src/network.rs",
+            "fast/src/tcp_ownership.rs", "fast/src/tracepoint_layout.rs",
+            "fast/src/io_request_layout.rs", "fast/build.rs", "fast/Cargo.toml",
             "fast-common/src/lib.rs", "fast-ebpf/src/main.rs",
             "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml",
             "tools/kernel/kernels.tsv", "tools/qemu-smoke.sh", "tools/qemu-guest-mount.c",
             "tools/scenarios.json", "tools/scenarios.sh", "tools/scenarios-lib.sh",
             "tools/rank-eval.sh", "tools/check-qemu-results.sh",
             "tools/sched-workload/src/main.rs", "tools/fast-workload/Cargo.toml",
-            "tools/fast-bench/src/main.rs", ".github/workflows/ci.yml",
+            ".github/workflows/ci.yml",
             ".github/actions/run-qemu-gate/action.yml",
-            ".github/actions/setup-rust-ebpf/action.yml", "fast/file with a\nnewline",
+            ".github/actions/setup-rust-ebpf/action.yml",
+            "fast-ebpf/src/file with a\nnewline",
         ):
             with self.subTest(path=path):
                 self.write(path)
@@ -81,15 +106,15 @@ class KernelChangesTest(unittest.TestCase):
                 base = head
 
     def test_deleting_a_sensitive_path(self):
-        (self.repo / "fast/src/runtime.rs").unlink()
+        (self.repo / SENSITIVE_BASELINE).unlink()
         self.commit()
         self.expect(self.base, "true")
 
     def test_moving_into_or_out_of_a_sensitive_path(self):
-        self.git("mv", "fast/src/runtime.rs", "documented.rs")
+        self.git("mv", SENSITIVE_BASELINE, "documented.rs")
         moved_out = self.commit()
         self.expect(self.base, "true")
-        self.git("mv", "documented.rs", "fast/src/runtime.rs")
+        self.git("mv", "documented.rs", SENSITIVE_BASELINE)
         self.commit()
         self.expect(moved_out, "true")
 
