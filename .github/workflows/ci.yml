@@ -51,13 +51,14 @@ jobs:
     name: Real-kernel QEMU gate (6.12.115)
     runs-on: ubuntu-24.04
     needs: [build, kernel-changes]
-    # The gate is the per-pull-request check, so it runs unless the change
-    # classification asked for the whole matrix instead.
+    # The gate is the per-pull-request check, so a pull request the classifier
+    # called user-space still boots one real kernel: that cell is the only place
+    # the collector meets a kernel on that path. Kernel-surface pull requests,
+    # main pushes, and the weekly run get the full matrix instead, so the two
+    # never boot the same kernel twice.
     if: |
-      always() && needs.build.result == 'success' && (github.event_name != 'pull_request'
-        || needs.kernel-changes.result != 'success'
-        || needs.kernel-changes.outputs.kernel != 'false'
-        || contains(github.event.pull_request.labels.*.name, 'kernel-matrix'))
+      always() && needs.build.result == 'success' && github.event_name == 'pull_request'
+        && needs.kernel-changes.outputs.kernel == 'false'
     timeout-minutes: 60
     concurrency:
       group: qemu-${{ github.ref }}

@@ -102,6 +102,12 @@ steady-state per-cell time did.
 The structural win is the user-space path, where the matrix no longer runs at
 all; the kernel path stays guest-bound until the guest run itself is split.
 
+One correction went in with this measurement. The gate job's condition also
+consulted the classifier with the matrix's polarity, so a user-space pull
+request skipped the gate as well and ran no guest at all. The two jobs are
+now complementary on purpose, and `tools/test-kernel-changes.py` fails if
+that pairing is ever swapped again.
+
 ## Not done
 
 - **Sharding the guest run.** Splitting the scenarios across cells, or running
