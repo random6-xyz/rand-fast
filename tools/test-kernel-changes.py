@@ -124,6 +124,27 @@ class KernelChangesTest(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertIn("kernel changes:", result.stderr)
 
+    def test_the_gate_runs_for_pull_requests_the_classifier_called_user_space(self):
+        # A user-space pull request skips the matrix, so the single gate cell is
+        # the only real kernel the collector meets on that path. The two jobs
+        # must stay complementary: if the gate stops covering user-space
+        # changes, that path silently loses its only real-kernel check.
+        workflow = (CLASSIFIER.parents[2] / ".github/workflows/ci.yml").read_text()
+        gate = self.job(workflow, "qemu-real-kernel")
+        matrix = self.job(workflow, "kernel-matrix")
+        self.assertIn("outputs.kernel == 'false'", gate)
+        self.assertIn("outputs.kernel != 'false'", matrix)
+
+    def job(self, workflow, name):
+        lines = workflow.splitlines()
+        start = lines.index(f"  {name}:")
+        block = [lines[start]]
+        for line in lines[start + 1 :]:
+            if line.startswith("  ") and not line.startswith("   ") and line.rstrip().endswith(":"):
+                break
+            block.append(line)
+        return "\n".join(block)
+
 
 if __name__ == "__main__":
     unittest.main()
