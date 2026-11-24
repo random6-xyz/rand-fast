@@ -101,3 +101,4 @@ reading it on a production host. Run `./fast --help` or
 Licensed under either the [MIT License](LICENSE-MIT) or the
 [Apache License, Version 2.0](LICENSE-APACHE). Release archives also include
 third-party Rust dependency license texts.
+
