@@ -117,7 +117,9 @@ pub fn read_proc_faults(pid: u32) -> Result<ProcFaults> {
 /// that would read as "no pressure".
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Psi {
-    /// True when /proc/pressure/memory could be read.
+    /// True when PSI was read *and* understood. Being able to open the file is not
+    /// enough: a zero from an unreadable field would rule out pressure that was
+    /// never measured.
     pub available: bool,
     /// Share of the last 10s in which at least some task was stalled, in
     /// percent.
@@ -128,37 +130,41 @@ pub struct Psi {
 }
 
 /// Reads memory PSI, reporting unavailability rather than zeroes.
+///
+/// The file is only treated as understood when both the `some` and `full`
+/// lines carry a parsable `avg10`. A partially understood file leaves the
+/// kernel's pressure unknown, and unknown is reported as unavailable so the
+/// scoring never reads it as "measured no pressure".
 pub fn read_psi(path: &str) -> Psi {
     let Ok(content) = fs::read_to_string(path) else {
         return Psi::default();
     };
-    let mut psi = Psi {
-        available: true,
-        ..Psi::default()
-    };
+    let mut some = None;
+    let mut full = None;
     for line in content.lines() {
-        let (which, value) = if let Some(rest) = line.strip_prefix("some") {
-            ("some", parse_avg10(rest))
+        if let Some(rest) = line.strip_prefix("some") {
+            some = parse_avg10(rest);
         } else if let Some(rest) = line.strip_prefix("full") {
-            ("full", parse_avg10(rest))
-        } else {
-            continue;
-        };
-        match which {
-            "some" => psi.some_pct = value,
-            _ => psi.full_pct = value,
+            full = parse_avg10(rest);
         }
     }
-    psi
+    match (some, full) {
+        (Some(some_pct), Some(full_pct)) => Psi {
+            available: true,
+            some_pct,
+            full_pct,
+        },
+        _ => Psi::default(),
+    }
 }
 
 /// Extracts the avg10 value from a PSI line body, which is a space-separated
-/// list of key=value pairs.
-fn parse_avg10(body: &str) -> f32 {
+/// list of key=value pairs. Returns `None` when the field is absent or
+/// unreadable, because that is not the same as a measured zero.
+fn parse_avg10(body: &str) -> Option<f32> {
     body.split_whitespace()
         .find_map(|part| part.strip_prefix("avg10="))
         .and_then(|value| value.parse().ok())
-        .unwrap_or(0.0)
 }
 
 /// Swap currently in use, in KiB.
@@ -622,8 +628,26 @@ mod tests {
 
     #[test]
     fn extracts_avg10_from_a_line() {
-        assert!((parse_avg10(" avg10=7.50 avg60=1.00") - 7.50).abs() < 0.001);
-        assert_eq!(parse_avg10(" avg60=1.00"), 0.0);
+        assert_eq!(parse_avg10(" avg10=7.50 avg60=1.00"), Some(7.50));
+        // A missing or unreadable field is not a zero: reporting 0.0 here would
+        // claim "no pressure" from a number that was never read.
+        assert_eq!(parse_avg10(" avg60=1.00"), None);
+        assert_eq!(parse_avg10(" avg10=oops"), None);
+    }
+
+    #[test]
+    fn psi_that_does_not_parse_is_unavailable_not_zero() {
+        // Being able to open the file is not the same as understanding it. When
+        // the fields do not parse, the kernel's pressure is unknown, and an
+        // "available, 0%" reading would rule out a cause nobody measured.
+        let dir = std::env::temp_dir().join(format!("fast-psi-bad-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory");
+        fs::write(&path, "some avg10=n/a\nfull avg10=n/a\n").unwrap();
+
+        let psi = read_psi(path.to_str().unwrap());
+        assert!(!psi.available, "unparsed PSI must not be published as zero");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
