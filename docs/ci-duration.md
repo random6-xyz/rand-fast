@@ -65,13 +65,42 @@ LLVM, and apt setup (about 1m35s).
 
 ## Expected effect
 
-- Kernel-surface pull request: about 60 minutes billed, about 11 minutes of
-  wall clock.
-- User-space-only pull request: about 19 minutes billed (one gate cell plus
+- Kernel-surface pull request: about 60 minutes billed once the kernel cache
+  is warm, about 11 minutes of wall clock.
+- User-space-only pull request: about 25 minutes billed (one gate cell plus
   `verify`), unchanged wall clock of about 13 minutes.
 - A wedged cell: at most about 25 minutes instead of an hour.
 - Scheduled and `main`-push runs keep the full five-cell matrix, so the
   compatibility claim is unchanged.
+
+## Measured after the change
+
+The first kernel-surface run that went through the new layout was PR #98
+(run 45343837317, commit `a5a595d`):
+
+| Job | Before | After |
+| --- | --- | --- |
+| `build` | 4m6s | 2m3s |
+| `verify` | 4m11s | 3m8s |
+| gate cell 6.12.115 | 12m55s | 11m0s |
+| gate cell 6.12.115-nopsi | 11m55s | 10m49s |
+| matrix 6.6.161 | 11m55s | 10m13s |
+| matrix 6.1.191 | 11m21s | 16m37s |
+| matrix 7.2.15 | 11m29s | 16m5s |
+| billed total | about 67 min | about 70 min |
+| wall clock | 12m57s | 18m45s |
+
+Warm cells shed the build they no longer perform and land at 10-11 minutes
+after losing the roughly 1.5 minutes of `cargo build` each had paid. The two
+16-minute cells are the caveat: the kernel cache is keyed per branch and is
+only written on a successful cell, so the earlier run on the same branch that
+died at the binary check left nothing behind and both of those cells built
+their kernels from source. A first run on any branch can pay that cost, which
+is why the billed total did not move on this measurement even though the
+steady-state per-cell time did.
+
+The structural win is the user-space path, where the matrix no longer runs at
+all; the kernel path stays guest-bound until the guest run itself is split.
 
 ## Not done
 
