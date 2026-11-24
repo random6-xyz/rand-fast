@@ -399,6 +399,16 @@ fn score_memory(evidence: &Evidence) -> Option<Severity> {
     } else {
         why.push_str(", PSI unavailable on this kernel");
     }
+    // Swap only counts as growth, so the evidence line has to say what grew
+    // and from where; a bare total reads as if the process had just been
+    // swapped out during the run.
+    let swap_delta = rates.swap_delta_kb();
+    if swap_delta > 0 {
+        why.push_str(&format!(
+            ", {swap_delta} KiB of new swap ({} KiB at the start)",
+            evidence.swap_start_kb
+        ));
+    }
     Some(Severity {
         cause: "Memory pressure",
         severity,
@@ -417,7 +427,10 @@ fn memory_rates(evidence: &Evidence) -> crate::memory::Rates {
         psi_some_pct: evidence.psi_some_pct,
         psi_full_pct: evidence.psi_full_pct,
         swap_kb: evidence.swap_kb,
-        swap_start_kb: 0,
+        // The window baseline, not zero: without it the amount of swap that
+        // was already resident before the run reads as growth during it, and
+        // the report accuses the process of leaning on swap it never used.
+        swap_start_kb: evidence.swap_start_kb,
     }
 }
 
@@ -711,6 +724,46 @@ mod tests {
         let (verdict, _) = MemoryVerdict::assess(&rates, false);
         assert_eq!(verdict, MemoryVerdict::Pressure);
         assert_eq!(score(&evidence)[0].cause, "Memory pressure");
+    }
+
+    #[test]
+    fn resident_swap_alone_is_not_pressure_here_either() {
+        // `fast memory` only calls swap pressure when the window *grew*. The
+        // diagnosis has to use the same window, or a host that was already
+        // using swap before the run is reported as leaning on it during the
+        // run -- evidence that is simply false.
+        let evidence = Evidence {
+            swap_kb: 8_192,
+            swap_start_kb: 8_192,
+            ..idle()
+        };
+        let rates = memory_rates(&evidence);
+        assert_eq!(rates.swap_delta_kb(), 0);
+        let (verdict, _) = MemoryVerdict::assess(&rates, true);
+        assert_eq!(verdict, MemoryVerdict::Idle);
+        assert!(
+            !score(&evidence)
+                .iter()
+                .any(|d| d.cause == "Memory pressure"),
+            "{:#?}",
+            score(&evidence)
+        );
+    }
+
+    #[test]
+    fn swap_growth_during_the_run_is_pressure() {
+        let evidence = Evidence {
+            swap_kb: 8_192,
+            swap_start_kb: 4_096,
+            ..idle()
+        };
+        let ranked = score(&evidence);
+        assert_eq!(ranked[0].cause, "Memory pressure");
+        assert!(
+            ranked[0].evidence[0].contains("new swap"),
+            "the growth has to be the stated reason: {:#?}",
+            ranked[0]
+        );
     }
 
     #[test]
